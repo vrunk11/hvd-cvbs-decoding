@@ -23,12 +23,12 @@ inline constexpr const char* kStageName = "hvd_chroma_decoder";
 inline constexpr const char* kStageDisplayName = "HVD Chroma Decoder";
 
 // Connectivity archetype.
-inline constexpr orc::NodeType kStageNodeType = NodeType::TRANSFORM;
+inline constexpr orc::NodeType kStageNodeType = NodeType::SINK;
 
 inline constexpr uint32_t kStageMinInputs = 1;
 inline constexpr uint32_t kStageMaxInputs = 1;
-inline constexpr uint32_t kStageMinOutputs = 1;
-inline constexpr uint32_t kStageMaxOutputs = 1;
+inline constexpr uint32_t kStageMinOutputs = 0;
+inline constexpr uint32_t kStageMaxOutputs = 0;
 
 // NTSC-only, like the reference decoder.
 inline constexpr orc::VideoFormatCompatibility kStageCompatibleFormats =

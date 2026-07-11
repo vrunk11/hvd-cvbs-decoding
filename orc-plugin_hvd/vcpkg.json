@@ -1,0 +1,7 @@
+{
+  "name": "orc-plugin-hvd",
+  "version": "0.1.0",
+  "dependencies": [
+    "fftw3"
+  ]
+}

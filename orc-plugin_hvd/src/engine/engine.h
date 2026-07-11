@@ -67,6 +67,23 @@ class HvdEngine {
   FrameYc DecodeFrame(const FieldInput& first, const FieldInput& second,
                       const FieldGeometry& g, const HvdConfig& cfg);
 
+  // For sources that are ALREADY Y/C separated at capture (has_separate_
+  // channels() on the host side — S-Video-style captures, some hi-fi VHS
+  // formats): `first`/`second` here are the CHROMA-ONLY fields (already
+  // re-centred to a signed zero-mean oscillation by the caller — see
+  // frame_bridge.cpp's chroma_dc handling), with no luma mixed in. There is
+  // no separation problem to solve here — the source already solved it —
+  // so this skips the variational arbitration entirely (nothing to
+  // arbitrate: residual luma is ~0 by construction) and just does burst
+  // lock-in + a holographic-bandwidth crop to get chi. Cheaper than
+  // DecodeFrame and correct for this input shape; using DecodeFrame here
+  // instead (on a real composite reconstructed as luma-only, no chroma)
+  // silently produces zero chroma — that used to be a real bug.
+  // Returned FrameYc.luma is meaningless (approximately zero) — the caller
+  // should get luma from the source's own clean Y channel directly instead.
+  FrameYc DecodeChromaOnly(const FieldInput& first, const FieldInput& second,
+                           const FieldGeometry& g, const HvdConfig& cfg);
+
  private:
   std::unique_ptr<Fft2d> fft_;
 };

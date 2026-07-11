@@ -80,6 +80,35 @@ if(NOT FFTW3F_FOUND)
 endif()
 
 # --- hvd_core: the SDK-free numerical library (engine + frame bridge) ---------
+# NOTE: variational.cpp already has #pragma omp parallel for on its hot
+# elementwise loops (gradient, curvature, dot products — the IRLS/CG solver
+# that dominates decode time). Those pragmas were previously silent no-ops:
+# nothing here ever requested OpenMP, so every compiler just ignored them
+# and ran single-threaded. This is very likely why the plugin was observed
+# using ~1 core's worth of CPU regardless of how many are available.
+#
+# We add -fopenmp directly (compile AND link) for GCC/Clang instead of
+# relying solely on find_package(OpenMP)'s OpenMP::OpenMP_CXX imported
+# target: on at least one MinGW-w64 setup, that target correctly added
+# -fopenmp at compile time (so #pragma omp lowered to real GOMP_* calls)
+# but did NOT propagate a link-time flag/library to consumers, so hvd_core
+# itself built fine (a static archive never resolves its own external
+# symbols) while the plugin DLL and any test exercising variational.cpp
+# failed at link with "undefined reference to GOMP_parallel/omp_get_num_
+# threads/...". Passing -fopenmp to the LINK command directly is what
+# actually fixes that: GCC's driver pulls in libgomp (and libpthread)
+# automatically whenever -fopenmp is present at link time, no need to name
+# the library by hand. find_package(OpenMP) is kept only for the
+# diagnostic message below.
+find_package(OpenMP QUIET)
+if(NOT OpenMP_CXX_FOUND)
+    message(WARNING
+        "OpenMP not detected by find_package(OpenMP): if the compiler is "
+        "GCC or Clang we still force -fopenmp explicitly below, so this is "
+        "informational, not necessarily a problem. On MinGW-w64, OpenMP "
+        "just needs libgomp to be installed.")
+endif()
+
 add_library(hvd_core STATIC
     src/engine/ntsc_geometry.cpp
     src/engine/lockin.cpp
@@ -87,11 +116,32 @@ add_library(hvd_core STATIC
     src/engine/holographic_init.cpp
     src/engine/variational.cpp
     src/engine/colour.cpp
+    src/engine/motion.cpp
     src/engine/engine.cpp
     src/frame_bridge.cpp
 )
 target_include_directories(hvd_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(hvd_core PUBLIC PkgConfig::FFTW3F)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # PUBLIC: needs to reach every consumer's compile AND link command
+    # (the plugin DLL, every tests/engine/*_test, hvd_stage_smoke_test,
+    # hvd_plugin_entrypoints_test — anything that pulls in variational.cpp
+    # transitively through hvd_core).
+    target_compile_options(hvd_core PUBLIC -fopenmp)
+    target_link_options(hvd_core PUBLIC -fopenmp)
+elseif(OpenMP_CXX_FOUND)
+    # MSVC or anything else find_package(OpenMP) actually handles cleanly.
+    target_link_libraries(hvd_core PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+# Frame-level parallel export (hvd_chroma_decoder_stage.cpp, part of the
+# plugin target below, not hvd_core itself) uses std::thread directly
+# rather than OpenMP (each worker owns its own HvdEngine — see that file
+# for why this can't just be another #pragma omp loop). Declared PUBLIC
+# here so it propagates to that target through LINK_LIBRARIES hvd_core.
+find_package(Threads REQUIRED)
+target_link_libraries(hvd_core PUBLIC Threads::Threads)
 set_target_properties(hvd_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # --- the plugin ---------------------------------------------------------------

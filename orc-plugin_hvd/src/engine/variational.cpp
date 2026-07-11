@@ -69,7 +69,11 @@ Plane Magnitude(const ComplexPlane& a) {
 // sum(|g|^2) over a complex plane (the real CG residual norm).
 double SumAbs2(const ComplexPlane& g) {
   double acc = 0.0;
-  for (size_t i = 0; i < g.size(); ++i)
+  const long n = static_cast<long>(g.size());
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : acc) schedule(static)
+#endif
+  for (long i = 0; i < n; ++i)
     acc += static_cast<double>(g[i].real()) * g[i].real() +
            static_cast<double>(g[i].imag()) * g[i].imag();
   return acc;
@@ -78,7 +82,11 @@ double SumAbs2(const ComplexPlane& g) {
 // Re(sum(conj(a) * b)) over complex planes.
 double DotReal(const ComplexPlane& a, const ComplexPlane& b) {
   double acc = 0.0;
-  for (size_t i = 0; i < a.size(); ++i)
+  const long n = static_cast<long>(a.size());
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : acc) schedule(static)
+#endif
+  for (long i = 0; i < n; ++i)
     acc += static_cast<double>(a[i].real()) * b[i].real() +
            static_cast<double>(a[i].imag()) * b[i].imag();
   return acc;
@@ -97,52 +105,98 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
   const int irls_outer = std::max(1, cfg.irls_outer);
   const int n_inner = std::max(1, cfg.cg_iterations / irls_outer);
 
+  const int H = s.height();
+  const int W = s.width();
+  const size_t N = s.size();
+
   ComplexPlane chi = chi0;  // working copy
 
-  // Gradient of the (fixed-weight) quadratic majorant with respect to chi.
-  // g_chi = -[ 2 (DxT(wx Dx Yc) + DyT(wy Dy Yc)) ] * conj(carrier)
-  //          + 2 ( mu_h DxT(wcx Dx chi) + mu_v DyT(wcy Dy chi) )
-  // The weights wx, wy, wcx, wcy are captured by reference and held fixed
-  // within one IRLS outer pass (lagged diffusivity).
-  auto grad = [&](const ComplexPlane& c, const Plane& wx, const Plane& wy,
-                  const Plane& wcx, const Plane& wcy) -> ComplexPlane {
-    const Plane yc = Luma(s, c, carrier);
-    // Image (luma) term, folded back onto chi via -conj(carrier).
-    const Plane img = [&] {
-      Plane t1 = DxT(Mul(wx, Dx(yc)));
-      Plane t2 = DyT(Mul(wy, Dy(yc)));
-      Plane out(yc.height(), yc.width());
-      for (size_t i = 0; i < out.size(); ++i) out[i] = 2.0F * (t1[i] + t2[i]);
-      return out;
-    }();
-    // Chroma prior term.
-    const ComplexPlane cprior = [&] {
-      ComplexPlane t1 = DxT(MulReal(Dx(c), wcx));
-      ComplexPlane t2 = DyT(MulReal(Dy(c), wcy));
-      ComplexPlane out(c.height(), c.width());
-      for (size_t i = 0; i < out.size(); ++i)
-        out[i] = 2.0F * (mu_h * t1[i] + mu_v * t2[i]);
-      return out;
-    }();
-    ComplexPlane g(c.height(), c.width());
-    for (size_t i = 0; i < g.size(); ++i)
-      g[i] = -img[i] * std::conj(carrier[i]) + cprior[i];
-    return g;
+  // ---- Workspace: every frame-sized buffer the hot loops need, allocated
+  // ONCE here instead of once per grad()/curv() call. The previous version
+  // allocated ~15 frame-sized planes per CG iteration (~900 allocations per
+  // frame at cg_iterations=60), which dominated the runtime. The maths below
+  // is unchanged; only the memory traffic is.
+  Plane wx(H, W), wy(H, W), wcx(H, W), wcy(H, W);
+  Plane yc(H, W), tmpr1(H, W), tmpr2(H, W), img(H, W);
+  Plane gxY(H, W), gyY(H, W), magx(H, W), magy(H, W);
+  ComplexPlane tmpc1(H, W), tmpc2(H, W), tmpc3(H, W), cprior(H, W);
+  ComplexPlane g(H, W), g_new(H, W), d(H, W);
+  Plane dy(H, W), dxdy(H, W), dydy(H, W);
+  ComplexPlane dxc(H, W), dyc(H, W);
+
+  // g = -[2 (DxT(wx Dx Yc) + DyT(wy Dy Yc))] * conj(carrier)
+  //     + 2 (mu_h DxT(wcx Dx chi) + mu_v DyT(wcy Dy chi))
+  auto grad = [&](const ComplexPlane& c, ComplexPlane& out) {
+    // Yc = S - Re[c * carrier]
+    const long n = static_cast<long>(N);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n; ++i) yc[i] = s[i] - (c[i] * carrier[i]).real();
+
+    // img = 2 * (DxT(wx .* Dx(yc)) + DyT(wy .* Dy(yc)))
+    DxInto(yc, tmpr1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n; ++i) tmpr1[i] *= wx[i];
+    DxTInto(tmpr1, img);
+
+    DyInto(yc, tmpr2);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n; ++i) tmpr2[i] *= wy[i];
+    DyTInto(tmpr2, tmpr1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n; ++i) img[i] = 2.0F * (img[i] + tmpr1[i]);
+
+    // cprior = 2 * (mu_h * DxT(wcx .* Dx(c)) + mu_v * DyT(wcy .* Dy(c)))
+    DxInto(c, tmpc1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n; ++i) tmpc1[i] *= wcx[i];
+    DxTInto(tmpc1, cprior);
+
+    DyInto(c, tmpc2);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n; ++i) tmpc2[i] *= wcy[i];
+    DyTInto(tmpc2, tmpc3);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n; ++i)
+      cprior[i] = 2.0F * (mu_h * cprior[i] + mu_v * tmpc3[i]);
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n; ++i)
+      out[i] = -img[i] * std::conj(carrier[i]) + cprior[i];
   };
 
-  // Curvature (quadratic form) of the majorant along a complex direction dC:
-  //   H = sum wx (Dx dY)^2 + wy (Dy dY)^2
-  //     + mu_h sum wcx |Dx dC|^2 + mu_v sum wcy |Dy dC|^2,   dY = -Re[dC c].
-  auto curv = [&](const ComplexPlane& dc, const Plane& wx, const Plane& wy,
-                  const Plane& wcx, const Plane& wcy) -> double {
-    Plane dy(dc.height(), dc.width());
-    for (size_t i = 0; i < dy.size(); ++i) dy[i] = -(dc[i] * carrier[i]).real();
-    const Plane dxdy = Dx(dy);
-    const Plane dydy = Dy(dy);
-    const ComplexPlane dxc = Dx(dc);
-    const ComplexPlane dyc = Dy(dc);
+  // H = sum wx (Dx dY)^2 + wy (Dy dY)^2
+  //   + mu_h sum wcx |Dx dC|^2 + mu_v sum wcy |Dy dC|^2,   dY = -Re[dC c].
+  auto curv = [&](const ComplexPlane& dc) -> double {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < static_cast<long>(N); ++i)
+      dy[i] = -(dc[i] * carrier[i]).real();
+    DxInto(dy, dxdy);
+    DyInto(dy, dydy);
+    DxInto(dc, dxc);
+    DyInto(dc, dyc);
     double h = 0.0;
-    for (size_t i = 0; i < dy.size(); ++i) {
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : h) schedule(static)
+#endif
+    for (long i = 0; i < static_cast<long>(N); ++i) {
       h += static_cast<double>(wx[i]) * dxdy[i] * dxdy[i];
       h += static_cast<double>(wy[i]) * dydy[i] * dydy[i];
       h += static_cast<double>(mu_h) * wcx[i] * std::norm(dxc[i]);
@@ -151,35 +205,66 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
     return h;
   };
 
-  const double n_pixels = static_cast<double>(s.size());
+  const double n_pixels = static_cast<double>(N);
+  const float e2 = eps * eps;
+  const float ec2 = eps_c * eps_c;
 
   for (int outer = 0; outer < irls_outer; ++outer) {
     // Recompute IRLS weights at the current chi (lagged diffusivity).
-    const Plane y = Luma(s, chi, carrier);
-    const Plane gxY = Dx(y);
-    const Plane gyY = Dy(y);
-    const Plane wx = CharbonnierWeight(gxY, eps);
-    const Plane wy = CharbonnierWeight(gyY, eps);
-    const Plane wcx = CoupledWeight(Magnitude(Dx(chi)), gxY, eps_c, k);
-    const Plane wcy = CoupledWeight(Magnitude(Dy(chi)), gyY, eps_c, k);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < static_cast<long>(N); ++i)
+      yc[i] = s[i] - (chi[i] * carrier[i]).real();
+    DxInto(yc, gxY);
+    DyInto(yc, gyY);
+    DxInto(chi, tmpc1);
+    DyInto(chi, tmpc2);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < static_cast<long>(N); ++i) {
+      wx[i] = eps / std::sqrt(gxY[i] * gxY[i] + e2);
+      wy[i] = eps / std::sqrt(gyY[i] * gyY[i] + e2);
+      magx[i] = std::abs(tmpc1[i]);
+      magy[i] = std::abs(tmpc2[i]);
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < static_cast<long>(N); ++i) {
+      const float dx_den = magx[i] * magx[i] + k * gxY[i] * gxY[i] + ec2;
+      const float dy_den = magy[i] * magy[i] + k * gyY[i] * gyY[i] + ec2;
+      wcx[i] = eps_c / std::sqrt(dx_den);
+      wcy[i] = eps_c / std::sqrt(dy_den);
+    }
 
     // Conjugate gradient on the fixed-weight quadratic.
-    ComplexPlane g = grad(chi, wx, wy, wcx, wcy);
-    ComplexPlane d(g.height(), g.width());
-    for (size_t i = 0; i < d.size(); ++i) d[i] = -g[i];
+    grad(chi, g);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < static_cast<long>(N); ++i) d[i] = -g[i];
     double gg = SumAbs2(g);
 
     for (int it = 0; it < n_inner; ++it) {
-      const double hh = curv(d, wx, wy, wcx, wcy);
+      const double hh = curv(d);
       if (hh <= 1e-12) break;
       const double gd = DotReal(g, d);
       const float alpha = static_cast<float>(-0.5 * gd / hh);
-      for (size_t i = 0; i < chi.size(); ++i) chi[i] += alpha * d[i];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < static_cast<long>(N); ++i) chi[i] += alpha * d[i];
 
-      const ComplexPlane g_new = grad(chi, wx, wy, wcx, wcy);
+      grad(chi, g_new);
       const double gg_new = SumAbs2(g_new);
       const float beta = static_cast<float>(gg_new / std::max(gg, 1e-30));
-      for (size_t i = 0; i < d.size(); ++i) d[i] = -g_new[i] + beta * d[i];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < static_cast<long>(N); ++i)
+        d[i] = -g_new[i] + beta * d[i];
       g = g_new;
       gg = gg_new;
       if (gg < 1e-10 * n_pixels) break;

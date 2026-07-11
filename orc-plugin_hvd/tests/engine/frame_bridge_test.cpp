@@ -84,11 +84,12 @@ void RunTests() {
   CHECK(yc.luma.size() == frame.size());
   CHECK(yc.chroma.size() == frame.size());
 
-  const int dc = static_cast<int>(std::lround(fp.chroma_dc));
+  // Chroma is zero-centred (signed), matching what the host's NTSC decoder
+  // demodulates: composite == luma + chroma, with no DC term to remove.
   int max_err = 0;
   for (size_t i = 0; i < frame.size(); ++i) {
-    const int recon = static_cast<int>(yc.luma[i]) +
-                      (static_cast<int>(yc.chroma[i]) - dc);
+    const int recon =
+        static_cast<int>(yc.luma[i]) + static_cast<int>(yc.chroma[i]);
     max_err = std::max(max_err, std::abs(recon - static_cast<int>(frame[i])));
   }
   CHECK(max_err <= 2);

@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "engine/engine.h"
 #include "engine/hvd_config.h"
 #include "engine/ntsc_geometry.h"
 
@@ -57,21 +58,61 @@ struct FrameParams {
 // same field-sequential geometry as the input. By construction
 // luma[i] + (chroma[i] - chroma_dc) reconstructs the composite to within one
 // code. Both buffers are frame_width * frame_height samples.
+//
+// u_plane/v_plane carry the BASEBAND chrominance (chroma_phasor = V - iU),
+// not the modulated `chroma` channel above — they are what a colour preview
+// needs (no carrier to demodulate), on the same code-delta numeric scale as
+// luma. Zero outside the active picture. Same frame_width * frame_height size.
 struct YcFrameS16 {
   int width = 0;
   int height = 0;
   float chroma_dc = 0.0F;
   std::vector<int16_t> luma;
   std::vector<int16_t> chroma;
+  std::vector<double> u_plane;
+  std::vector<double> v_plane;
 };
 
 // Build the engine's field geometry from the host frame parameters.
 FieldGeometry FieldGeometryFromParams(const FrameParams& fp);
 
 // Decode one field-sequential CVBS frame into a lossless Y/C split.
+// `engine` is reused across calls by the caller (its FFTW plan cache only
+// pays the planning cost once per distinct frame size, not every frame —
+// see engine.h). NOT safe to call concurrently on the same `engine` from
+// multiple threads; each thread needs its own.
 //   `frame` : frame_width * frame_height samples (row-major, 10-bit codes).
 YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
+                             const HvdConfig& cfg, HvdEngine& engine);
+
+// Convenience overload for tests/one-off calls: constructs a throwaway
+// engine internally. Prefer the engine-taking overload above for any
+// repeated/per-sequence decoding (which is every real use in the plugin) —
+// this one re-plans FFTW from scratch on every call.
+YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
                              const HvdConfig& cfg);
+
+// For sources that are ALREADY Y/C separated at capture (host's
+// has_separate_channels() == true, e.g. get_frame_luma()/get_frame_chroma()
+// on an S-Video-style or hi-fi-VHS TBC): `luma` and `chroma` are two
+// separate field-sequential buffers, same geometry as `frame` above.
+// `chroma` is expected UNSIGNED with fp.chroma_dc as its zero point (raw
+// TBC convention — see orc_source_parameters.h's chroma_dc_offset) rather
+// than already centred; this function does the re-centring.
+// There is no Y/C separation problem to solve here (the source solved it),
+// so this is much cheaper than DecodeFrameBuffer: luma passes through
+// directly, and only the chroma undergoes burst lock-in + demodulation.
+// Do NOT feed such a source's get_frame() (composite) into
+// DecodeFrameBuffer instead — for a Y/C source that call returns the luma
+// plane with no chroma in it at all, which silently decodes to zero
+// chroma.
+// Same engine-reuse and thread-safety notes as DecodeFrameBuffer above.
+YcFrameS16 DecodeYcFrameBuffer(const int16_t* luma, const int16_t* chroma,
+                               const FrameParams& fp, const HvdConfig& cfg,
+                               HvdEngine& engine);
+
+YcFrameS16 DecodeYcFrameBuffer(const int16_t* luma, const int16_t* chroma,
+                               const FrameParams& fp, const HvdConfig& cfg);
 
 }  // namespace hvd
 

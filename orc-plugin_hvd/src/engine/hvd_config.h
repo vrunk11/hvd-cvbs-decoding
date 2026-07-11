@@ -47,13 +47,29 @@ struct HvdConfig {
   bool symmetry_variant = false;
 
   // --- Colour / levels ----------------------------------------------------
-  // NTSC-J sources place black at 0 IRE (no 7.5 IRE setup pedestal).
-  bool ntsc_j = false;
+  // NOTE: no ntsc_j flag here. The Python reference has one because it
+  // works from raw TBC files with no host calibration; in this plugin,
+  // orc::SourceParameters::black_level already reflects the real measured
+  // pedestal for this specific capture (0 IRE for NTSC-J, 7.5 IRE for
+  // standard NTSC — see orc_source_parameters.h's black_level_override /
+  // has_nonstandard_values), and frame_bridge.cpp already uses it
+  // throughout. Re-applying a black-level shift here would double-correct
+  // NTSC-J sources and silently corrupt standard NTSC-M ones.
   // Automatic Color Control: calibrate saturation from the measured burst
   // amplitude (nominal 20 IRE), as every analogue TV does.
   bool acc = true;
   float chroma_gain = 1.0F;
   bool monochrome = false;
+  // Chroma phase correction, in degrees, applied directly to the burst-
+  // locked phase reference (theta) BEFORE it's used to build the carrier —
+  // same idea as Comb::Configuration::chromaPhase in the classic decoder
+  // (comb.cpp's transformIQ, theta = (33 + chromaPhase) * pi/180), except
+  // here it's injected at the actual phase-reference stage instead of
+  // rotating U/V after the fact. 0 = no correction. The recovered chroma
+  // has been persistently 180 deg off since the Python reference, so 180 is
+  // the known-good starting point; treat it as tunable per-capture rather
+  // than assuming every source needs exactly 180.
+  float chroma_phase_deg = 180.0F;
 
   // --- Geometry -----------------------------------------------------------
   // Weave both fields into frame geometry before decoding (default, best

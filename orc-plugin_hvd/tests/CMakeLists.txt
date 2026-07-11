@@ -38,7 +38,8 @@ set(HVD_ENGINE_TESTS
     lossless_identity_test
     lockin_test
     colour_test
-    frame_bridge_test)
+    frame_bridge_test
+    motion_test)
 
 foreach(t ${HVD_ENGINE_TESTS})
     add_executable(${t} engine/${t}.cpp)

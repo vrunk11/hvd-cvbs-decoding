@@ -26,11 +26,16 @@ namespace hvd {
 template <typename T>
 BasicPlane<T> Dx(const BasicPlane<T>& a) {
   BasicPlane<T> d(a.height(), a.width());
-  for (int y = 0; y < a.height(); ++y) {
-    for (int x = 0; x + 1 < a.width(); ++x) {
+  const int h = a.height();
+  const int w = a.width();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x + 1 < w; ++x) {
       d.at(y, x) = a.at(y, x + 1) - a.at(y, x);
     }
-    if (a.width() > 0) d.at(y, a.width() - 1) = T{};
+    if (w > 0) d.at(y, w - 1) = T{};
   }
   return d;
 }
@@ -39,8 +44,13 @@ BasicPlane<T> Dx(const BasicPlane<T>& a) {
 template <typename T>
 BasicPlane<T> Dy(const BasicPlane<T>& a) {
   BasicPlane<T> d(a.height(), a.width());
-  for (int y = 0; y + 1 < a.height(); ++y) {
-    for (int x = 0; x < a.width(); ++x) {
+  const int h = a.height();
+  const int w = a.width();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h - 1; ++y) {
+    for (int x = 0; x < w; ++x) {
       d.at(y, x) = a.at(y + 1, x) - a.at(y, x);
     }
   }
@@ -56,7 +66,11 @@ template <typename T>
 BasicPlane<T> DxT(const BasicPlane<T>& a) {
   BasicPlane<T> d(a.height(), a.width());
   const int w = a.width();
-  for (int y = 0; y < a.height(); ++y) {
+  const int h = a.height();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h; ++y) {
     // For w < 2, Dx is the zero operator, so its adjoint is zero too
     // (d is already zero-initialised).
     if (w < 2) continue;
@@ -75,12 +89,88 @@ BasicPlane<T> DyT(const BasicPlane<T>& a) {
   const int w = a.width();
   // For h < 2, Dy is the zero operator, so its adjoint is zero too.
   if (h < 2) return d;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
   for (int x = 0; x < w; ++x) {
     d.at(0, x) = -a.at(0, x);
     for (int y = 1; y < h - 1; ++y) d.at(y, x) = a.at(y - 1, x) - a.at(y, x);
     d.at(h - 1, x) = a.at(h - 2, x);
   }
   return d;
+}
+
+// ---------------------------------------------------------------------------
+// Out-parameter variants: same maths, but write into a caller-owned buffer so
+// hot loops (the CG solver) can pre-allocate once instead of allocating a
+// frame-sized plane per call. `d` must already have a's dimensions.
+//
+// DyInto/DyTInto also iterate row-major (unlike the column-major loops above),
+// which matches the row-major storage and keeps the cache happy.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+void DxInto(const BasicPlane<T>& a, BasicPlane<T>& d) {
+  const int w = a.width();
+  const int h = a.height();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x + 1 < w; ++x) d.at(y, x) = a.at(y, x + 1) - a.at(y, x);
+    if (w > 0) d.at(y, w - 1) = T{};
+  }
+}
+
+template <typename T>
+void DyInto(const BasicPlane<T>& a, BasicPlane<T>& d) {
+  const int h = a.height();
+  const int w = a.width();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h - 1; ++y) {
+    for (int x = 0; x < w; ++x) d.at(y, x) = a.at(y + 1, x) - a.at(y, x);
+  }
+  if (h > 0) {
+    for (int x = 0; x < w; ++x) d.at(h - 1, x) = T{};
+  }
+}
+
+template <typename T>
+void DxTInto(const BasicPlane<T>& a, BasicPlane<T>& d) {
+  const int w = a.width();
+  const int h = a.height();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h; ++y) {
+    if (w < 2) {
+      for (int x = 0; x < w; ++x) d.at(y, x) = T{};
+      continue;
+    }
+    d.at(y, 0) = -a.at(y, 0);
+    for (int x = 1; x < w - 1; ++x) d.at(y, x) = a.at(y, x - 1) - a.at(y, x);
+    d.at(y, w - 1) = a.at(y, w - 2);
+  }
+}
+
+template <typename T>
+void DyTInto(const BasicPlane<T>& a, BasicPlane<T>& d) {
+  const int h = a.height();
+  const int w = a.width();
+  if (h < 2) {
+    for (size_t i = 0; i < d.size(); ++i) d[i] = T{};
+    return;
+  }
+  for (int x = 0; x < w; ++x) d.at(0, x) = -a.at(0, x);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 1; y < h - 1; ++y) {
+    for (int x = 0; x < w; ++x) d.at(y, x) = a.at(y - 1, x) - a.at(y, x);
+  }
+  for (int x = 0; x < w; ++x) d.at(h - 1, x) = a.at(h - 2, x);
 }
 
 }  // namespace hvd

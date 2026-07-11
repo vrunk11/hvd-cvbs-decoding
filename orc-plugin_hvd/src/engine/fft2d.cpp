@@ -5,6 +5,7 @@
 #include <fftw3.h>
 
 #include <map>
+#include <mutex>
 #include <utility>
 
 namespace hvd {
@@ -15,6 +16,19 @@ namespace {
 // than copy element-by-element.
 static_assert(sizeof(Complex) == sizeof(fftwf_complex),
               "std::complex<float> must match fftwf_complex layout");
+
+// fftwf_plan_dft_2d touches FFTW's global planner state, which is NOT
+// thread-safe to call concurrently from multiple threads (same reason the
+// host's own multi-threaded decoders serialize planning — see
+// video_sink_stage.cpp's fftwPlanMutex). This only matters once more than
+// one HvdEngine can be planning at the same time, e.g. worker-thread
+// parallel export — each thread's Fft2d::PlanFor() call takes this lock for
+// the (cheap, FFTW_ESTIMATE) planning step only; fftwf_execute_dft() itself
+// is safe to run concurrently on independent plans/buffers with no lock.
+std::mutex& PlanningMutex() {
+  static std::mutex m;
+  return m;
+}
 }  // namespace
 
 struct Fft2d::Impl {
@@ -27,6 +41,7 @@ struct Fft2d::Impl {
   ComplexPlane scratch_out;
 
   ~Impl() {
+    std::lock_guard<std::mutex> lock(PlanningMutex());
     for (auto& kv : plans) fftwf_destroy_plan(kv.second);
   }
 
@@ -35,7 +50,11 @@ struct Fft2d::Impl {
     const auto key = std::make_tuple(h, w, sign);
     auto it = plans.find(key);
     if (it != plans.end()) return it->second;
-    fftwf_plan p = fftwf_plan_dft_2d(h, w, in, out, sign, FFTW_ESTIMATE);
+    fftwf_plan p;
+    {
+      std::lock_guard<std::mutex> lock(PlanningMutex());
+      p = fftwf_plan_dft_2d(h, w, in, out, sign, FFTW_ESTIMATE);
+    }
     plans.emplace(key, p);
     return p;
   }
