@@ -1,0 +1,155 @@
+name: CI and Release
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-package:
+    runs-on: ${{ matrix.os }}
+    env:
+      ORC_SDK_DIR: ${{ github.workspace }}/decode-orc
+      ORC_SDK_REF: v2.0.0
+      ORC_CMAKE_ARGS: -DORC_INTREE_SDK_DIR=${{ github.workspace }}/decode-orc -DBUILD_TESTS=ON
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            ext: so
+            use_nix: true
+          - os: macos-latest
+            platform: macos
+            ext: dylib
+            use_nix: true
+          - os: windows-latest
+            platform: windows
+            ext: dll
+            use_nix: false
+
+    steps:
+      - name: Checkout skeleton plugin
+        uses: actions/checkout@v4
+
+      - name: Checkout decode-orc host repository
+        uses: actions/checkout@v4
+        with:
+          repository: simoninns/decode-orc
+          ref: ${{ env.ORC_SDK_REF }}
+          path: decode-orc
+
+      - name: Install Nix
+        if: matrix.use_nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Verify SDK headers (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          test -f "$ORC_SDK_DIR/orc/sdk/include/orc/plugin/orc_plugin_sdk.h"
+          test -f "$ORC_SDK_DIR/orc/sdk/include/orc/plugin/orc_stage_preview.h"
+          test -f "$ORC_SDK_DIR/orc/sdk/include/orc/plugin/orc_stage_runtime.h"
+
+      - name: Verify SDK headers (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "$env:ORC_SDK_DIR/orc/sdk/include/orc/plugin/orc_plugin_sdk.h")) {
+            throw "Missing orc_plugin_sdk.h in SDK checkout"
+          }
+          if (-not (Test-Path "$env:ORC_SDK_DIR/orc/sdk/include/orc/plugin/orc_stage_preview.h")) {
+            throw "Missing orc_stage_preview.h in SDK checkout"
+          }
+          if (-not (Test-Path "$env:ORC_SDK_DIR/orc/sdk/include/orc/plugin/orc_stage_runtime.h")) {
+            throw "Missing orc_stage_runtime.h in SDK checkout"
+          }
+
+      - name: Enforce SDK boundary
+        shell: bash
+        run: |
+          chmod +x scripts/check_sdk_boundary.sh
+          ./scripts/check_sdk_boundary.sh .
+
+      - name: Configure (Nix)
+        if: matrix.use_nix
+        run: |
+          nix develop --accept-flake-config --command \
+            cmake -S . -B build $ORC_CMAKE_ARGS
+
+      - name: Install fmt (Windows)
+        if: runner.os == 'Windows'
+        run: vcpkg install fmt:x64-windows
+
+      - name: Configure (native)
+        if: ${{ !matrix.use_nix }}
+        run: >
+          cmake -S . -B build
+          -DORC_INTREE_SDK_DIR=${{ env.ORC_SDK_DIR }}
+          -DBUILD_TESTS=ON
+          -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+      - name: Build (Nix)
+        if: matrix.use_nix
+        run: nix develop --accept-flake-config --command cmake --build build --config Release --parallel
+
+      - name: Build (native)
+        if: ${{ !matrix.use_nix }}
+        run: cmake --build build --config Release --parallel
+
+      - name: Test (Nix)
+        if: matrix.use_nix
+        run: nix develop --accept-flake-config --command ctest --test-dir build --output-on-failure -C Release
+
+      - name: Test (native)
+        if: ${{ !matrix.use_nix }}
+        run: ctest --test-dir build --output-on-failure -C Release
+
+      - name: Package artifact (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x scripts/package_local.sh
+          ./scripts/package_local.sh build dist
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $candidate = Get-ChildItem -Path build -Recurse -File -Filter "*.dll" | Where-Object {
+            $_.Name -like "orc-stage-plugin-hvd-chroma-decoder*.dll"
+          } | Select-Object -First 1
+          if (-not $candidate) {
+            Write-Host "DLL candidates under build/:"
+            Get-ChildItem -Path build -Recurse -File -Filter "*.dll" | ForEach-Object {
+              Write-Host " - $($_.FullName)"
+            }
+          }
+          if (-not $candidate) { throw 'Could not locate built plugin DLL' }
+          Copy-Item $candidate.FullName "dist/orc-plugin_hvd_chroma_decoder_windows.dll"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ matrix.platform }}
+          path: dist/*
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-test-package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/orc-plugin_hvd_chroma_decoder_*

@@ -1,0 +1,65 @@
+/*
+ * File:        plugin.cpp
+ * Module:      orc-stage-plugin-hvd-chroma-decoder
+ * Purpose:     Runtime plugin bundle for HvdChromaDecoderStage
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-FileCopyrightText: 2026 hvd-decode contributors
+ */
+
+#include "plugin.h"
+#include "hvd_chroma_decoder_stage.h"
+
+namespace {
+
+orc::DAGStagePtr create_stage()
+{
+    return std::make_shared<orc::plugins::hvd::HvdChromaDecoderStage>();
+}
+
+}  // namespace
+
+ORC_STAGE_PLUGIN_EXPORT const orc::StagePluginDescriptor* orc_get_stage_plugin_descriptor()
+{
+    return &orc::plugins::hvd::kPluginDescriptor;
+}
+
+ORC_STAGE_PLUGIN_EXPORT bool orc_register_stage_plugin(
+    const orc::OrcPluginServices* services,
+    void* context,
+    bool (*register_stage)(void* context, const char* stage_name, orc::OrcStageFactoryFn factory),
+    const char** error_message)
+{
+    orc::plugin::set_services(services);
+
+    if (!register_stage) {
+        if (error_message) {
+            *error_message = "Missing stage registration callback";
+        }
+        return false;
+    }
+
+    const auto node_type_info = create_stage()->get_node_type_info();
+    if (node_type_info.display_name != orc::plugins::hvd::kStageDisplayName ||
+        node_type_info.menu_category != orc::plugins::hvd::kStageMenuCategory ||
+        node_type_info.type != orc::plugins::hvd::kStageNodeType ||
+        node_type_info.min_inputs != orc::plugins::hvd::kStageMinInputs ||
+        node_type_info.max_inputs != orc::plugins::hvd::kStageMaxInputs ||
+        node_type_info.min_outputs != orc::plugins::hvd::kStageMinOutputs ||
+        node_type_info.max_outputs != orc::plugins::hvd::kStageMaxOutputs ||
+        node_type_info.compatible_formats != orc::plugins::hvd::kStageCompatibleFormats ||
+        node_type_info.sink_category != orc::plugins::hvd::kStageSinkCategory) {
+        if (error_message) {
+            *error_message = "Stage metadata mismatch between plugin.h and NodeTypeInfo";
+        }
+        return false;
+    }
+
+    if (!register_stage(context, orc::plugins::hvd::kStageName, &create_stage)) {
+        if (error_message) {
+            *error_message = "Failed to register stage from plugin metadata";
+        }
+        return false;
+    }
+
+    return true;
+}
