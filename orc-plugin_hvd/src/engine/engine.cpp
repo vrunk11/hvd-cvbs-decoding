@@ -103,6 +103,8 @@ WovenFrame WeaveAndBuildCarrier(const FieldInput& first, const FieldInput& secon
 HvdEngine::HvdEngine() : fft_(std::make_unique<Fft2d>()) {}
 HvdEngine::~HvdEngine() = default;
 
+void HvdEngine::SetFftThreads(int n) { fft_->SetThreadCount(n); }
+
 FrameYc HvdEngine::DecodeFrame(const FieldInput& first, const FieldInput& second,
                                const FieldGeometry& g, const HvdConfig& cfg) {
   const WovenFrame w = WeaveAndBuildCarrier(first, second, g, cfg);

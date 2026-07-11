@@ -476,6 +476,9 @@ bool HvdChromaDecoderStage::export_now(std::string* error) const
         LimitOpenMpThreadsPerWorker();
         ::hvd::HvdEngine engine;  // one plan cache per thread, reused across
                                   // every frame that thread decodes
+        engine.SetFftThreads(1);  // see engine.h's doc comment: this worker
+                                  // IS the parallelism unit, FFTW fanning out
+                                  // internally too would oversubscribe
         for (;;) {
             if (failed.load(std::memory_order_relaxed)) return;
             const FrameID id = next_to_decode.fetch_add(1);

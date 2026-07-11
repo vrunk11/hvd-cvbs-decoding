@@ -79,6 +79,54 @@ if(NOT FFTW3F_FOUND)
         INTERFACE_LINK_LIBRARIES "${FFTW3F_LIBRARY}")
 endif()
 
+# --- FFTW3 threading (optional): lets FFTW's own 2-D transforms use
+# multiple threads internally — this is on top of, not instead of, the
+# OpenMP/std::thread parallelism elsewhere in hvd_core; it's the last major
+# unparallelised chunk of a single frame's decode (HolographicInit does 3-4
+# full-picture 2-D FFTs per frame).
+#
+# This does NOT search for a separate library file. Some FFTW builds ship
+# threading as a distinct fftw3f_threads/fftw3f_omp library, but vcpkg's
+# fftw3[threads] (or [openmp]) feature compiles the threading symbols
+# (fftwf_init_threads, fftwf_plan_with_nthreads) directly INTO the base
+# fftw3f library instead — verified against an actual vcpkg x64-mingw-
+# dynamic build, which produces only libfftw3f.dll/.dll.a, no separate
+# threads/omp artifact at all. So instead of looking for a file, we just
+# try to actually link a program calling those symbols against whatever
+# fftw3f we already have — the only test that's actually correct across
+# both packaging styles.
+include(CheckCXXSourceCompiles)
+get_target_property(_fftw3f_test_incs PkgConfig::FFTW3F INTERFACE_INCLUDE_DIRECTORIES)
+get_target_property(_fftw3f_test_libs PkgConfig::FFTW3F INTERFACE_LINK_LIBRARIES)
+set(CMAKE_REQUIRED_INCLUDES ${_fftw3f_test_incs})
+set(CMAKE_REQUIRED_LIBRARIES ${_fftw3f_test_libs})
+check_cxx_source_compiles("
+    #include <fftw3.h>
+    int main() {
+      fftwf_init_threads();
+      fftwf_plan_with_nthreads(1);
+      return 0;
+    }
+" HVD_FFTW_THREADS_AVAILABLE)
+unset(CMAKE_REQUIRED_INCLUDES)
+unset(CMAKE_REQUIRED_LIBRARIES)
+
+if(HVD_FFTW_THREADS_AVAILABLE)
+    message(STATUS
+        "FFTW3 threading symbols available in fftw3f: FFTW's own "
+        "transforms will use multiple threads too, not just the caller's "
+        "OpenMP/std::thread parallelism.")
+else()
+    message(WARNING
+        "fftwf_init_threads/fftwf_plan_with_nthreads not available in the "
+        "linked fftw3f — FFTW's 2-D transforms will run single-threaded. "
+        "This is currently the largest remaining unparallelised chunk of "
+        "per-frame decode time. If using vcpkg, make sure vcpkg.json "
+        "requests fftw3's 'threads' or 'openmp' feature. The build "
+        "proceeds fine either way — this is a perf nice-to-have, not a "
+        "hard requirement.")
+endif()
+
 # --- hvd_core: the SDK-free numerical library (engine + frame bridge) ---------
 # NOTE: variational.cpp already has #pragma omp parallel for on its hot
 # elementwise loops (gradient, curvature, dot products — the IRLS/CG solver
@@ -122,6 +170,11 @@ add_library(hvd_core STATIC
 )
 target_include_directories(hvd_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(hvd_core PUBLIC PkgConfig::FFTW3F)
+if(HVD_FFTW_THREADS_AVAILABLE)
+    # No extra target_link_libraries: the threading symbols are already
+    # part of PkgConfig::FFTW3F, just above — see the detection comment.
+    target_compile_definitions(hvd_core PUBLIC HVD_HAVE_FFTW_THREADS)
+endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # PUBLIC: needs to reach every consumer's compile AND link command

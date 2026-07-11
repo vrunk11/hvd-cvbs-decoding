@@ -42,6 +42,9 @@ Plane GaussianLpf(int h, int w, const FieldGeometry& g, float lpf_h_mhz,
     gy[y] = std::exp(-0.5F * r * r);
   }
   Plane g_out(h, w);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x) g_out.at(y, x) = gy[y] * gx[x];
   return g_out;
@@ -54,8 +57,16 @@ void BoxBlur1DRows(Plane* a, int r) {
   const int h = a->height();
   const int w = a->width();
   const float norm = 1.0F / static_cast<float>(2 * r + 1);
-  std::vector<float> col(h);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
   for (int x = 0; x < w; ++x) {
+    // col is declared INSIDE the loop so each parallel iteration (each
+    // thread, for whichever columns it's assigned) gets its own buffer —
+    // sharing one `col` across iterations the way the original sequential
+    // version did would be a data race once this loop is split across
+    // threads.
+    std::vector<float> col(h);
     for (int y = 0; y < h; ++y) col[y] = a->at(y, x);
     for (int y = 0; y < h; ++y) {
       float acc = 0.0F;
@@ -72,8 +83,12 @@ void BoxBlur1DCols(Plane* a, int r) {
   const int h = a->height();
   const int w = a->width();
   const float norm = 1.0F / static_cast<float>(2 * r + 1);
-  std::vector<float> row(w);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
   for (int y = 0; y < h; ++y) {
+    // Same per-iteration-buffer reasoning as BoxBlur1DRows above.
+    std::vector<float> row(w);
     for (int x = 0; x < w; ++x) row[x] = a->at(y, x);
     for (int x = 0; x < w; ++x) {
       float acc = 0.0F;
@@ -95,7 +110,11 @@ Plane BoxBlur(Plane a, int r) {
 // Re[chi * carrier] as a real plane.
 Plane RealOfProduct(const ComplexPlane& chi, const ComplexPlane& carrier) {
   Plane out(chi.height(), chi.width());
-  for (size_t i = 0; i < chi.size(); ++i) out[i] = (chi[i] * carrier[i]).real();
+  const long n = static_cast<long>(chi.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (long i = 0; i < n; ++i) out[i] = (chi[i] * carrier[i]).real();
   return out;
 }
 
@@ -103,7 +122,11 @@ Plane RealOfProduct(const ComplexPlane& chi, const ComplexPlane& carrier) {
 Plane ResidualLuma(const Plane& s, const ComplexPlane& chi,
                    const ComplexPlane& carrier) {
   Plane y(s.height(), s.width());
-  for (size_t i = 0; i < s.size(); ++i)
+  const long n = static_cast<long>(s.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (long i = 0; i < n; ++i)
     y[i] = s[i] - (chi[i] * carrier[i]).real();
   return y;
 }
@@ -114,7 +137,11 @@ Plane EdgeEnergy(const Plane& y) {
   const Plane gx = Dx(y);
   const Plane gy = Dy(y);
   Plane e(y.height(), y.width());
-  for (size_t i = 0; i < y.size(); ++i)
+  const long n = static_cast<long>(y.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (long i = 0; i < n; ++i)
     e[i] = std::fabs(gx[i]) + std::fabs(gy[i]);
   return BoxBlur(std::move(e), 3);
 }
@@ -126,10 +153,14 @@ HoloInit HolographicInit(const Plane& s, const ComplexPlane& carrier,
                          Fft2d* fft) {
   const int h = s.height();
   const int w = s.width();
+  const long n_total = static_cast<long>(s.size());
 
   // demod = S * conj(carrier); shift the chroma sideband to DC.
   ComplexPlane demod(h, w);
-  for (size_t i = 0; i < s.size(); ++i) demod[i] = s[i] * std::conj(carrier[i]);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (long i = 0; i < n_total; ++i) demod[i] = s[i] * std::conj(carrier[i]);
   const ComplexPlane spectrum = fft->Forward(demod);
 
   // Accumulate the per-pixel weighted blend of the crop variants.
@@ -138,18 +169,32 @@ HoloInit HolographicInit(const Plane& s, const ComplexPlane& carrier,
 
   // Two complementary anisotropic crops: (narrow-x, wide-y) and (wide-x,
   // narrow-y). Values copied verbatim from the reference.
+  // NOTE: this outer loop (2 iterations) stays sequential on purpose — the
+  // FFT plan cache (Fft2d::PlanFor) isn't safe to look up/insert into
+  // concurrently from multiple threads sharing one Fft2d, and chi_num/
+  // w_sum are shared accumulators across variants. The per-pixel loops
+  // WITHIN each variant below are what's parallelised instead — that's
+  // most of the actual elementwise work anyway.
   const float variants[2][2] = {{0.8F, 120.0F}, {1.8F, 30.0F}};
   for (const auto& v : variants) {
     const Plane kernel = GaussianLpf(h, w, g, v[0], v[1]);
     ComplexPlane cropped(h, w);
-    for (size_t i = 0; i < cropped.size(); ++i) cropped[i] = spectrum[i] *
-                                                             kernel[i];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n_total; ++i) cropped[i] = spectrum[i] * kernel[i];
     ComplexPlane chi_v = fft->Inverse(cropped);
-    for (size_t i = 0; i < chi_v.size(); ++i) chi_v[i] *= 2.0F;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n_total; ++i) chi_v[i] *= 2.0F;
 
     const Plane y_v = ResidualLuma(s, chi_v, carrier);
     const Plane e = EdgeEnergy(y_v);
-    for (size_t i = 0; i < chi_v.size(); ++i) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n_total; ++i) {
       const float weight = 1.0F / (e[i] + 0.5F);
       chi_num[i] += chi_v[i] * weight;
       w_sum[i] += weight;
@@ -163,9 +208,15 @@ HoloInit HolographicInit(const Plane& s, const ComplexPlane& carrier,
     // of chroma that luma almost never fakes. The point-reflection is
     // roll(roll(D[::-1,::-1], 1, 0), 1, 1) so bin k pairs with bin -k.
     Plane mag(h, w);
-    for (size_t i = 0; i < mag.size(); ++i) mag[i] = std::abs(spectrum[i]);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n_total; ++i) mag[i] = std::abs(spectrum[i]);
     ComplexPlane certified(h, w);
     const Plane kernel = GaussianLpf(h, w, g, 1.3F, 60.0F);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < h; ++y) {
       for (int x = 0; x < w; ++x) {
         const int ry = (h - y) % h;  // reflect+shift by 1 => index (h-y) mod h
@@ -177,10 +228,16 @@ HoloInit HolographicInit(const Plane& s, const ComplexPlane& carrier,
       }
     }
     ComplexPlane chi_s = fft->Inverse(certified);
-    for (size_t i = 0; i < chi_s.size(); ++i) chi_s[i] *= 2.0F;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n_total; ++i) chi_s[i] *= 2.0F;
     const Plane y_s = ResidualLuma(s, chi_s, carrier);
     const Plane e = EdgeEnergy(y_s);
-    for (size_t i = 0; i < chi_s.size(); ++i) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (long i = 0; i < n_total; ++i) {
       const float weight = 1.0F / (e[i] + 0.5F);
       chi_num[i] += chi_s[i] * weight;
       w_sum[i] += weight;
@@ -189,7 +246,10 @@ HoloInit HolographicInit(const Plane& s, const ComplexPlane& carrier,
 
   HoloInit out;
   out.chroma = ComplexPlane(h, w);
-  for (size_t i = 0; i < out.chroma.size(); ++i)
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (long i = 0; i < n_total; ++i)
     out.chroma[i] = chi_num[i] / w_sum[i];
   out.luma = ResidualLuma(s, out.chroma, carrier);
   return out;

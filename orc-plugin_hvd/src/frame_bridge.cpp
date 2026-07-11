@@ -61,6 +61,9 @@ YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
   bottom.samples = Plane(field_h, fw);
   top.is_first_field = true;
   bottom.is_first_field = false;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
   for (int y = 0; y < field_h; ++y) {
     for (int x = 0; x < fw; ++x) {
       const float st =
@@ -100,6 +103,9 @@ YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
   const int active_w = yc.luma.width();
   const float scale = (fp.white_level - fp.black_level) / 100.0F;
 
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
   for (int r = 0; r < active_h; ++r) {
     const int field = r % 2;               // 0 = field 1 (top), 1 = field 2
     const int field_line = fal + (r / 2);  // line within that field
@@ -163,6 +169,9 @@ YcFrameS16 DecodeYcFrameBuffer(const int16_t* luma, const int16_t* chroma,
   chroma_top.is_first_field = true;
   chroma_bot.is_first_field = false;
 
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
   for (int y = 0; y < field_h; ++y) {
     for (int x = 0; x < fw; ++x) {
       // Unsigned raw code -> signed, zero-mean, same numeric scale as IRE.
@@ -188,16 +197,21 @@ YcFrameS16 DecodeYcFrameBuffer(const int16_t* luma, const int16_t* chroma,
 
   // Luma is already clean: pass the source's own Y channel through as-is,
   // outside the active picture included (nothing to decode either way).
-  for (int i = 0; i < fw * fh; ++i) {
-    out.luma[i] = luma[i];
-    out.chroma[i] = 0;
-  }
+  // Plain copy/fill, not a #pragma omp loop — this is memory-bandwidth-
+  // bound with no per-element work, so std::copy/assign (which the
+  // compiler/stdlib can turn into a vectorised memcpy/memset) beats
+  // parallelising it: thread launch overhead would dwarf the actual work.
+  std::copy(luma, luma + static_cast<size_t>(fw) * fh, out.luma.begin());
+  std::fill(out.chroma.begin(), out.chroma.end(), 0);
 
   const int fal = g.first_active_field_line;
   const int a0 = fp.active_video_start;
   const int active_h = yc.chroma_phasor.height();
   const int active_w = yc.chroma_phasor.width();
 
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
   for (int r = 0; r < active_h; ++r) {
     const int field = r % 2;
     const int field_line = fal + (r / 2);

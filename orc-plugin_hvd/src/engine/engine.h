@@ -84,6 +84,16 @@ class HvdEngine {
   FrameYc DecodeChromaOnly(const FieldInput& first, const FieldInput& second,
                            const FieldGeometry& g, const HvdConfig& cfg);
 
+  // Forwards to Fft2d::SetThreadCount — see its doc comment in fft2d.h.
+  // Parallel-export workers (hvd_chroma_decoder_stage.cpp) MUST call this
+  // with 1 on their own per-thread HvdEngine before decoding anything, or
+  // FFTW would fan its own transforms out across every core PER WORKER,
+  // oversubscribing on top of the frame-level parallelism already in play.
+  // The single shared engine used by the normal preview/cached path
+  // doesn't need to call this — it defaults to using every core, which is
+  // what a single-frame-at-a-time workload wants.
+  void SetFftThreads(int n);
+
  private:
   std::unique_ptr<Fft2d> fft_;
 };

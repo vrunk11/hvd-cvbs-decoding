@@ -4,8 +4,10 @@
 
 #include <fftw3.h>
 
+#include <algorithm>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 namespace hvd {
@@ -25,10 +27,27 @@ static_assert(sizeof(Complex) == sizeof(fftwf_complex),
 // parallel export — each thread's Fft2d::PlanFor() call takes this lock for
 // the (cheap, FFTW_ESTIMATE) planning step only; fftwf_execute_dft() itself
 // is safe to run concurrently on independent plans/buffers with no lock.
+//
+// This same lock also guards fftwf_plan_with_nthreads() (see PlanFor
+// below): that call sets a GLOBAL "how many threads should the next plan
+// use" value with no locking of its own, so it has to happen immediately
+// before — and under the same lock as — the fftwf_plan_dft_2d() call that
+// consumes it, or two threads planning concurrently could race and one
+// plan could silently pick up the wrong thread count.
 std::mutex& PlanningMutex() {
   static std::mutex m;
   return m;
 }
+
+#ifdef HVD_HAVE_FFTW_THREADS
+void EnsureFftwThreadsInitialised() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    std::lock_guard<std::mutex> lock(PlanningMutex());
+    fftwf_init_threads();
+  });
+}
+#endif
 }  // namespace
 
 struct Fft2d::Impl {
@@ -40,6 +59,13 @@ struct Fft2d::Impl {
   ComplexPlane scratch_in;
   ComplexPlane scratch_out;
 
+  // Thread count FFTW uses internally for plans created FROM NOW ON (not
+  // retroactively for already-cached plans — see SetThreadCount's doc
+  // comment in fft2d.h). Defaults to every core: the common case is one
+  // frame being decoded at a time (preview), where using every core inside
+  // the FFT itself is exactly what we want.
+  int thread_count = std::max<int>(1, static_cast<int>(std::thread::hardware_concurrency()));
+
   ~Impl() {
     std::lock_guard<std::mutex> lock(PlanningMutex());
     for (auto& kv : plans) fftwf_destroy_plan(kv.second);
@@ -50,9 +76,15 @@ struct Fft2d::Impl {
     const auto key = std::make_tuple(h, w, sign);
     auto it = plans.find(key);
     if (it != plans.end()) return it->second;
+#ifdef HVD_HAVE_FFTW_THREADS
+    EnsureFftwThreadsInitialised();
+#endif
     fftwf_plan p;
     {
       std::lock_guard<std::mutex> lock(PlanningMutex());
+#ifdef HVD_HAVE_FFTW_THREADS
+      fftwf_plan_with_nthreads(thread_count);
+#endif
       p = fftwf_plan_dft_2d(h, w, in, out, sign, FFTW_ESTIMATE);
     }
     plans.emplace(key, p);
@@ -63,6 +95,8 @@ struct Fft2d::Impl {
 Fft2d::Fft2d() : impl_(new Impl) {}
 
 Fft2d::~Fft2d() { delete impl_; }
+
+void Fft2d::SetThreadCount(int n) { impl_->thread_count = std::max(1, n); }
 
 ComplexPlane Fft2d::Run(const ComplexPlane& in, int sign, bool normalise) {
   const int h = in.height();

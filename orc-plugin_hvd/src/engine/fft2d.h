@@ -32,6 +32,29 @@ class Fft2d {
   ComplexPlane Forward(const ComplexPlane& in);
   ComplexPlane Inverse(const ComplexPlane& in);
 
+  // Configure how many threads FFTW itself should use internally for each
+  // transform executed through this Fft2d instance. Defaults to
+  // std::thread::hardware_concurrency() at construction (use every core for
+  // the one frame usually being decoded — the preview/normal path).
+  //
+  // IMPORTANT for parallel export (hvd_chroma_decoder_stage.cpp): FFTW's
+  // threading is a global PLANNER setting (fftwf_plan_with_nthreads),
+  // applied at plan-CREATION time, not per-execution — so this only
+  // affects plans created AFTER this call, and every Fft2d sharing the
+  // process (i.e. every export worker thread's own Fft2d) affects the same
+  // global FFTW planner state while planning. That's already serialised by
+  // the same planning mutex that guards fftwf_plan_dft_2d (see fft2d.cpp),
+  // so it's safe, but each export worker MUST call SetThreadCount(1) before
+  // its first Forward()/Inverse() — otherwise every one of the N worker
+  // threads would ALSO fan its own FFTs out across every core, the same
+  // oversubscription problem LimitOpenMpThreadsPerWorker() exists to avoid,
+  // just for FFTW instead of OpenMP.
+  //
+  // No-op (transforms always run on 1 thread, silently) if FFTW wasn't
+  // built with threading support — see CMakeLists.txt's FFTW3F_THREADS
+  // detection.
+  void SetThreadCount(int n);
+
  private:
   ComplexPlane Run(const ComplexPlane& in, int sign, bool normalise);
 
