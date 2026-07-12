@@ -288,6 +288,72 @@ two subsumption theorems-in-practice (spectral symmetry ⊂
 arbitration; N-step PSI ⊂ the temporal equations under IRLS), zero
 borrowable ideas left unharvested in the surveyed record.
 
+## 9e. The "4th dimension" brainstorm (mapping + two additions)
+
+A free-form ideation session (external) proposed ten "extra
+dimensions" for video processing. Honest mapping: six were already
+this decoder's foundations — confidence-as-dimension = the gate
+stack; the complex dimension = χ itself; kinematic neighborhoods and
+the "warped 4D fabric" = motion-compensated equations; between-pixel
+coordinates = sub-pixel/drizzle; local frequency = the adaptive
+spectral init. The semantic dimension is excluded by the purity
+contract. Two ideas were genuinely uncovered and are now implemented:
+
+* **Trajectory-coherent motion** ("the 1D filter that follows the
+  matter"): the offsets f±1..±3 are six independent pairwise matches
+  of ONE physical velocity. A per-tile velocity is fitted
+  (confidence-masked median of d_k/k, with the known half-line parity
+  term (p_k−p_j)/2 removed before fitting — sign matters, the first
+  attempt doubled the bias), and pairwise vectors snap to k·v only
+  under CONSENSUS (≥3 offsets agreeing within 1.5 px): structured
+  motion collapses onto the trajectory, noise-dominated matching is
+  left untouched. Measured: +0.08/+0.09 dB on both benches, never
+  negative. Default on (`trajectory_fit`).
+* **Oriented (±45°) chroma priors** (the (x,y,θ) dimension):
+  diagonal Charbonnier terms with exact adjoints (verified 1e-14),
+  renormalised so the total prior mass is unchanged. Measured
+  trade-off, not a win: −1.0 dB on axis-aligned sharp chroma (SMPTE)
+  vs +2.0 dB on diagonal cross-colour torture (zoneplate). Default
+  off; a documented dial (`--diag-prior`) for diagonal-artifact-heavy
+  material (fine weaves, venetian blinds).
+
+## 9f. Fast mode (optimisation spec for the C++ port)
+
+`--fast` keeps the algorithm and changes the logistics. Measured in
+Python: ~2x wall clock, −0.2/+0.2 dB depending on bench (never worse
+than 0.2). The operation-count savings are larger than the Python
+wall clock shows (interpreter overhead flattens them); expect the
+C++ port to realise closer to the true ratios. Components:
+
+* **Motion cache** (biggest): one estimate per field pair per chunk,
+  shared across passes AND with the anchor blend — the same (j,k)
+  motion was previously computed up to 4x. Slow mode keys per pass
+  (bit-exact preservation of previous behaviour).
+* **Predicted+verified ME**: full pyramid search only for offsets
+  {−1,+1,+2}; the rest get trajectory-predicted vectors audited by
+  TWO SSD evaluations (predicted + zero) instead of ~130 — a ~60x
+  reduction on those offsets (`decoder.verify_motion`).
+* **Adaptive CG exit**: relative gradient-norm tolerance (0.02 slow /
+  0.10 fast) instead of a fixed iteration count; fast also caps total
+  CG iterations at 2/3.
+* **Tile-resolution confidence maps**, bilinearly interpolated (the
+  full-res blur only ever smoothed at sub-tile scale): ~256x cheaper
+  on those maps.
+* **Deferred coherence**: the InSAR gate starts at pass 1 (at pass 0
+  the chroma fields are inits; the measurement is barely informative).
+* **Exact rewrites benefiting BOTH modes**: box blur via integral
+  images (two prefix-sum passes, verified to 1e-16 against the
+  original INCLUDING its constant-normalisation edge semantics and
+  r=2 default — an earlier rewrite silently changed the default
+  radius and cost 0.75 dB, caught by the benches); per-pixel warp
+  vectors computed once per warp trio instead of three times.
+
+C++ port notes: the integral-image blur is two prefix sums (SIMD/
+cache friendly); the motion cache is a per-chunk hash keyed (j,k);
+FFTW plans should be created once per field geometry; tiles and
+fields parallelise trivially (each field's refine is independent
+within a pass).
+
 ## 10. Deferred items, with reasons
 
 * **Multigrid / coarse-to-fine solving**: naive spatial coarsening is

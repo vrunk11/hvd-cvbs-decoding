@@ -69,6 +69,15 @@ def main():
                     help="3D streaming window size (frames)")
     ap.add_argument("--chunk-overlap", type=int, default=2,
                     help="temporal context overlap (frames)")
+    ap.add_argument("--fast", action="store_true",
+                    help="fast mode: same algorithm with cheaper logistics "
+                         "(shared motion cache, predicted+verified ME, "
+                         "adaptive CG exit). Target: >=3x speed, "
+                         "imperceptible difference")
+    ap.add_argument("--diag-prior", type=float, default=0.0,
+                    help="oriented +/-45deg chroma prior weight (0=off): "
+                         "trades axis-aligned chroma sharpness for "
+                         "diagonal cross-colour suppression")
     ap.add_argument("--ntsc-j", action="store_true",
                     help="NTSC-J source: black at 0 IRE (no 7.5 IRE setup) "
                          "— required for correct levels on Japanese discs")
@@ -130,6 +139,8 @@ def main():
                         output_fidelity=not args.soft_output,
                         drizzle=args.drizzle,
                         ntsc_j=args.ntsc_j,
+                        diag_prior=args.diag_prior,
+                        fast=args.fast,
                         acc=not args.no_acc,
                         cg_iterations=args.cg_iter,
                         chroma_gain=args.chroma_gain,
