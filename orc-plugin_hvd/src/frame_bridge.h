@@ -82,8 +82,25 @@ FieldGeometry FieldGeometryFromParams(const FrameParams& fp);
 // see engine.h). NOT safe to call concurrently on the same `engine` from
 // multiple threads; each thread needs its own.
 //   `frame` : frame_width * frame_height samples (row-major, 10-bit codes).
+//
+// `prev_frame`: optional raw state (active-picture, raster order) of the
+// IMMEDIATELY PRECEDING frame in decode order — see engine.h's DecodeFrame
+// doc comment on the frame-level temporal extension. Passing a frame that
+// ISN'T actually adjacent (e.g. after the user scrubs the preview to a
+// distant frame) isn't unsafe, just wasted work: motion estimation against
+// unrelated content typically finds nothing useful and the neighbour term
+// ends up contributing ~nothing, but it's the caller's job to only pass
+// this when it's really the previous frame (see HvdDecodedRepresentation's
+// FrameID-adjacency check in hvd_chroma_decoder_stage.cpp). Ignored if
+// cfg.temporal_strength <= 0 regardless.
+//
+// `out_state`: if non-null, filled with THIS frame's own raw state
+// (active-picture luma/composite/carrier) — retain it (keyed by this
+// frame's FrameID) to pass as `prev_frame` on the NEXT call.
 YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
-                             const HvdConfig& cfg, HvdEngine& engine);
+                             const HvdConfig& cfg, HvdEngine& engine,
+                             const NeighborRawState* prev_frame = nullptr,
+                             NeighborRawState* out_state = nullptr);
 
 // Convenience overload for tests/one-off calls: constructs a throwaway
 // engine internally. Prefer the engine-taking overload above for any

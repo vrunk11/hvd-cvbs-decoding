@@ -10,11 +10,14 @@
 
 #include <orc/plugin/orc_plugin_sdk.h>
 #include <orc/stage/colour_preview_provider.h>
+#include <orc/stage/triggerable_stage.h>
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -97,9 +100,20 @@ public:
     // appendSourceFields()).
     // Safe to call from multiple threads concurrently PROVIDED every
     // thread passes its own HvdEngine and all threads share the same
-    // read_mutex.
+    // read_mutex — but if `prev_frame`/`out_state` are used to chain a
+    // temporal neighbour (see below), the caller must call this frame-by-
+    // frame IN ORDER on a SINGLE thread instead (there's no such thing as
+    // "parallel but sequential" — chaining state across frames is
+    // inherently serial). See export_now()'s two export modes.
+    //
+    // `prev_frame`/`out_state`: same meaning as DecodeFrameBuffer's own
+    // parameters of the same name (frame_bridge.h) — pass the immediately
+    // preceding frame's state to get a temporal neighbour term, and/or
+    // capture this frame's own state to chain into the next call.
     bool decode_and_write_rgb24(FrameID id, ::hvd::HvdEngine& engine,
-                                std::mutex& read_mutex, std::ostream& out) const;
+                                std::mutex& read_mutex, std::ostream& out,
+                                const ::hvd::NeighborRawState* prev_frame = nullptr,
+                                ::hvd::NeighborRawState* out_state = nullptr) const;
 
 private:
     const ::hvd::YcFrameS16& decoded(FrameID id) const;
@@ -138,6 +152,20 @@ private:
 
     mutable std::mutex mutex_;
     mutable std::map<FrameID, ::hvd::YcFrameS16> yc_cache_;
+
+    // Frame-level 3D temporal state (see engine.h's DecodeFrame doc
+    // comment): the raw state of the last frame decoded THROUGH decoded()
+    // (guarded by mutex_ along with everything else here). Only used as a
+    // temporal neighbour on the NEXT call if that call's FrameID is
+    // exactly prev_frame_id_ + 1 — anything else (a preview scrub to a
+    // distant frame) means this cached state isn't really adjacent, so
+    // it's discarded rather than fed in as a misleading "previous frame".
+    // This member is specific to the preview/cached path; export_now()'s
+    // temporal-chained mode keeps its OWN local chain instead (a sequential
+    // export shouldn't perturb whatever the preview was in the middle of,
+    // and vice versa) — see HvdChromaDecoderStage::trigger().
+    mutable std::optional<FrameID> prev_frame_id_;
+    mutable ::hvd::NeighborRawState prev_frame_state_;
 };
 
 // ---------------------------------------------------------------------------
@@ -146,7 +174,8 @@ private:
 class HvdChromaDecoderStage : public DAGStage,
                              public ParameterizedStage,
                              public IStagePreviewCapability,
-                             public IColourPreviewProvider {
+                             public IColourPreviewProvider,
+                             public TriggerableStage {
 public:
     HvdChromaDecoderStage();
 
@@ -162,25 +191,17 @@ public:
 
     // Sink: no downstream Y/C representation. Decoding still happens on
     // execute() (to keep the colour preview live); file export is a
-    // separate, explicit action (see kExportNow/kOutputPath parameters).
+    // separate, explicit action via TriggerableStage (see trigger() below
+    // — this is what shows up as an actual "Export" button in the GUI,
+    // not a checkbox parameter: an earlier version of this modeled export
+    // as a plain bool parameter (export_now), which is why it was
+    // confusing — there was no dedicated UI affordance for it, just an
+    // easy-to-miss checkbox in the parameter list).
     size_t required_input_count() const override { return 1; }
     size_t output_count() const override { return 0; }
 
     std::shared_ptr<const VideoFrameRepresentation> process(
         std::shared_ptr<const VideoFrameRepresentation> source) const;
-
-    // Writes every frame in source's frame_range() to `output_path_` as
-    // raw interleaved RGB24, active picture only
-    // (width * height * 3 bytes per frame, no header). Returns false on
-    // I/O failure or if there's nothing decoded yet.
-    // NOTE: this is a plain raw video dump, not a container — view it with
-    // e.g. `ffplay -f rawvideo -pixel_format rgb24 -video_size WxH file.rgb`.
-    bool export_now(std::string* error) const;
-
-    // Human-readable result of the last export_now() call (empty until one
-    // has run). Not tied to any host status-reporting interface yet — wire
-    // this into whatever the GUI's node-status panel expects.
-    const std::string& export_status() const { return export_status_; }
 
     // ParameterizedStage
     std::vector<ParameterDescriptor> get_parameter_descriptors(
@@ -197,6 +218,24 @@ public:
     std::optional<ColourFrameCarrier> get_colour_preview_carrier(
         uint64_t frame_index, PreviewNavigationHint hint) const override;
 
+    // TriggerableStage: this is the real "Export" button. Builds (or
+    // reuses) the decoded representation from `inputs`, then runs the
+    // parallel frame-level export to output_path_ — same worker-pool
+    // logic as before, just reached through the proper SDK interface
+    // instead of a bool parameter now.
+    bool trigger(const std::vector<ArtifactPtr>& inputs,
+                const std::map<std::string, ParameterValue>& parameters,
+                IObservationContext& observation_context) override;
+    std::string get_trigger_status() const override { return export_status_; }
+    void set_progress_callback(TriggerProgressCallback callback) override
+    {
+        progress_callback_ = std::move(callback);
+    }
+    bool is_trigger_in_progress() const override
+    {
+        return trigger_in_progress_.load();
+    }
+
 private:
     void refresh_status();
 
@@ -204,6 +243,8 @@ private:
     std::string output_path_;
     mutable std::string export_status_;
     mutable std::shared_ptr<const VideoFrameRepresentation> cached_output_;
+    TriggerProgressCallback progress_callback_;
+    mutable std::atomic<bool> trigger_in_progress_{false};
 };
 
 }  // namespace orc::plugins::hvd

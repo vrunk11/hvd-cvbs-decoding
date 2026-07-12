@@ -46,7 +46,9 @@ FieldGeometry FieldGeometryFromParams(const FrameParams& fp) {
 }
 
 YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
-                             const HvdConfig& cfg, HvdEngine& engine) {
+                             const HvdConfig& cfg, HvdEngine& engine,
+                             const NeighborRawState* prev_frame,
+                             NeighborRawState* out_state) {
   const int fw = fp.frame_width;
   const int fh = fp.frame_height;
   const int f1 = fp.field1_lines;
@@ -75,7 +77,15 @@ YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
     }
   }
 
-  const FrameYc yc = engine.DecodeFrame(top, bottom, g, cfg);
+  std::vector<NeighborRawState> prev_frames;
+  if (prev_frame && cfg.enable_temporal) prev_frames.push_back(*prev_frame);
+  const FrameYc yc = engine.DecodeFrame(top, bottom, g, cfg, prev_frames);
+
+  if (out_state) {
+    out_state->luma = yc.luma;
+    out_state->composite = yc.composite;
+    out_state->carrier = yc.carrier;
+  }
 
   // --- Re-weave into a field-sequential Y/C split --------------------------
   YcFrameS16 out;

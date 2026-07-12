@@ -37,8 +37,12 @@ constexpr const char* kChromaGain = "chroma_gain";
 constexpr const char* kMonochrome = "monochrome";
 constexpr const char* kSymmetryVariant = "symmetry_variant";
 constexpr const char* kChromaPhaseDeg = "chroma_phase_deg";
+constexpr const char* kFftThreads = "fft_threads";
+constexpr const char* kEnableTemporal = "enable_temporal";
+constexpr const char* kTemporalStrength = "temporal_strength";
+constexpr const char* kMcTile = "mc_tile";
+constexpr const char* kMcSearch = "mc_search";
 constexpr const char* kOutputPath = "output_path";
-constexpr const char* kExportNow = "export_now";
 
 // BT.601-ish YUV -> RGB, same matrix as engine/colour.cpp's YuvToRgb16 but
 // operating directly on normalised [0,1]-ish code-domain deltas (see
@@ -119,6 +123,12 @@ const ::hvd::YcFrameS16& HvdDecodedRepresentation::decoded(FrameID id) const
     const ::hvd::FrameParams fp = frame_params();
     ::hvd::YcFrameS16 yc;
     if (source_ && fp.frame_width > 0 && fp.frame_height > 0) {
+        // Tunable live from the UI (fft_threads) rather than hardcoded —
+        // FFTW's own thread-sync overhead can outweigh its benefit on an
+        // image this small, and the right value is CPU/size-dependent, not
+        // something to guess once in code. See hvd_config.h.
+        engine_.SetFftThreads(config_.fft_threads);
+
         // IMPORTANT: for a source that's already Y/C separated (S-Video-
         // style captures, some hi-fi VHS formats), get_frame() (composite)
         // returns the LUMA plane with no chroma in it at all — see
@@ -140,8 +150,28 @@ const ::hvd::YcFrameS16& HvdDecodedRepresentation::decoded(FrameID id) const
             if (luma && chroma) {
                 yc = ::hvd::DecodeYcFrameBuffer(luma, chroma, fp, config_, engine_);
             }
+            // No frame-level temporal wiring on the Y/C-native path yet —
+            // DecodeChromaOnly has no prev_frames parameter (see its doc
+            // comment in engine.h: there's no Y/C arbitration happening
+            // there for a temporal term to improve). prev_frame_id_/
+            // prev_frame_state_ are only ever populated by the composite
+            // path below, so switching between the two source kinds
+            // simply won't chain a temporal neighbour — not unsafe, just
+            // inert here.
         } else if (const sample_type* frame = source_->get_frame(id)) {
-            yc = ::hvd::DecodeFrameBuffer(frame, fp, config_, engine_);
+            // Only treat the cached state as a real temporal neighbour if
+            // it's truly the immediately preceding frame — see this
+            // member's doc comment in the header for why anything else
+            // gets discarded instead of fed in as a misleading neighbour.
+            const ::hvd::NeighborRawState* prev =
+                (prev_frame_id_.has_value() && *prev_frame_id_ + 1 == id)
+                    ? &prev_frame_state_
+                    : nullptr;
+            ::hvd::NeighborRawState this_frame_state;
+            yc = ::hvd::DecodeFrameBuffer(frame, fp, config_, engine_, prev,
+                                          &this_frame_state);
+            prev_frame_id_ = id;
+            prev_frame_state_ = std::move(this_frame_state);
         }
     }
     auto [ins, ok] = yc_cache_.emplace(id, std::move(yc));
@@ -288,7 +318,8 @@ bool HvdDecodedRepresentation::write_raw_rgb24_frame(
 
 bool HvdDecodedRepresentation::decode_and_write_rgb24(
     FrameID id, ::hvd::HvdEngine& engine, std::mutex& read_mutex,
-    std::ostream& out) const
+    std::ostream& out, const ::hvd::NeighborRawState* prev_frame,
+    ::hvd::NeighborRawState* out_state) const
 {
     ::hvd::FrameParams fp;
     ::hvd::YcFrameS16 yc;
@@ -311,11 +342,17 @@ bool HvdDecodedRepresentation::decode_and_write_rgb24(
             const std::vector<sample_type> chroma_copy(chroma, chroma + n);
             yc = ::hvd::DecodeYcFrameBuffer(luma_copy.data(), chroma_copy.data(),
                                             fp, config_, engine);
+            // No frame-level temporal wiring on the Y/C-native path — see
+            // decoded()'s equivalent comment for why (DecodeChromaOnly has
+            // no arbitration step for a temporal term to improve). A
+            // caller chaining state across calls just won't get a neighbour
+            // whenever the source happens to be Y/C-native; harmless.
         } else {
             const sample_type* frame = source_->get_frame(id);
             if (!frame) return false;
             const std::vector<sample_type> frame_copy(frame, frame + n);
-            yc = ::hvd::DecodeFrameBuffer(frame_copy.data(), fp, config_, engine);
+            yc = ::hvd::DecodeFrameBuffer(frame_copy.data(), fp, config_, engine,
+                                          prev_frame, out_state);
         }
     }
     if (yc.luma.empty()) return false;
@@ -366,8 +403,9 @@ std::vector<ArtifactPtr> HvdChromaDecoderStage::execute(
     ObservationContext&)
 {
     // Sink: never returns an output artifact (output_count() == 0). We still
-    // decode on every execute() so the colour preview stays live, and so
-    // export_now() has something to write.
+    // decode on every execute() so the colour preview stays live. File
+    // export happens through trigger() (TriggerableStage) instead — a real
+    // "Export" button in the GUI, not a parameter here.
     if (inputs.empty() || !inputs[0]) {
         cached_output_.reset();
         return {};
@@ -380,18 +418,6 @@ std::vector<ArtifactPtr> HvdChromaDecoderStage::execute(
     if (!parameters.empty()) set_parameters(parameters);
 
     cached_output_ = process(vfr);
-
-    bool want_export = false;
-    auto it = parameters.find(kExportNow);
-    if (it != parameters.end() && std::holds_alternative<bool>(it->second)) {
-        want_export = std::get<bool>(it->second);
-    }
-    if (want_export) {
-        std::string error;
-        export_status_ =
-            export_now(&error) ? ("Export complete: " + output_path_)
-                               : ("Error: " + error);
-    }
     return {};
 }
 
@@ -403,26 +429,88 @@ HvdChromaDecoderStage::process(
     return std::make_shared<HvdDecodedRepresentation>(std::move(source), config_);
 }
 
-bool HvdChromaDecoderStage::export_now(std::string* error) const
+bool HvdChromaDecoderStage::trigger(
+    const std::vector<ArtifactPtr>& inputs,
+    const std::map<std::string, ParameterValue>& parameters,
+    IObservationContext&)
 {
-    auto set_error = [&](const std::string& msg) {
-        if (error) *error = msg;
+    trigger_in_progress_.store(true);
+    auto fail = [&](const std::string& msg) {
+        export_status_ = "Error: " + msg;
+        trigger_in_progress_.store(false);
         return false;
     };
-    if (output_path_.empty()) return set_error("no output_path configured");
+
+    if (!parameters.empty()) set_parameters(parameters);
+
+    // Self-sufficient, per TriggerableStage's contract ("reading all fields
+    // from input and writing to output file") — build the representation
+    // fresh from `inputs` rather than assuming execute() already ran. Falls
+    // back to whatever's already cached if inputs weren't (re-)supplied.
+    if (!inputs.empty() && inputs[0]) {
+        if (auto vfr = std::dynamic_pointer_cast<const VideoFrameRepresentation>(inputs[0])) {
+            cached_output_ = process(vfr);
+        }
+    }
+
+    if (output_path_.empty()) return fail("no output_path configured");
 
     auto repr = std::dynamic_pointer_cast<const HvdDecodedRepresentation>(cached_output_);
-    if (!repr) return set_error("nothing decoded yet (run the pipeline first)");
+    if (!repr) return fail("no input (connect a video source and try again)");
 
     const auto [w, h] = repr->active_picture_size();
-    if (w == 0 || h == 0) return set_error("no active picture geometry");
+    if (w == 0 || h == 0) return fail("no active picture geometry");
 
     std::ofstream out(output_path_, std::ios::binary | std::ios::trunc);
-    if (!out) return set_error("could not open '" + output_path_ + "' for writing");
+    if (!out) return fail("could not open '" + output_path_ + "' for writing");
 
     const FrameIDRange range = cached_output_->frame_range();
-    if (range.last < range.first) return set_error("frame range was empty");
+    if (range.last < range.first) return fail("frame range was empty");
     const uint64_t total = range.last - range.first + 1;
+
+    if (progress_callback_) progress_callback_(0, total, "Starting export...");
+
+    if (config_.enable_temporal) {
+        // Temporal mode: frame N's decode needs frame N-1's ALREADY-DECODED
+        // state (see engine.h's DecodeFrame doc comment) — there's no such
+        // thing as "parallel but sequential", chaining is inherently
+        // serial. We don't trade that away for throughput (no quality
+        // loss): this runs single-threaded ACROSS frames, but with full
+        // per-frame parallelism (OpenMP/FFTW use every core) since only
+        // one frame is ever in flight here — no oversubscription concern,
+        // unlike the frame-parallel path below where each of several
+        // concurrent workers must cap itself.
+        ::hvd::HvdEngine engine;
+        engine.SetFftThreads(config_.fft_threads);
+        std::mutex read_mutex;  // decode_and_write_rgb24 always takes one,
+                                // even though nothing else touches source_
+                                // concurrently on this path
+        std::optional<FrameID> prev_id;
+        ::hvd::NeighborRawState prev_state;
+        uint64_t written = 0;
+        for (FrameID id = range.first; id <= range.last; ++id) {
+            const ::hvd::NeighborRawState* prev =
+                (prev_id.has_value() && *prev_id + 1 == id) ? &prev_state : nullptr;
+            ::hvd::NeighborRawState this_state;
+            if (!repr->decode_and_write_rgb24(id, engine, read_mutex, out, prev,
+                                              &this_state)) {
+                return fail("failed decoding frame " + std::to_string(id));
+            }
+            prev_id = id;
+            prev_state = std::move(this_state);
+            ++written;
+            if (progress_callback_) {
+                progress_callback_(written, total,
+                                   "Exported frame " + std::to_string(written) +
+                                       "/" + std::to_string(total) + " (temporal)");
+            }
+        }
+        if (written == 0) return fail("frame range was empty");
+        export_status_ = "Export complete: " + std::to_string(written) +
+                         " frames (temporal chain) -> " + output_path_;
+        trigger_in_progress_.store(false);
+        return true;
+    }
 
     const unsigned hw = std::thread::hardware_concurrency();
     const uint64_t num_threads =
@@ -437,11 +525,19 @@ bool HvdChromaDecoderStage::export_now(std::string* error) const
         uint64_t written = 0;
         for (FrameID id = range.first; id <= range.last; ++id) {
             if (!repr->decode_and_write_rgb24(id, engine, read_mutex, out)) {
-                return set_error("failed decoding frame " + std::to_string(id));
+                return fail("failed decoding frame " + std::to_string(id));
             }
             ++written;
+            if (progress_callback_) {
+                progress_callback_(written, total,
+                                   "Exported frame " + std::to_string(written) +
+                                       "/" + std::to_string(total));
+            }
         }
-        return written > 0;
+        if (written == 0) return fail("frame range was empty");
+        export_status_ = "Export complete: " + output_path_;
+        trigger_in_progress_.store(false);
+        return true;
     }
 
     // --- Parallel export ----------------------------------------------
@@ -531,15 +627,23 @@ bool HvdChromaDecoderStage::export_now(std::string* error) const
         }
         ++next_to_write;
         ++written;
+        if (progress_callback_) {
+            progress_callback_(written, total,
+                               "Exported frame " + std::to_string(written) +
+                                   "/" + std::to_string(total));
+        }
     }
 
     for (auto& t : workers) t.join();
 
-    if (io_failed) return set_error("I/O error writing '" + output_path_ + "'");
+    if (io_failed) return fail("I/O error writing '" + output_path_ + "'");
     if (failed.load()) {
-        return set_error(failure_message.empty() ? "export failed" : failure_message);
+        return fail(failure_message.empty() ? "export failed" : failure_message);
     }
-    if (written == 0) return set_error("frame range was empty");
+    if (written == 0) return fail("frame range was empty");
+    export_status_ = "Export complete: " + std::to_string(written) +
+                     " frames -> " + output_path_;
+    trigger_in_progress_.store(false);
     return true;
 }
 
@@ -599,17 +703,44 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "reference, hence the default; treat it as tunable per-capture, "
             "not as fixed.",
             ParameterType::DOUBLE, real(-180.0, 180.0, 180.0)},
+        ParameterDescriptor{kFftThreads, "FFTW threads (preview)",
+            "Threads FFTW uses internally per transform in the preview "
+            "path (parallel export always forces this to 1 per worker "
+            "regardless). 1 disables FFTW's own threading. There's no way "
+            "to predict the best value analytically — it depends on your "
+            "CPU and image size — so try 1/2/4/your core count live and "
+            "keep whichever measures fastest.",
+            ParameterType::INT32, integer(1, 64, 4)},
+        ParameterDescriptor{kEnableTemporal, "Enable 3D (temporal)",
+            "Use the immediately preceding frame as extra motion-"
+            "compensated evidence in the solve. Off by default (pure 2D). "
+            "Independent of Temporal strength below, so you can toggle "
+            "this without losing your tuned strength value. Frame-level "
+            "3D only — decode_sequence's richer bidirectional/chunked "
+            "pipeline isn't wired up.",
+            ParameterType::BOOL, boolean(false)},
+        ParameterDescriptor{kTemporalStrength, "Temporal strength",
+            "Weight of the motion-compensated previous-frame data terms in "
+            "the solve, once Enable 3D is on (has no effect otherwise). "
+            "Export automatically switches to a slower, sequential mode "
+            "when 3D is enabled so the temporal chain carries through the "
+            "whole export with no quality loss (see "
+            "HvdChromaDecoderStage::trigger()).",
+            ParameterType::DOUBLE, real(0.0, 4.0, 1.0)},
+        ParameterDescriptor{kMcTile, "Motion tile size (px)",
+            "Block-matching tile size for the temporal path.",
+            ParameterType::INT32, integer(8, 128, 32)},
+        ParameterDescriptor{kMcSearch, "Motion search radius (px)",
+            "Block-matching search radius for the temporal path.",
+            ParameterType::INT32, integer(2, 64, 16)},
         ParameterDescriptor{kOutputPath, "Output file path",
-            "Destination for 'Export': raw interleaved RGB24, no container. "
-            "View with e.g. ffplay -f rawvideo -pixel_format rgb24 "
-            "-video_size WxH.",
+            "Destination for the Export button: raw interleaved RGB24, no "
+            "container. View with e.g. ffplay -f rawvideo -pixel_format "
+            "rgb24 -video_size WxH.",
             ParameterType::FILE_PATH,
             ParameterConstraints{std::nullopt, std::nullopt,
                                  ParameterValue{std::string{}}, {}, false,
-                                 std::nullopt}},
-        ParameterDescriptor{kExportNow, "Export",
-            "Write every frame in range to output_path right now.",
-            ParameterType::BOOL, boolean(false)}};
+                                 std::nullopt}}};
 }
 
 std::map<std::string, ParameterValue>
@@ -626,8 +757,12 @@ HvdChromaDecoderStage::get_parameters() const
         {kMonochrome, config_.monochrome},
         {kSymmetryVariant, config_.symmetry_variant},
         {kChromaPhaseDeg, static_cast<double>(config_.chroma_phase_deg)},
-        {kOutputPath, output_path_},
-        {kExportNow, false}};  // momentary action, never reflects "on"
+        {kFftThreads, static_cast<int32_t>(config_.fft_threads)},
+        {kEnableTemporal, config_.enable_temporal},
+        {kTemporalStrength, static_cast<double>(config_.temporal_strength)},
+        {kMcTile, static_cast<int32_t>(config_.mc_tile)},
+        {kMcSearch, static_cast<int32_t>(config_.mc_search)},
+        {kOutputPath, output_path_}};
 }
 
 bool HvdChromaDecoderStage::set_parameters(
@@ -667,9 +802,12 @@ bool HvdChromaDecoderStage::set_parameters(
     get_bool(kMonochrome, config_.monochrome);
     get_bool(kSymmetryVariant, config_.symmetry_variant);
     get_double(kChromaPhaseDeg, config_.chroma_phase_deg);
+    get_int(kFftThreads, config_.fft_threads);
+    get_bool(kEnableTemporal, config_.enable_temporal);
+    get_double(kTemporalStrength, config_.temporal_strength);
+    get_int(kMcTile, config_.mc_tile);
+    get_int(kMcSearch, config_.mc_search);
     get_string(kOutputPath, output_path_);
-    // kExportNow is read directly in execute(), not stored: it's a momentary
-    // action, not persistent state.
 
     cached_output_.reset();
     refresh_status();

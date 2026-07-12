@@ -15,19 +15,28 @@
 // A single Fft2d (FFTW plan cache) is owned by the engine and reused across
 // frames, so repeated decoding of a sequence does not re-plan.
 //
-// 3-D / temporal decoding is a documented extension point: DecodeFrame takes
-// only the current frame's two fields today; the temporal terms in the
-// reference operate on neighbouring fields and would be added as an overload
-// that also accepts the neighbour window (see docs/PORTING.md).
+// 3-D / temporal decoding: DecodeFrame optionally takes a list of PREVIOUS
+// woven frames' raw state (see NeighborRawState in temporal.h) and motion-
+// compensates against them (temporal.h's MotionCompensatePrev), feeding the
+// result to VariationalRefine's neighbours parameter. This is decode_frame's
+// own frame-level 3D mode in the reference — a separate, much simpler
+// architecture than decode_sequence's field-granularity chunked/Gauss-Seidel
+// pipeline (bidirectional neighbours, multi-pass refinement, synth_reference
+// NR anchor, drizzle), which remains a larger, deferred enhancement (see
+// docs/PORTING.md). This engine only ever sees PAST frames as neighbours —
+// a future frame isn't available yet when decoding sequentially one frame
+// at a time; decode_sequence's bidirectional mode needs the chunked driver.
 
 #ifndef ORC_PLUGIN_HVD_ENGINE_ENGINE_H_
 #define ORC_PLUGIN_HVD_ENGINE_ENGINE_H_
 
 #include <memory>
+#include <vector>
 
 #include "engine/hvd_config.h"
 #include "engine/ntsc_geometry.h"
 #include "engine/plane.h"
+#include "engine/temporal.h"
 
 namespace hvd {
 
@@ -50,6 +59,10 @@ struct FrameYc {
   Plane chroma;                // C = S - Y = Re[chi * carrier]  (IRE, AC)
   Plane composite;             // S (IRE), for verification / passthrough
   ComplexPlane chroma_phasor;  // chi = V - iU (IRE)
+  ComplexPlane carrier;        // exp(i*phi) used for this frame — retain this
+                                // (with luma/composite) if you want to use
+                                // this frame as a future DecodeFrame call's
+                                // temporal neighbour (see NeighborRawState).
   float acc_gain = 1.0F;       // measured Automatic Color Control gain
 };
 
@@ -64,8 +77,17 @@ class HvdEngine {
   // Decode one frame from its two fields. `first` and `second` may be given in
   // capture order; the engine orders first-field lines onto the even rows using
   // is_first_field. `g` is the field geometry, `cfg` the knobs.
+  //
+  // `prev_frames`: optional raw state (luma/composite/carrier) of one or
+  // more PREVIOUS woven frames, used as motion-compensated temporal data
+  // terms when cfg.temporal_strength > 0 (ignored otherwise, and ignored
+  // if empty regardless of temporal_strength — see hvd_config.h). The
+  // caller is responsible for keeping these around across calls (e.g. the
+  // previous call's own FrameYc::luma/composite + the carrier used for
+  // it); this engine has no memory of past frames itself.
   FrameYc DecodeFrame(const FieldInput& first, const FieldInput& second,
-                      const FieldGeometry& g, const HvdConfig& cfg);
+                      const FieldGeometry& g, const HvdConfig& cfg,
+                      const std::vector<NeighborRawState>& prev_frames = {});
 
   // For sources that are ALREADY Y/C separated at capture (has_separate_
   // channels() on the host side — S-Video-style captures, some hi-fi VHS

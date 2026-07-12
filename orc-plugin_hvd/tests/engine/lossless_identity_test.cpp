@@ -75,6 +75,29 @@ void RunTests() {
   const hvd::RefineResult ref =
       hvd::VariationalRefine(s, carrier, init.chroma, cfg);
   CHECK_NEAR(MaxResidual(s, ref.luma, ref.chroma, carrier), 0.0, 1e-3);
+
+  // --- Same check, now with a temporal neighbour term active. The whole
+  // point of VariationalRefine's neighbours parameter is that Y stays
+  // EXACTLY eliminated (Y = S - Re[chi*carrier]) even in "3D mode" — see
+  // variational.h's doc comment on the algebraic reformulation. A perfect
+  // static neighbour (same composite, 180 deg-flipped carrier) is the
+  // reference's own worked example for what this should do to a static
+  // pixel; here we just confirm the lossless split survives regardless. --
+  {
+    hvd::NeighborTerm nbr;
+    nbr.composite = s;  // a perfectly static "neighbour" frame
+    nbr.carrier = ComplexPlane(h, w);
+    for (size_t i = 0; i < nbr.carrier.size(); ++i) nbr.carrier[i] = -carrier[i];
+    nbr.confidence = Plane(h, w, 1.0F);
+
+    HvdConfig cfg_3d = cfg;
+    cfg_3d.temporal_strength = 0.5F;
+    cfg_3d.temporal_eps = 4.0F;
+
+    const hvd::RefineResult ref3d = hvd::VariationalRefine(
+        s, carrier, init.chroma, cfg_3d, {nbr});
+    CHECK_NEAR(MaxResidual(s, ref3d.luma, ref3d.chroma, carrier), 0.0, 1e-3);
+  }
 }
 
 TEST_MAIN()

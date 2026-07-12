@@ -106,7 +106,8 @@ HvdEngine::~HvdEngine() = default;
 void HvdEngine::SetFftThreads(int n) { fft_->SetThreadCount(n); }
 
 FrameYc HvdEngine::DecodeFrame(const FieldInput& first, const FieldInput& second,
-                               const FieldGeometry& g, const HvdConfig& cfg) {
+                               const FieldGeometry& g, const HvdConfig& cfg,
+                               const std::vector<NeighborRawState>& prev_frames) {
   const WovenFrame w = WeaveAndBuildCarrier(first, second, g, cfg);
   const Plane& s = w.s;
   const ComplexPlane& carrier = w.carrier;
@@ -116,7 +117,24 @@ FrameYc HvdEngine::DecodeFrame(const FieldInput& first, const FieldInput& second
   Plane luma;
   ComplexPlane chi;
   if (cfg.cg_iterations > 0 && !cfg.monochrome) {
-    RefineResult r = VariationalRefine(s, carrier, init.chroma, cfg);
+    std::vector<NeighborTerm> neighbors;
+    HvdConfig effective_cfg = cfg;
+    if (!prev_frames.empty() && cfg.enable_temporal) {
+      // Auto-calibrate temporal_eps from measured composite noise if the
+      // caller left it at 0 — see hvd_config.h's doc comment for why a
+      // bare 0 would otherwise silently zero out every neighbour weight.
+      if (effective_cfg.temporal_eps <= 0.0F) {
+        const float sigma = EstimateNoiseIre(s);
+        effective_cfg.temporal_eps = std::clamp(7.0F * sigma, 4.0F, 20.0F);
+      }
+      neighbors.reserve(prev_frames.size());
+      for (const NeighborRawState& prev : prev_frames) {
+        const MotionCompensatedResult mc =
+            MotionCompensatePrev(prev, init.luma, cfg.mc_tile, cfg.mc_search);
+        neighbors.push_back(NeighborTerm{mc.composite, mc.carrier, mc.confidence});
+      }
+    }
+    RefineResult r = VariationalRefine(s, carrier, init.chroma, effective_cfg, neighbors);
     luma = std::move(r.luma);
     chi = std::move(r.chroma);
   } else {
@@ -133,6 +151,7 @@ FrameYc HvdEngine::DecodeFrame(const FieldInput& first, const FieldInput& second
   // Lossless Y/C split: chroma = S - Y (== Re[chi * carrier] when not mono).
   FrameYc out;
   out.composite = s;
+  out.carrier = carrier;
   out.luma = luma;
   out.chroma = Plane(s.height(), s.width());
   for (size_t i = 0; i < out.chroma.size(); ++i) out.chroma[i] = s[i] - luma[i];
@@ -164,6 +183,7 @@ FrameYc HvdEngine::DecodeChromaOnly(const FieldInput& first,
 
   FrameYc out;
   out.composite = s;
+  out.carrier = carrier;
   out.luma = Plane(s.height(), s.width());  // meaningless; caller ignores it
   out.chroma_phasor = init.chroma;
   out.chroma = Plane(s.height(), s.width());

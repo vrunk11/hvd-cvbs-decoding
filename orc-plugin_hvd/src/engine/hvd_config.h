@@ -76,17 +76,77 @@ struct HvdConfig {
   // quality on static material). false => legacy per-field decode.
   bool frame_decode = true;
 
-  // --- 3-D / temporal (declared for the next iteration; not yet used) -----
-  // See docs/PORTING.md §"Deferred". Kept here so the engine interface is
-  // stable when the temporal terms are added.
-  float temporal_strength = 0.0F;  // 0 => pure 2-D
-  bool bidirectional = true;
-  int passes = 1;
-  float temporal_eps = 0.0F;  // 0 => auto-calibrate to measured noise
+  // --- Engine performance (not in the Python reference — this only exists
+  // because of how differently a single C++ process schedules threads
+  // compared to a one-shot numpy script) ------------------------------------
+  // How many threads FFTW uses internally for each 2-D transform in the
+  // preview/single-frame path (parallel-export workers always force this
+  // to 1 themselves, regardless of this value — see
+  // hvd_chroma_decoder_stage.cpp's worker_fn). FFTW's own thread
+  // synchronisation overhead is fixed per call, so on an image this small
+  // (~700x480 active picture) it can easily cost more than it saves; 1
+  // effectively disables FFTW's internal threading. Tune this live instead
+  // of guessing-and-recompiling: try 1 (off), 2, 4, and your full core
+  // count, and keep whichever measures fastest — there's no way to predict
+  // the right value analytically, it depends on the exact CPU and image
+  // size.
+  int fft_threads = 4;
+
+  // --- 3-D / temporal --------------------------------------------------
+  // Frame-level neighbour extension (decode_frame's own 3D mode in the
+  // reference — NOT decode_sequence's separate, field-granularity chunked
+  // pipeline, which is a richer but much larger alternative architecture
+  // deferred for later; see docs/PORTING.md). Wired into HvdEngine::
+  // DecodeFrame via an optional list of previous WOVEN FRAMES' raw state
+  // (luma/composite/carrier), motion-compensated with MotionCompensatePrev
+  // and fed to VariationalRefine's neighbours parameter.
+  //
+  // enable_temporal is the actual on/off switch — NOT in the Python
+  // reference, which just uses temporal_strength == 0 as "off" (no
+  // separate toggle needed there since it's a one-shot script, not a UI
+  // with a value you want to keep dialled in while flipping 3D on/off).
+  // Decoupling them means temporal_strength can default to an actually-
+  // useful working value instead of 0, without that turning 3D on by
+  // itself — this default (unlike every other value in this file) is NOT
+  // from the reference, since the reference has no equivalent "on but at
+  // a sensible strength" state; treat it as a starting point to tune, not
+  // a verified-correct constant.
+  bool enable_temporal = false;
+  float temporal_strength = 1.0F;
+  bool bidirectional = true;       // declared for decode_sequence's richer
+                                    // path; DecodeFrame only ever sees PAST
+                                    // frames (a future frame isn't available
+                                    // yet when decoding sequentially)
+  int passes = 1;                  // ditto — Gauss-Seidel passes, only
+                                    // meaningful for the chunked pipeline
+  // 0 => auto-calibrate from the measured composite noise (clip(7*sigma,
+  // 4, 20), same formula decode_sequence itself uses) via
+  // EstimateNoiseIre — NOT decode_frame's own literal Python (which just
+  // uses cfg.temporal_eps as given, no auto-cal at that level): a fixed 0
+  // default would otherwise make every neighbour weight collapse to ~0
+  // silently (wt = conf*eps_t^2/(rt^2+eps_t^2) degenerates when eps_t==0),
+  // exactly the "declared but does nothing" trap this project has hit
+  // more than once already — auto-calibrating avoids reintroducing it here.
+  float temporal_eps = 0.0F;
   float nr_anchor = 1.0F;
   float nr_eps = 0.0F;
   int nr_radius = 2;
   bool drizzle = false;
+  int mc_tile = 32;    // block-matching tile size (px)
+  int mc_search = 16;  // block-matching search radius (px)
+
+  // decode_sequence-only fields (the field-granularity chunked pipeline,
+  // not yet ported — see docs/PORTING.md). Declared with the reference's
+  // own defaults so the config surface is complete and ready, but nothing
+  // reads these yet; DecodeFrame's simpler frame-level 3D mode has no
+  // concept of "extended" neighbour offsets (its neighbour list is just
+  // whatever the caller passes) or of chunking/coherence gating at all.
+  bool extended_temporal = true;  // decode_sequence: also use fields f±3
+  float coherence_gate = 0.6F;
+  int chunk_frames = 6;
+  int chunk_overlap = 2;
+  bool output_fidelity = true;
+  bool psi_init = false;
 };
 
 }  // namespace hvd
