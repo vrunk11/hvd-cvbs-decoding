@@ -122,14 +122,32 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
   const float eps = cfg.charbonnier_eps;
   const float eps_c = cfg.chroma_eps;
   const float eps_t = cfg.temporal_eps;
-  const float mu_h = cfg.lambda_c * cfg.chroma_aniso;  // chroma broader in x
-  const float mu_v = cfg.lambda_c;
+  float mu_h = cfg.lambda_c * cfg.chroma_aniso;  // chroma broader in x
+  float mu_v = cfg.lambda_c;
+  // Oriented (+/-45 deg) chroma prior weight, distance-normalised by 1/2
+  // (a diagonal step is sqrt(2) px). Renormalise so the TOTAL chroma prior
+  // mass is unchanged by the oriented terms: they redistribute smoothing
+  // across directions (isotropy against diagonal cross-colour) without
+  // increasing it. (THEORY 9e; exact port of the reference's block.)
+  float mu_d = cfg.lambda_c * cfg.diag_prior * 0.5F;
+  {
+    const float tot0 = cfg.lambda_c * (1.0F + cfg.chroma_aniso);
+    const float scale = mu_d > 0.0F ? tot0 / (tot0 + 2.0F * mu_d) : 1.0F;
+    mu_h *= scale;
+    mu_v *= scale;
+    mu_d *= scale;
+  }
   const float k = cfg.structure_coupling;
   const float nu = neighbors.empty() ? 0.0F : cfg.temporal_strength;
   const size_t n_nbr = neighbors.size();
 
   const int irls_outer = std::max(1, cfg.irls_outer);
-  const int n_inner = std::max(1, cfg.cg_iterations / irls_outer);
+  // Fast mode caps the total CG budget at 2/3 (the adaptive tol below is
+  // what actually saves the iterations; the cap is the safety net).
+  const int cg_total = cfg.fast ? cfg.cg_iterations * 2 / 3 : cfg.cg_iterations;
+  const int n_inner = std::max(1, cg_total / irls_outer);
+  // CG relative gradient-norm early-exit (0 = auto, reference values).
+  const float cg_tol = cfg.cg_tol > 0.0F ? cfg.cg_tol : (cfg.fast ? 0.10F : 0.02F);
 
   const int H = s.height();
   const int W = s.width();
@@ -144,6 +162,7 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
   // frame at cg_iterations=60), which dominated the runtime. The maths below
   // is unchanged; only the memory traffic is.
   Plane wx(H, W), wy(H, W), wcx(H, W), wcy(H, W);
+  Plane wd1(H, W), wd2(H, W);  // oriented-prior diffusivities (mu_d > 0 only)
   Plane yc(H, W), tmpr1(H, W), tmpr2(H, W), img(H, W);
   Plane gxY(H, W), gyY(H, W), magx(H, W), magy(H, W);
   ComplexPlane tmpc1(H, W), tmpc2(H, W), tmpc3(H, W), cprior(H, W);
@@ -229,6 +248,29 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
     for (long i = 0; i < n; ++i)
       cprior[i] = 2.0F * (mu_h * cprior[i] + mu_v * tmpc3[i]);
 
+    // Oriented terms: + 2 * mu_d * (D1T(wd1 .* D1(c)) + D2T(wd2 .* D2(c))).
+    // tmpc1..3 are free again by this point (their h/v contributions have
+    // been folded into cprior above).
+    if (mu_d > 0.0F) {
+      D1Into(c, tmpc1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) tmpc1[i] *= wd1[i];
+      D1TInto(tmpc1, tmpc2);
+      D2Into(c, tmpc1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) tmpc1[i] *= wd2[i];
+      D2TInto(tmpc1, tmpc3);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < n; ++i)
+        cprior[i] += 2.0F * mu_d * (tmpc2[i] + tmpc3[i]);
+    }
+
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -268,6 +310,20 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
       h += static_cast<double>(wy[i]) * dydy[i] * dydy[i];
       h += static_cast<double>(mu_h) * wcx[i] * std::norm(dxc[i]);
       h += static_cast<double>(mu_v) * wcy[i] * std::norm(dyc[i]);
+    }
+    if (mu_d > 0.0F) {
+      // dxc/dyc are consumed above; reuse them for the diagonal directions.
+      D1Into(dc_dir, dxc);
+      D2Into(dc_dir, dyc);
+      double acc_d = 0.0;
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : acc_d) schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) {
+        acc_d += static_cast<double>(wd1[i]) * std::norm(dxc[i]);
+        acc_d += static_cast<double>(wd2[i]) * std::norm(dyc[i]);
+      }
+      h += mu_d * acc_d;
     }
     for (size_t j = 0; j < n_nbr; ++j) {
       const Plane& wt = wts[j];
@@ -318,6 +374,24 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
       wcx[i] = eps_c / std::sqrt(dx_den);
       wcy[i] = eps_c / std::sqrt(dy_den);
     }
+    if (mu_d > 0.0F) {
+      // Diagonal diffusivities: 1 / sqrt(1 + (|D chi| / eps_c)^2), the same
+      // Charbonnier shape as wcx/wcy written in the reference's normalised
+      // form (equivalent to eps_c / sqrt(|D chi|^2 + eps_c^2)), without the
+      // luma structure-coupling term (the reference's oriented prior has
+      // none). tmpc1/tmpc2 are free again once magx/magy exist.
+      D1Into(chi, tmpc1);
+      D2Into(chi, tmpc2);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) {
+        const float c1 = std::abs(tmpc1[i]) / eps_c;
+        const float c2 = std::abs(tmpc2[i]) / eps_c;
+        wd1[i] = 1.0F / std::sqrt(1.0F + c1 * c1);
+        wd2[i] = 1.0F / std::sqrt(1.0F + c2 * c2);
+      }
+    }
     if (nu > 0.0F) {
       for (size_t j = 0; j < n_nbr; ++j) {
         temporal_residual_into(chi, neighbors[j], dcs[j]);
@@ -338,6 +412,7 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
 #endif
     for (long i = 0; i < n; ++i) d[i] = -g[i];
     double gg = SumAbs2(g);
+    const double gg0 = gg;  // for the relative-tolerance early exit
 
     for (int it = 0; it < n_inner; ++it) {
       const double hh = curv(d);
@@ -358,6 +433,7 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
       for (long i = 0; i < n; ++i) d[i] = -g_new[i] + beta * d[i];
       g = g_new;
       gg = gg_new;
+      if (gg < static_cast<double>(cg_tol) * cg_tol * gg0) break;
       if (gg < 1e-10 * n_pixels) break;
     }
   }
@@ -376,14 +452,27 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
   const float eps = cfg.charbonnier_eps;
   const float eps_c = cfg.chroma_eps;
   const float eps_t = cfg.temporal_eps;
-  const float mu_h = cfg.lambda_c * cfg.chroma_aniso;
-  const float mu_v = cfg.lambda_c;
+  float mu_h = cfg.lambda_c * cfg.chroma_aniso;
+  float mu_v = cfg.lambda_c;
+  // Oriented prior weight + total-mass renormalisation, identical to the
+  // pass-1 solver (and to the reference, which repeats the block verbatim
+  // in both refiners).
+  float mu_d = cfg.lambda_c * cfg.diag_prior * 0.5F;
+  {
+    const float tot0 = cfg.lambda_c * (1.0F + cfg.chroma_aniso);
+    const float scale = mu_d > 0.0F ? tot0 / (tot0 + 2.0F * mu_d) : 1.0F;
+    mu_h *= scale;
+    mu_v *= scale;
+    mu_d *= scale;
+  }
   const float k = cfg.structure_coupling;
   const float nu = neighbors.empty() ? 0.0F : cfg.temporal_strength;
   const float nu_a = anchor ? cfg.nr_anchor : 0.0F;
 
   const int irls_outer = std::max(1, cfg.irls_outer);
-  const int n_inner = std::max(1, cfg.cg_iterations / irls_outer);
+  const int cg_total = cfg.fast ? cfg.cg_iterations * 2 / 3 : cfg.cg_iterations;
+  const int n_inner = std::max(1, cg_total / irls_outer);
+  const float cg_tol = cfg.cg_tol > 0.0F ? cfg.cg_tol : (cfg.fast ? 0.10F : 0.02F);
 
   const int H = s.height();
   const int W = s.width();
@@ -395,6 +484,7 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
 
   // ---- Workspace, allocated once (same rationale as VariationalRefine) ----
   Plane wx(H, W), wy(H, W), wcx(H, W), wcy(H, W);
+  Plane wd1(H, W), wd2(H, W);  // oriented-prior diffusivities (mu_d > 0 only)
   Plane gxY(H, W), gyY(H, W), magx(H, W), magy(H, W);
   Plane tmpr1(H, W), tmpr2(H, W);
   ComplexPlane tmpc1(H, W), tmpc2(H, W), tmpc3(H, W), cprior(H, W);
@@ -491,6 +581,31 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
 #pragma omp parallel for schedule(static)
 #endif
     for (long i = 0; i < n; ++i) gc_out[i] += 2.0F * mu_v * cprior[i];
+
+    // Oriented terms: + 2 * mu_d * (D1T(wd1 .* D1(cc)) + D2T(wd2 .* D2(cc))).
+    if (mu_d > 0.0F) {
+      D1Into(cc, tmpc1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) tmpc1[i] *= wd1[i];
+      D1TInto(tmpc1, cprior);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) gc_out[i] += 2.0F * mu_d * cprior[i];
+
+      D2Into(cc, tmpc1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) tmpc1[i] *= wd2[i];
+      D2TInto(tmpc1, cprior);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) gc_out[i] += 2.0F * mu_d * cprior[i];
+    }
   };
 
   // curv(dY, dC): the quadratic form's curvature along direction (dY, dC).
@@ -538,6 +653,19 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
       spatial += static_cast<double>(mu_h) * wcx[i] * std::norm(dxc[i]);
       spatial += static_cast<double>(mu_v) * wcy[i] * std::norm(dyc[i]);
     }
+    if (mu_d > 0.0F) {
+      D1Into(d_c, dxc);  // dxc/dyc consumed above; reuse for the diagonals
+      D2Into(d_c, dyc);
+      double acc_d = 0.0;
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+ : acc_d) schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) {
+        acc_d += static_cast<double>(wd1[i]) * std::norm(dxc[i]);
+        acc_d += static_cast<double>(wd2[i]) * std::norm(dyc[i]);
+      }
+      spatial += mu_d * acc_d;
+    }
     return h + spatial;
   };
 
@@ -567,6 +695,19 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
       wcx[i] = eps_c / std::sqrt(dx_den);
       wcy[i] = eps_c / std::sqrt(dy_den);
     }
+    if (mu_d > 0.0F) {
+      D1Into(chi, tmpc1);
+      D2Into(chi, tmpc2);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) {
+        const float c1 = std::abs(tmpc1[i]) / eps_c;
+        const float c2 = std::abs(tmpc2[i]) / eps_c;
+        wd1[i] = 1.0F / std::sqrt(1.0F + c1 * c1);
+        wd2[i] = 1.0F / std::sqrt(1.0F + c2 * c2);
+      }
+    }
     if (nu > 0.0F) {
       for (size_t j = 0; j < n_nbr; ++j) {
         const NeighborTerm& nbr = neighbors[j];
@@ -590,6 +731,7 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
       dC[i] = -gC[i];
     }
     double gg = SumSq(gY) + SumAbs2(gC);
+    const double gg0 = gg;  // for the relative-tolerance early exit
 
     for (int it = 0; it < n_inner; ++it) {
       const double hh = curv(dY, dC);
@@ -617,6 +759,7 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
       gY = gY_new;
       gC = gC_new;
       gg = gg_new;
+      if (gg < static_cast<double>(cg_tol) * cg_tol * gg0) break;
       if (gg < 1e-10 * n_pixels) break;
     }
   }

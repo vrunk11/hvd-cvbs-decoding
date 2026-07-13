@@ -45,6 +45,10 @@ PerPixelMotion VectorsPerPixel(const Plane& mdy, const Plane& mdx, int tile,
 // (no resampling of the carrier itself).
 Plane WarpByTiles(const Plane& a, const Plane& mdy, const Plane& mdx,
                   int tile);
+// Precomputed-vector overload (THEORY 9f, "per-pixel warp vectors computed
+// once per warp trio instead of three times"): pass VectorsPerPixel's output
+// so several warps of the SAME motion field share one interpolation.
+Plane WarpByTiles(const Plane& a, const PerPixelMotion& v);
 
 // Bilinear, sub-pixel warp of a BASEBAND array (post envelope_of — never
 // call this on a still-modulated composite, sub-pixel interpolation of a
@@ -53,6 +57,10 @@ Plane WarpByTiles(const Plane& a, const Plane& mdy, const Plane& mdx,
 // size can differ from the input's (envelope arrays have one fewer row).
 Plane WarpBilinearTiles(const Plane& a, const Plane& dyf, const Plane& dxf,
                         int tile, float row_offset, int out_h, int out_w);
+// Precomputed-vector overload (see WarpByTiles above); `v` must have been
+// interpolated at (out_h, out_w).
+Plane WarpBilinearTiles(const Plane& a, const PerPixelMotion& v,
+                        float row_offset, int out_h, int out_w);
 
 // Line-pair comb separation of a raw field into baseband envelope samples
 // on the HALF-LINE grid (between lines m and m+1) — see envelope_of in the
@@ -84,6 +92,8 @@ Plane ComplexCoherence(const ComplexPlane& z1, const ComplexPlane& z2, int r);
 // for a sub-pixel/bilinear warp of a still-modulated carrier.
 ComplexPlane WarpByTilesComplex(const ComplexPlane& a, const Plane& mdy,
                                 const Plane& mdx, int tile);
+// Precomputed-vector overload (see WarpByTiles above).
+ComplexPlane WarpByTilesComplex(const ComplexPlane& a, const PerPixelMotion& v);
 
 // Upsamples a per-tile confidence field to per-pixel: NEAREST-tile (not
 // VectorsPerPixel's smooth interpolation — matches the reference's
@@ -91,6 +101,16 @@ ComplexPlane WarpByTilesComplex(const ComplexPlane& a, const Plane& mdy,
 // a linear scale would), then box-blurred (radius 8) to avoid hard tile
 // seams in the confidence itself.
 Plane UpsampleConfidence(const Plane& conf, int tile, int out_h, int out_w);
+
+// FAST-mode confidence upsample (THEORY 9f): the per-tile confidence map,
+// squared, bilinearly interpolated between tile centers (VectorsPerPixel's
+// interpolation, median-snap included — the reference routes conf**2
+// through _vectors_per_pixel itself). The full-res squared upsample +
+// radius-8 blur above only ever smoothed at sub-tile scale, so
+// interpolating the ~24x24 tile map is ~256x cheaper and visually
+// identical.
+Plane UpsampleConfidenceFast(const Plane& conf, int tile, int out_h,
+                             int out_w);
 
 // Estimates motion from y_from toward y_to and warps every plane in
 // `arrays` accordingly (integer-pel — these are still-modulated composite-
@@ -113,6 +133,14 @@ struct NeighborRawState {
   Plane luma;
   Plane composite;
   ComplexPlane carrier;
+  // The neighbour's decoded BASEBAND chroma phasor (chi = V - iU). Not a raw
+  // measurement — it exists solely so the InSAR coherence gate
+  // (ComplexCoherence, reference decode_sequence's `coherence_gate`) can
+  // compare phasor fields and collapse the neighbour's confidence where the
+  // chroma phase decorrelates (motion residual, content change) — exactly
+  // the situation where a temporal chroma equation turns toxic. May be left
+  // empty; the gate is skipped then.
+  ComplexPlane chroma;
 };
 
 // Envelope-domain neighbour resampling (motion_compensate_envelope in the
@@ -145,9 +173,16 @@ MotionCompensatedResult MotionCompensateEnvelope(
 // re-encoding. Cheaper, and the natural choice for same-parity neighbours
 // (e.g. +/-2 fields, 1 frame apart) where MotionCompensateEnvelope's
 // cross-parity machinery isn't needed.
+// `fast` selects the tile-resolution confidence upsample
+// (UpsampleConfidenceFast) instead of the full-res squared+blurred one.
+// `vpix`: optional precomputed per-pixel vectors for `motion` at the
+// composite's resolution (THEORY 9f "once per warp trio" — the sequence
+// driver shares one interpolation between this warp pair and the
+// coherence gate's chi warp instead of computing it twice per neighbour).
 MotionCompensatedResult MotionCompensatePrev(
     const NeighborRawState& prev, const Plane& y_cur_init, int tile,
-    int search, const MotionField* motion = nullptr);
+    int search, const MotionField* motion = nullptr, bool fast = false,
+    const PerPixelMotion* vpix = nullptr);
 
 }  // namespace hvd
 

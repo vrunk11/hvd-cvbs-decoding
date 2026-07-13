@@ -322,13 +322,6 @@ def holographic_init(S: np.ndarray, phi: np.ndarray,
 
 # ------------------------------------------------- variational refinement
 
-def _laplacian(a: np.ndarray) -> np.ndarray:
-    out = -4.0 * a
-    out += np.roll(a, 1, 0) + np.roll(a, -1, 0)
-    out += np.roll(a, 1, 1) + np.roll(a, -1, 1)
-    return out
-
-
 # --------------------------------------------- motion compensation (3D)
 
 def _box_blur(a, r=2):
@@ -454,7 +447,7 @@ def estimate_motion(Y_ref, Y_cur, tile=32, search=8):
     sdy = _para(cy_m, best, cy_p)
     sdx = _para(cx_m, best, cx_p)
     # explicit zero-motion evaluation for the margin rule
-    zdy, zdx, best0, cost0 = _bm_pass(A, B, tile, [0], [0])
+    _, _, best0, cost0 = _bm_pass(A, B, tile, [0], [0])
 
     take0 = best0 < best
     mdy[take0] = 0
@@ -511,7 +504,7 @@ def verify_motion(Y_ref, Y_cur, pdy, pdx, tile=32):
     pdxi = np.round(np.asarray(pdx)).astype(np.int32)
     mdy, mdx, best, _ = _bm_pass(A, B, tile, [0], [0],
                                  base_dy=pdyi, base_dx=pdxi)
-    zdy, zdx, best0, cost0 = _bm_pass(A, B, tile, [0], [0])
+    _, _, best0, _ = _bm_pass(A, B, tile, [0], [0])
     take0 = best0 <= best
     mdy = np.where(take0, 0, mdy).astype(float)
     mdx = np.where(take0, 0, mdx).astype(float)
@@ -594,6 +587,12 @@ def warp_by_tiles(a, mdy, mdx, tile=32):
     return a[sy, sx]
 
 
+# NOTE (audit): mc_warp / envelope_of / motion_compensate_envelope are
+# call-site dead — the envelope-resampled neighbour variant was tried and
+# REJECTED (its 1-line comb leaks vertical luma gradients into chroma; see
+# the raw-warp comment in decode_sequence). Kept deliberately: the code is
+# the record of the negative result, and the C++ port carries tested
+# equivalents for the same reason.
 def mc_warp(Y_from, Y_to, arrays, tile=32, search=16):
     """Estimate motion from Y_from toward Y_to, warp every array in
     `arrays` accordingly. Returns (warped_list, per-pixel confidence)."""
@@ -1266,10 +1265,6 @@ def drizzle_frame(j0, Ys, chis, parities, cfg, scale=2):
     # fallback where coverage is thin: linear vertical interpolation
     # of the plain woven decode
     base = np.zeros((HF, W)); baseC = np.zeros((HF, W), complex)
-    rows = (np.arange(HF) / scale - parities[j0]) / 2.0
-    r0 = np.clip(np.floor(rows).astype(int), 0, L - 1)
-    fr = np.clip(rows - r0, 0.0, 1.0)[:, None]
-    r1 = np.minimum(r0 + 1, L - 1)
     for (dst, srcs) in ((base, (Ys[j0], Ys[j0 + 1])),
                         (baseC, (chis[j0], chis[j0 + 1]))):
         woven = np.zeros((2 * L, W), dst.dtype)
@@ -1345,9 +1340,9 @@ def psi_closed_form(S, phi, neighbors, chi_fallback):
     # near-singular (det -> 0); blend to fallback there
     ok = det > 1e-3 * np.maximum(a11, 1e-9) ** 3 * 0.01
     d = np.where(ok, det, 1.0)
-    p = (b1 * (a22 * a33 - a23 * a23)
-         - a12 * (b2 * a33 - a23 * b3)
-         + a13 * (b2 * a23 - a22 * b3)) / d          # Y (unused here)
+    # (the Y cofactor of the 3x3 solve is never needed — chi is what the
+    # init wants and Y is re-derived from the identity downstream; the
+    # full-array expansion it used to compute here was pure waste)
     q1 = (a11 * (b2 * a33 - b3 * a23)
           - b1 * (a12 * a33 - a23 * a13)
           + a13 * (a12 * b3 - b2 * a13)) / d         # p = Re chi
@@ -1622,7 +1617,7 @@ def decode_sequence(src: TbcSource, start: int, length: int,
                     os_ = sorted(pair_motion)
                     # odd offsets measure content displacement PLUS the
                     # half-line parity geometry: d_k = k*v + h_k with
-                    # h_k = (p_j - p_k)/2. Remove the known h_k before
+                    # h_k = (p_k - p_j)/2. Remove the known h_k before
                     # fitting the trajectory, reinstate it after —
                     # otherwise the fit mixes two biased populations.
                     pj = field_parity(fidx[j])
@@ -1692,8 +1687,19 @@ def decode_sequence(src: TbcSource, start: int, length: int,
                         # and the warped neighbor chroma, floored so
                         # grey content (|chi|~0, gamma = pure noise)
                         # keeps the equation's LUMA benefit
-                        row_off = (field_parity(fidx[j])
-                                   - field_parity(fidx[k])) / 2.0
+                        # AUDIT FIX (THEORY 9g): the warp convention
+                        # assumes motion WITHOUT the half-line parity
+                        # component (row_offset supplies it) — true while
+                        # the margin rule zeroed static estimates, broken
+                        # once the trajectory snap deliberately
+                        # RE-INTRODUCED h_k into the pairwise vectors:
+                        # adding row_offset on top double-compensated, and
+                        # the gate compared chi fields shifted a FULL line
+                        # on exactly the static consensus tiles it exists
+                        # to protect. The snapped/subpixel motion already
+                        # carries the total inter-grid displacement, so
+                        # the correct warp is sy = y - dy, no row offset.
+                        row_off = 0.0
                         hh, ww = Ys[j].shape
                         vpx = _vectors_per_pixel(
                             np.asarray(mo[0], float),

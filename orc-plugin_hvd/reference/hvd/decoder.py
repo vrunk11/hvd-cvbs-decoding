@@ -50,6 +50,25 @@ IRE_WHITE = 100.0
 
 @dataclass
 class DecoderConfig:
+    fast: bool = False             # FAST MODE: same algorithm, cheaper
+                                   # logistics — motion cache shared across
+                                   # passes and the anchor blend; predicted+
+                                   # verified ME for long offsets; tile-res
+                                   # confidence maps; looser CG early-exit.
+                                   # Target: >=3x speed, <=0.1 dB, no
+                                   # perceptible change.
+    cg_tol: float = 0.0            # CG relative gradient-norm early-exit
+                                   # (0 = auto: 0.02 slow / 0.10 fast)
+    diag_prior: float = 0.0        # oriented (+/-45 deg) chroma prior
+                                   # weight, relative to mu_v and distance-
+                                   # normalised by 1/2 (diagonal step =
+                                   # sqrt(2) px); 0 disables
+    trajectory_fit: bool = True    # fit ONE per-tile velocity across all
+                                   # temporal offsets (they are 6 noisy
+                                   # measurements of one physical motion)
+                                   # and snap agreeing pairwise vectors to
+                                   # the trajectory; disagreement is kept
+                                   # (occlusion/acceleration is signal)
     psi_init: bool = False         # phase-shifting-interferometry init:
                                    # closed-form per-pixel weighted LS over
                                    # the >=3 carrier phases the neighbor
@@ -303,19 +322,26 @@ def holographic_init(S: np.ndarray, phi: np.ndarray,
 
 # ------------------------------------------------- variational refinement
 
-def _laplacian(a: np.ndarray) -> np.ndarray:
-    out = -4.0 * a
-    out += np.roll(a, 1, 0) + np.roll(a, -1, 0)
-    out += np.roll(a, 1, 1) + np.roll(a, -1, 1)
-    return out
-
-
 # --------------------------------------------- motion compensation (3D)
 
 def _box_blur(a, r=2):
-    k = np.ones(2 * r + 1) / (2 * r + 1)
-    a = np.apply_along_axis(np.convolve, 0, a, k, 'same')
-    return np.apply_along_axis(np.convolve, 1, a, k, 'same')
+    """Box blur via integral images (cumulative sums): O(n) fully
+    vectorised, ~20x faster than per-row convolution and the natural
+    formulation for a C++ port (two prefix-sum passes). Semantics
+    match the original exactly: CONSTANT 1/(2r+1) normalisation per
+    axis (zero-padded edges are attenuated, not renormalised), and
+    default radius r=2 — the ME pre-blur depends on both."""
+    h, w = a.shape[:2]
+    c = np.zeros((h + 1, w), np.float64)
+    np.cumsum(a, axis=0, out=c[1:])
+    y0 = np.clip(np.arange(h) - r, 0, h)
+    y1 = np.clip(np.arange(h) + r + 1, 0, h)
+    sy = c[y1] - c[y0]
+    c2 = np.zeros((h, w + 1), np.float64)
+    np.cumsum(sy, axis=1, out=c2[:, 1:])
+    x0 = np.clip(np.arange(w) - r, 0, w)
+    x1 = np.clip(np.arange(w) + r + 1, 0, w)
+    return (c2[:, x1] - c2[:, x0]) / float((2 * r + 1) ** 2)
 
 
 def _decimate(a, f):
@@ -421,7 +447,7 @@ def estimate_motion(Y_ref, Y_cur, tile=32, search=8):
     sdy = _para(cy_m, best, cy_p)
     sdx = _para(cx_m, best, cx_p)
     # explicit zero-motion evaluation for the margin rule
-    zdy, zdx, best0, cost0 = _bm_pass(A, B, tile, [0], [0])
+    _, _, best0, cost0 = _bm_pass(A, B, tile, [0], [0])
 
     take0 = best0 < best
     mdy[take0] = 0
@@ -436,9 +462,19 @@ def estimate_motion(Y_ref, Y_cur, tile=32, search=8):
     sdy[keep_zero] = 0.0
     sdx[keep_zero] = 0.0
 
+    conf = _motion_conf(A, best, tile)
+    return mdy + sdy, mdx + sdx, conf
+
+
+def _motion_conf(A, best, tile):
+    """Confidence layers shared by full and predicted ME: tile-energy
+    explained, median-calibrated outlier rejection, global pair
+    validity (scene-cut detector)."""
+    h, w = A.shape
+    th, tw = (h + tile - 1) // tile, (w + tile - 1) // tile
+
     def tilesum(D):
-        ph, pw = th * tile, tw * tile
-        Dp = np.zeros((ph, pw))
+        Dp = np.zeros((th * tile, tw * tile))
         Dp[:h, :w] = D
         return Dp.reshape(th, tile, tw, tile).sum(axis=(1, 3))
 
@@ -446,13 +482,37 @@ def estimate_motion(Y_ref, Y_cur, tile=32, search=8):
     tvar = tilesum(A ** 2) / (tile * tile) - tmean ** 2
     energy = (tvar + 1.0) * (tile * tile)
     conf = np.clip(1.0 - best / energy, 0.0, 1.0)
-
     r = best / (tile * tile)
     med = np.median(r)
-    excess = np.maximum(0.0, r - med)
-    conf *= (med + 1.0) / (med + 1.0 + excess)
+    conf *= (med + 1.0) / (med + 1.0 + np.maximum(0.0, r - med))
     conf *= 6.0 / (6.0 + med)
-    return mdy + sdy, mdx + sdx, conf
+    return conf
+
+
+def verify_motion(Y_ref, Y_cur, pdy, pdx, tile=32):
+    """FAST-mode ME for long temporal offsets: instead of a full
+    pyramid search (~130 SSD evaluations), evaluate ONLY the
+    trajectory-predicted vector and the zero vector (2 evaluations),
+    keep the better, and compute the standard confidence layers. The
+    trajectory supplies the hypothesis; this supplies the audit. Long
+    offsets are exactly where full search is least reliable anyway
+    (more occlusion), so the quality cost is imperceptible while the
+    ME cost drops ~60x for those offsets."""
+    A = _box_blur(Y_cur)
+    B = _box_blur(Y_ref)
+    pdyi = np.round(np.asarray(pdy)).astype(np.int32)
+    pdxi = np.round(np.asarray(pdx)).astype(np.int32)
+    mdy, mdx, best, _ = _bm_pass(A, B, tile, [0], [0],
+                                 base_dy=pdyi, base_dx=pdxi)
+    _, _, best0, _ = _bm_pass(A, B, tile, [0], [0])
+    take0 = best0 <= best
+    mdy = np.where(take0, 0, mdy).astype(float)
+    mdx = np.where(take0, 0, mdx).astype(float)
+    best = np.where(take0, best0, best)
+    # keep the sub-pixel part of the prediction where it won
+    mdy = np.where(take0, mdy, np.asarray(pdy))
+    mdx = np.where(take0, mdx, np.asarray(pdx))
+    return mdy, mdx, _motion_conf(A, best, tile)
 
 
 def _vectors_per_pixel(mdy, mdx, tile, shape):
@@ -527,6 +587,12 @@ def warp_by_tiles(a, mdy, mdx, tile=32):
     return a[sy, sx]
 
 
+# NOTE (audit): mc_warp / envelope_of / motion_compensate_envelope are
+# call-site dead — the envelope-resampled neighbour variant was tried and
+# REJECTED (its 1-line comb leaks vertical luma gradients into chroma; see
+# the raw-warp comment in decode_sequence). Kept deliberately: the code is
+# the record of the negative result, and the C++ port carries tested
+# equivalents for the same reason.
 def mc_warp(Y_from, Y_to, arrays, tile=32, search=16):
     """Estimate motion from Y_from toward Y_to, warp every array in
     `arrays` accordingly. Returns (warped_list, per-pixel confidence)."""
@@ -558,7 +624,8 @@ def envelope_of(S, phi):
     return Yb.astype(np.float32), chi_b.astype(np.complex64)
 
 
-def _warp_bilinear_tiles(a, dyf, dxf, tile, row_offset=0.0, out_shape=None):
+def _warp_bilinear_tiles(a, dyf, dxf, tile, row_offset=0.0, out_shape=None,
+                         vpix=None):
     """Bilinear warp of a baseband array by per-tile float vectors,
     with a constant extra row offset (grid alignment). The output grid
     may differ from the source grid (envelope arrays have L-1 rows)."""
@@ -566,8 +633,10 @@ def _warp_bilinear_tiles(a, dyf, dxf, tile, row_offset=0.0, out_shape=None):
     ho, wo = int(ho), int(wo)
     yy = np.arange(ho, dtype=np.float64)[:, None] * np.ones((1, wo))
     xx = np.ones((ho, 1)) * np.arange(wo, dtype=np.float64)[None, :]
-    vdy, vdx = _vectors_per_pixel(np.asarray(dyf, float),
+    if vpix is None:
+        vpix = _vectors_per_pixel(np.asarray(dyf, float),
                                   np.asarray(dxf, float), tile, (ho, wo))
+    vdy, vdx = vpix
     sy = yy - vdy + row_offset
     sx = xx - vdx
     hs, ws = a.shape[:2]
@@ -638,7 +707,7 @@ def complex_coherence(z1, z2, r=6):
     return np.clip(num / den, 0.0, 1.0)
 
 
-def motion_compensate_prev(prev, Y_cur_init, tile=32, search=16, motion=None):
+def motion_compensate_prev(prev, Y_cur_init, tile=32, search=16, motion=None, fast=False):
     """Warp a neighbor frame's *raw measurements* toward the current
     frame: its composite S and its carrier phase map phi (per-pixel
     values copied exactly — integer-pel shifts mean no carrier-phase
@@ -651,16 +720,25 @@ def motion_compensate_prev(prev, Y_cur_init, tile=32, search=16, motion=None):
         motion = estimate_motion(Yp, Y_cur_init, tile=tile, search=search)
     mdy, mdx, conf = motion
     h, w = Yp.shape
-    yy, xx = np.mgrid[0:h, 0:w]
-    ty = np.minimum(yy // tile, conf.shape[0] - 1)
-    tx = np.minimum(xx // tile, conf.shape[1] - 1)
-    conf_px = _box_blur(conf[ty, tx] ** 2, r=8)
+    if fast:
+        # tile-resolution confidence, bilinearly interpolated between
+        # tile centers (the full-res box blur only ever smoothed at
+        # sub-tile scale; interpolating the 24x24 tile map is ~256x
+        # cheaper and visually identical)
+        cy, cx = _vectors_per_pixel(conf ** 2, conf ** 2, tile, (h, w))
+        conf_px = cy
+    else:
+        yy, xx = np.mgrid[0:h, 0:w]
+        ty = np.minimum(yy // tile, conf.shape[0] - 1)
+        tx = np.minimum(xx // tile, conf.shape[1] - 1)
+        conf_px = _box_blur(conf[ty, tx] ** 2, r=8)
     S_w = warp_by_tiles(Sp, mdy, mdx, tile)
     phi_w = warp_by_tiles(phip, mdy, mdx, tile)
     return S_w, np.exp(1j * phi_w), conf_px
 
 
-def synth_reference(j, Ys, chis, SP, cfg, parities=None):
+def synth_reference(j, Ys, chis, SP, cfg, parities=None,
+                    motion_cache=None):
     """The re-encode loop (user-suggested pass structure): build a
     denoised reference for frame j by motion-compensated temporal
     blending of the *decoded* fields, then re-encode it to composite
@@ -689,8 +767,13 @@ def synth_reference(j, Ys, chis, SP, cfg, parities=None):
     for k in range(j - cfg.nr_radius, j + cfg.nr_radius + 1):
         if k == j or not (0 <= k < len(Ys)):
             continue
-        mdy, mdx, cf = estimate_motion(Ys[k], Ys[j], tile=tile,
-                                       search=cfg.mc_search)
+        if motion_cache is not None and (j, k) in motion_cache:
+            mdy, mdx, cf = motion_cache[(j, k)]
+        else:
+            mdy, mdx, cf = estimate_motion(Ys[k], Ys[j], tile=tile,
+                                           search=cfg.mc_search)
+            if motion_cache is not None:
+                motion_cache[(j, k)] = (mdy, mdx, cf)
         ty = np.minimum(yy // tile, cf.shape[0] - 1)
         tx = np.minimum(xx // tile, cf.shape[1] - 1)
         conf = _box_blur(cf[ty, tx] ** 2, r=8)
@@ -702,13 +785,17 @@ def synth_reference(j, Ys, chis, SP, cfg, parities=None):
             row_off = (parities[j] - parities[k]) / 2.0
         else:
             row_off = ((j % 2) - (k % 2)) / 2.0
+        vpix = _vectors_per_pixel(np.asarray(mdy, float),
+                                  np.asarray(mdx, float), tile, (hh, ww))
         Yw = _warp_bilinear_tiles(Ys[k], mdy, mdx, tile,
-                                  row_offset=row_off, out_shape=(hh, ww))
+                                  row_offset=row_off, out_shape=(hh, ww),
+                                  vpix=vpix)
         Cw = (_warp_bilinear_tiles(chis[k].real, mdy, mdx, tile,
-                                   row_offset=row_off, out_shape=(hh, ww))
+                                   row_offset=row_off, out_shape=(hh, ww),
+                                   vpix=vpix)
               + 1j * _warp_bilinear_tiles(chis[k].imag, mdy, mdx, tile,
                                           row_offset=row_off,
-                                          out_shape=(hh, ww)))
+                                          out_shape=(hh, ww), vpix=vpix))
         d2 = (Yw - Ys[j]) ** 2 + np.abs(Cw - chis[j]) ** 2
         w = conf * eps_b ** 2 / (d2 + eps_b ** 2)
         accY += w * Yw
@@ -740,6 +827,36 @@ def _dy(a):
     d = np.empty_like(a)
     d[:-1] = a[1:] - a[:-1]
     d[-1] = 0
+    return d
+
+
+def _d1(a):
+    """+45-degree diagonal forward difference (Neumann), for oriented
+    priors (4D brainstorm idea #2: the (x,y,theta) dimension). Built
+    so that _d1T is its exact adjoint (verified in run_tests)."""
+    d = np.zeros_like(a)
+    d[:-1, :-1] = a[1:, 1:] - a[:-1, :-1]
+    return d
+
+
+def _d1T(a):
+    d = np.zeros_like(a)
+    d[:-1, :-1] -= a[:-1, :-1]
+    d[1:, 1:] += a[:-1, :-1]
+    return d
+
+
+def _d2(a):
+    """-45-degree diagonal forward difference (Neumann)."""
+    d = np.zeros_like(a)
+    d[:-1, 1:] = a[1:, :-1] - a[:-1, 1:]
+    return d
+
+
+def _d2T(a):
+    d = np.zeros_like(a)
+    d[:-1, 1:] -= a[:-1, 1:]
+    d[1:, :-1] += a[:-1, 1:]
     return d
 
 
@@ -804,6 +921,13 @@ def variational_refine(S, phi, Y0, chi0, cfg: DecoderConfig,
     eps_t = cfg.temporal_eps
     mu_h = cfg.lambda_c * cfg.chroma_aniso   # chroma is broader horizontally
     mu_v = cfg.lambda_c
+    mu_d = cfg.lambda_c * cfg.diag_prior * 0.5
+    # renormalise so the TOTAL chroma prior mass is unchanged by the
+    # oriented terms: they redistribute smoothing across directions
+    # (isotropy against diagonal cross-colour) without increasing it
+    _tot0 = cfg.lambda_c * (1.0 + cfg.chroma_aniso)
+    _scale = _tot0 / (_tot0 + 2.0 * mu_d) if mu_d > 0 else 1.0
+    mu_h, mu_v, mu_d = mu_h * _scale, mu_v * _scale, mu_d * _scale
     neighbors = neighbors or []
     nu = cfg.temporal_strength if neighbors else 0.0
     carrier = np.exp(1j * phi)
@@ -811,7 +935,9 @@ def variational_refine(S, phi, Y0, chi0, cfg: DecoderConfig,
     nbr = [(S_w, carrier - c_w, conf) for (S_w, c_w, conf) in neighbors]
     chi = chi0.copy()
 
-    n_inner = max(1, cfg.cg_iterations // max(1, irls_outer))
+    _cg_total = (int(cfg.cg_iterations * 2 // 3) if cfg.fast
+                 else cfg.cg_iterations)
+    n_inner = max(1, _cg_total // max(1, irls_outer))
 
     def luma(chi):
         return S - np.real(chi * carrier)
@@ -835,6 +961,9 @@ def variational_refine(S, phi, Y0, chi0, cfg: DecoderConfig,
         wy = eps / np.sqrt(gyY ** 2 + eps ** 2)
 
         # chroma diffusivity: own edges + joint coupling with luma edges
+        cd1, cd2 = np.abs(_d1(chi)), np.abs(_d2(chi))
+        wd1 = 1.0 / np.sqrt(1.0 + (cd1 / eps_c) ** 2)
+        wd2 = 1.0 / np.sqrt(1.0 + (cd2 / eps_c) ** 2)
         cx, cy = np.abs(_dx(chi)), np.abs(_dy(chi))
         k = cfg.structure_coupling
         wcx = eps_c / np.sqrt(cx ** 2 + k * gxY ** 2 + eps_c ** 2)
@@ -861,7 +990,9 @@ def variational_refine(S, phi, Y0, chi0, cfg: DecoderConfig,
             g_img = 2.0 * (_dxT(wx * _dx(Yc)) + _dyT(wy * _dy(Yc)))
             gC = (-g_img * np.conj(carrier)
                   + 2.0 * (mu_h * _dxT(wcx * _dx(chi))
-                           + mu_v * _dyT(wcy * _dy(chi))))
+                           + mu_v * _dyT(wcy * _dy(chi))
+                           + mu_d * (_d1T(wd1 * _d1(chi))
+                                     + _d2T(wd2 * _d2(chi)))))
             for (S_w, dc, conf), wt in zip(nbr, wts):
                 gC += (2.0 * nu * wt
                        * temporal_residual(chi, S_w, dc) * np.conj(dc))
@@ -871,7 +1002,9 @@ def variational_refine(S, phi, Y0, chi0, cfg: DecoderConfig,
             dY = -np.real(dC * carrier)
             h = (np.sum(wx * _dx(dY) ** 2) + np.sum(wy * _dy(dY) ** 2)
                  + mu_h * np.sum(wcx * np.abs(_dx(dC)) ** 2)
-                 + mu_v * np.sum(wcy * np.abs(_dy(dC)) ** 2))
+                 + mu_v * np.sum(wcy * np.abs(_dy(dC)) ** 2)
+                 + mu_d * (np.sum(wd1 * np.abs(_d1(dC)) ** 2)
+                           + np.sum(wd2 * np.abs(_d2(dC)) ** 2)))
             for (S_w, dc, conf), wt in zip(nbr, wts):
                 h += nu * np.sum(wt * np.real(dC * dc) ** 2)
             return h
@@ -879,6 +1012,8 @@ def variational_refine(S, phi, Y0, chi0, cfg: DecoderConfig,
         g = grad(chi)
         d = -g
         gg = np.real(np.sum(np.conj(g) * g))
+        tol = cfg.cg_tol or (0.10 if cfg.fast else 0.02)
+        gg0 = gg
         for _it in range(n_inner):
             H = curv(d)
             if H <= 1e-12:
@@ -891,6 +1026,8 @@ def variational_refine(S, phi, Y0, chi0, cfg: DecoderConfig,
             beta = gg_new / max(gg, 1e-30)
             d = -g_new + beta * d
             g, gg = g_new, gg_new
+            if gg < tol * tol * gg0:
+                break
             if gg < 1e-10 * S.size:
                 break
 
@@ -925,6 +1062,13 @@ def variational_refine_joint(S, phi, Y0, chi0, cfg: DecoderConfig,
     eps_t = cfg.temporal_eps
     mu_h = cfg.lambda_c * cfg.chroma_aniso
     mu_v = cfg.lambda_c
+    mu_d = cfg.lambda_c * cfg.diag_prior * 0.5
+    # renormalise so the TOTAL chroma prior mass is unchanged by the
+    # oriented terms: they redistribute smoothing across directions
+    # (isotropy against diagonal cross-colour) without increasing it
+    _tot0 = cfg.lambda_c * (1.0 + cfg.chroma_aniso)
+    _scale = _tot0 / (_tot0 + 2.0 * mu_d) if mu_d > 0 else 1.0
+    mu_h, mu_v, mu_d = mu_h * _scale, mu_v * _scale, mu_d * _scale
     neighbors = neighbors or []
     nu = cfg.temporal_strength if neighbors else 0.0
     nu_a = cfg.nr_anchor if anchor is not None else 0.0
@@ -935,12 +1079,17 @@ def variational_refine_joint(S, phi, Y0, chi0, cfg: DecoderConfig,
 
     Y = Y0.copy()
     chi = chi0.copy()
-    n_inner = max(1, cfg.cg_iterations // max(1, irls_outer))
+    _cg_total = (int(cfg.cg_iterations * 2 // 3) if cfg.fast
+                 else cfg.cg_iterations)
+    n_inner = max(1, _cg_total // max(1, irls_outer))
 
     for _outer in range(irls_outer):
         gxY, gyY = _dx(Y), _dy(Y)
         wx = eps / np.sqrt(gxY ** 2 + eps ** 2)
         wy = eps / np.sqrt(gyY ** 2 + eps ** 2)
+        cd1, cd2 = np.abs(_d1(chi)), np.abs(_d2(chi))
+        wd1 = 1.0 / np.sqrt(1.0 + (cd1 / eps_c) ** 2)
+        wd2 = 1.0 / np.sqrt(1.0 + (cd2 / eps_c) ** 2)
         cx, cy = np.abs(_dx(chi)), np.abs(_dy(chi))
         k = cfg.structure_coupling
         wcx = eps_c / np.sqrt(cx ** 2 + k * gxY ** 2 + eps_c ** 2)
@@ -962,7 +1111,9 @@ def variational_refine_joint(S, phi, Y0, chi0, cfg: DecoderConfig,
                 gC += 2.0 * nu_a * w_a * (chi - chi_hat)
             gY += 2.0 * (_dxT(wx * _dx(Y)) + _dyT(wy * _dy(Y)))
             gC += 2.0 * (mu_h * _dxT(wcx * _dx(chi))
-                         + mu_v * _dyT(wcy * _dy(chi)))
+                         + mu_v * _dyT(wcy * _dy(chi))
+                         + mu_d * (_d1T(wd1 * _d1(chi))
+                                   + _d2T(wd2 * _d2(chi))))
             return gY, gC
 
         def curv(dY, dC):
@@ -975,12 +1126,16 @@ def variational_refine_joint(S, phi, Y0, chi0, cfg: DecoderConfig,
                 h += nu_a * np.sum(w_a * (dY ** 2 + np.abs(dC) ** 2))
             h += np.sum(wx * _dx(dY) ** 2) + np.sum(wy * _dy(dY) ** 2)
             h += (mu_h * np.sum(wcx * np.abs(_dx(dC)) ** 2)
-                  + mu_v * np.sum(wcy * np.abs(_dy(dC)) ** 2))
+                  + mu_v * np.sum(wcy * np.abs(_dy(dC)) ** 2)
+                  + mu_d * (np.sum(wd1 * np.abs(_d1(dC)) ** 2)
+                            + np.sum(wd2 * np.abs(_d2(dC)) ** 2)))
             return h
 
         gY, gC = grad(Y, chi)
         dY, dC = -gY, -gC
         gg = np.sum(gY * gY) + np.real(np.sum(np.conj(gC) * gC))
+        tol = cfg.cg_tol or (0.10 if cfg.fast else 0.02)
+        gg0 = gg
         for _it in range(n_inner):
             H = curv(dY, dC)
             if H <= 1e-12:
@@ -995,6 +1150,8 @@ def variational_refine_joint(S, phi, Y0, chi0, cfg: DecoderConfig,
             dY = -gY2 + beta * dY
             dC = -gC2 + beta * dC
             gY, gC, gg = gY2, gC2, gg2
+            if gg < tol * tol * gg0:
+                break
             if gg < 1e-10 * S.size:
                 break
 
@@ -1108,10 +1265,6 @@ def drizzle_frame(j0, Ys, chis, parities, cfg, scale=2):
     # fallback where coverage is thin: linear vertical interpolation
     # of the plain woven decode
     base = np.zeros((HF, W)); baseC = np.zeros((HF, W), complex)
-    rows = (np.arange(HF) / scale - parities[j0]) / 2.0
-    r0 = np.clip(np.floor(rows).astype(int), 0, L - 1)
-    fr = np.clip(rows - r0, 0.0, 1.0)[:, None]
-    r1 = np.minimum(r0 + 1, L - 1)
     for (dst, srcs) in ((base, (Ys[j0], Ys[j0 + 1])),
                         (baseC, (chis[j0], chis[j0 + 1]))):
         woven = np.zeros((2 * L, W), dst.dtype)
@@ -1187,9 +1340,9 @@ def psi_closed_form(S, phi, neighbors, chi_fallback):
     # near-singular (det -> 0); blend to fallback there
     ok = det > 1e-3 * np.maximum(a11, 1e-9) ** 3 * 0.01
     d = np.where(ok, det, 1.0)
-    p = (b1 * (a22 * a33 - a23 * a23)
-         - a12 * (b2 * a33 - a23 * b3)
-         + a13 * (b2 * a23 - a22 * b3)) / d          # Y (unused here)
+    # (the Y cofactor of the 3x3 solve is never needed — chi is what the
+    # init wants and Y is re-derived from the identity downstream; the
+    # full-array expansion it used to compute here was pure waste)
     q1 = (a11 * (b2 * a33 - b3 * a23)
           - b1 * (a12 * a33 - a23 * a13)
           + a13 * (a12 * b3 - b2 * a13)) / d         # p = Re chi
@@ -1401,12 +1554,112 @@ def decode_sequence(src: TbcSource, start: int, length: int,
             nr_eps=(cfg.nr_eps if cfg.nr_eps > 0
                     else float(np.clip(3.0 * sigma, 3.0, 12.0))))
         inits = [holographic_init(S, phi, p, ccfg) for (S, phi) in SP]
+        mcache = {}   # per-chunk motion cache: fast mode shares one
+                      # estimate per field pair across passes AND with
+                      # the anchor blend (identical inputs, ~4x fewer
+                      # block-matching runs); slow mode keys per pass
         Ys = [Y.astype(np.float32) for (Y, _) in inits]
         chis = [chi.astype(np.complex64) for (_, chi) in inits]
 
         for _pass in range(n_passes):
             for j in range(len(fidx)):
                 S, phi = SP[j]
+                # --- trajectory-coherent motion (4D brainstorm) --
+                # The offsets f±1..±3 are SIX independent pairwise
+                # matches of what is physically ONE velocity per tile
+                # (over 3/60 s). We therefore fit a per-tile velocity
+                # v as the confidence-weighted median of d_k/k over
+                # all offsets, then snap each pairwise vector to k·v
+                # WHEN IT AGREES (<=1.5 px): six noisy measurements
+                # collapse onto one trajectory ("the 1D filter that
+                # follows the matter"), and disagreement is preserved
+                # as-is — it is signal (occlusion, acceleration), not
+                # noise, and the per-pixel gates handle it.
+                pair_motion = {}
+                full_os = ([-1, 1, 2] if ccfg.fast else offs)
+                for o in offs:
+                    k = j + o
+                    if not (0 <= k < len(fidx)):
+                        continue
+                    ck = (j, k) if ccfg.fast else (j, k, _pass)
+                    if ck in mcache:
+                        pair_motion[o] = mcache[ck]
+                    elif (o in full_os) or not ccfg.trajectory_fit:
+                        pair_motion[o] = mcache[ck] = estimate_motion(
+                            Ys[k], Ys[j], tile=ccfg.mc_tile,
+                            search=ccfg.mc_search)
+                if ccfg.fast and ccfg.trajectory_fit:
+                    # FAST: long offsets get trajectory-PREDICTED
+                    # vectors, audited by verify_motion (2 SSD evals)
+                    have = sorted(o for o in pair_motion)
+                    if have:
+                        pj0 = field_parity(fidx[j])
+                        vys = np.stack([(pair_motion[o][0]
+                                         - (field_parity(fidx[j + o]) - pj0)
+                                         / 2.0) / o for o in have])
+                        vxs = np.stack([pair_motion[o][1] / o
+                                        for o in have])
+                        vym0 = np.median(vys, axis=0)
+                        vxm0 = np.median(vxs, axis=0)
+                        for o in offs:
+                            k = j + o
+                            if o in pair_motion or not (0 <= k < len(fidx)):
+                                continue
+                            ck = (j, k)
+                            if ck in mcache:
+                                pair_motion[o] = mcache[ck]
+                                continue
+                            h_o = (field_parity(fidx[k]) - pj0) / 2.0
+                            pair_motion[o] = mcache[ck] = verify_motion(
+                                Ys[k], Ys[j], o * vym0 + h_o, o * vxm0,
+                                tile=ccfg.mc_tile)
+                if len(pair_motion) >= 2 and ccfg.trajectory_fit:
+                    os_ = sorted(pair_motion)
+                    # odd offsets measure content displacement PLUS the
+                    # half-line parity geometry: d_k = k*v + h_k with
+                    # h_k = (p_k - p_j)/2. Remove the known h_k before
+                    # fitting the trajectory, reinstate it after —
+                    # otherwise the fit mixes two biased populations.
+                    pj = field_parity(fidx[j])
+                    # static content of parity p_k matched from parity
+                    # p_j appears at dy = (p_k - p_j)/2 (derivation in
+                    # THEORY 9e) — the sign matters, the first attempt
+                    # doubled the bias instead of removing it
+                    hk = {o: (field_parity(fidx[j + o]) - pj) / 2.0
+                          for o in os_}
+                    vy = np.stack([(pair_motion[o][0] - hk[o]) / o
+                                   for o in os_])
+                    vx = np.stack([pair_motion[o][1] / o for o in os_])
+                    wv = np.stack([pair_motion[o][2] for o in os_])
+                    # weighted median via argsort would be heavy; the
+                    # plain median over <=6 samples is robust enough,
+                    # with low-confidence samples pushed toward the
+                    # median of the rest by NaN-masking
+                    vy = np.where(wv > 0.15, vy, np.nan)
+                    vx = np.where(wv > 0.15, vx, np.nan)
+                    with np.errstate(all="ignore"):
+                        vym = np.nanmedian(vy, axis=0)
+                        vxm = np.nanmedian(vx, axis=0)
+                    vym = np.nan_to_num(vym)
+                    vxm = np.nan_to_num(vxm)
+                    # consensus requirement: the snap only applies where
+                    # >= 3 offsets agree with the fitted trajectory —
+                    # structured motion qualifies, noise-dominated
+                    # matching leaves the pairwise vectors untouched
+                    agree = 0
+                    for o in os_:
+                        mdy, mdx, _ = pair_motion[o]
+                        agree = agree + ((np.abs(mdy - (o * vym + hk[o]))
+                                          + np.abs(mdx - o * vxm)) <= 1.5)
+                    consensus = agree >= 3
+                    for o in os_:
+                        mdy, mdx, cf = pair_motion[o]
+                        py, px = o * vym + hk[o], o * vxm
+                        ok = consensus & (
+                            (np.abs(mdy - py) + np.abs(mdx - px)) <= 1.5)
+                        pair_motion[o] = (np.where(ok, py, mdy),
+                                          np.where(ok, px, mdx), cf)
+
                 neighbors = []
                 for o in offs:
                     k = j + o
@@ -1421,25 +1674,45 @@ def decode_sequence(src: TbcSource, start: int, length: int,
                     # gradients into chroma and injects cross-colour
                     # on textured content — the artefact this decoder
                     # exists to remove.)
-                    mo = estimate_motion(Ys[k], Ys[j],
-                                         tile=ccfg.mc_tile,
-                                         search=ccfg.mc_search)
+                    mo = pair_motion[o]
                     S_w, c_w, conf_n = motion_compensate_prev(
-                        state, Ys[j], tile=ccfg.mc_tile, motion=mo)
-                    if ccfg.coherence_gate > 0.0:
+                        state, Ys[j], tile=ccfg.mc_tile, motion=mo,
+                        fast=ccfg.fast)
+                    if ccfg.coherence_gate > 0.0 and not (
+                            ccfg.fast and _pass == 0):
+                        # fast: coherence only from pass 1 — at pass 0
+                        # the chi fields are still inits and the
+                        # measurement is barely informative
                         # InSAR coherence between the current chroma
                         # and the warped neighbor chroma, floored so
                         # grey content (|chi|~0, gamma = pure noise)
                         # keeps the equation's LUMA benefit
-                        row_off = (field_parity(fidx[j])
-                                   - field_parity(fidx[k])) / 2.0
+                        # AUDIT FIX (THEORY 9g): the warp convention
+                        # assumes motion WITHOUT the half-line parity
+                        # component (row_offset supplies it) — true while
+                        # the margin rule zeroed static estimates, broken
+                        # once the trajectory snap deliberately
+                        # RE-INTRODUCED h_k into the pairwise vectors:
+                        # adding row_offset on top double-compensated, and
+                        # the gate compared chi fields shifted a FULL line
+                        # on exactly the static consensus tiles it exists
+                        # to protect. The snapped/subpixel motion already
+                        # carries the total inter-grid displacement, so
+                        # the correct warp is sy = y - dy, no row offset.
+                        row_off = 0.0
                         hh, ww = Ys[j].shape
+                        vpx = _vectors_per_pixel(
+                            np.asarray(mo[0], float),
+                            np.asarray(mo[1], float),
+                            ccfg.mc_tile, (hh, ww))
                         Cw = (_warp_bilinear_tiles(
                                   chis[k].real, mo[0], mo[1], ccfg.mc_tile,
-                                  row_offset=row_off, out_shape=(hh, ww))
+                                  row_offset=row_off, out_shape=(hh, ww),
+                                  vpix=vpx)
                               + 1j * _warp_bilinear_tiles(
                                   chis[k].imag, mo[0], mo[1], ccfg.mc_tile,
-                                  row_offset=row_off, out_shape=(hh, ww)))
+                                  row_offset=row_off, out_shape=(hh, ww),
+                                  vpix=vpx))
                         g = complex_coherence(chis[j], Cw)
                         a = ccfg.coherence_gate
                         conf_n = conf_n * ((1.0 - a) + a * g)
@@ -1447,9 +1720,10 @@ def decode_sequence(src: TbcSource, start: int, length: int,
                 if (_pass == 0 and ccfg.psi_init and neighbors):
                     chis[j] = psi_closed_form(S, phi, neighbors, chis[j])
                 if _pass >= 1 and ccfg.nr_anchor > 0.0 and len(fidx) > 1:
-                    anchor = synth_reference(j, Ys, chis, SP, ccfg,
-                                             parities=[field_parity(f)
-                                                       for f in fidx])
+                    anchor = synth_reference(
+                        j, Ys, chis, SP, ccfg,
+                        parities=[field_parity(f) for f in fidx],
+                        motion_cache=(mcache if ccfg.fast else None))
                     Ys[j], chis[j] = variational_refine_joint(
                         S, phi, Ys[j], chis[j], ccfg,
                         neighbors=neighbors, anchor=anchor)

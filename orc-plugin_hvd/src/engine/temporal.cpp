@@ -2,6 +2,10 @@
 
 #include "engine/temporal.h"
 
+// BoxBlur is shared from engine/motion.h (it became public there when the
+// THEORY 9f integral-image rewrite made it independently unit-testable);
+// the local duplicate this file used to carry is gone with it.
+
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -9,59 +13,6 @@
 namespace hvd {
 
 namespace {
-
-// Same box-blur convention as motion.cpp/holographic_init.cpp: zero-padded
-// 'same' convolution normalised by the full kernel length (numpy.convolve
-// equivalent). Duplicated locally rather than shared, matching how the rest
-// of the engine already does this (see motion.cpp's own copy) — small
-// enough that a shared header isn't worth the extra indirection yet.
-void BoxBlur1DRows(Plane* a, int r) {
-  const int h = a->height();
-  const int w = a->width();
-  const float norm = 1.0F / static_cast<float>(2 * r + 1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-  for (int x = 0; x < w; ++x) {
-    std::vector<float> col(h);
-    for (int y = 0; y < h; ++y) col[y] = a->at(y, x);
-    for (int y = 0; y < h; ++y) {
-      float acc = 0.0F;
-      for (int k = -r; k <= r; ++k) {
-        const int yy = y + k;
-        if (yy >= 0 && yy < h) acc += col[yy];
-      }
-      a->at(y, x) = acc * norm;
-    }
-  }
-}
-
-void BoxBlur1DCols(Plane* a, int r) {
-  const int h = a->height();
-  const int w = a->width();
-  const float norm = 1.0F / static_cast<float>(2 * r + 1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-  for (int y = 0; y < h; ++y) {
-    std::vector<float> row(w);
-    for (int x = 0; x < w; ++x) row[x] = a->at(y, x);
-    for (int x = 0; x < w; ++x) {
-      float acc = 0.0F;
-      for (int k = -r; k <= r; ++k) {
-        const int xx = x + k;
-        if (xx >= 0 && xx < w) acc += row[xx];
-      }
-      a->at(y, x) = acc * norm;
-    }
-  }
-}
-
-Plane BoxBlur(Plane a, int r) {
-  BoxBlur1DRows(&a, r);
-  BoxBlur1DCols(&a, r);
-  return a;
-}
 
 // 3x3 component-wise median, edge-padded. th/tw < 3 returns a copy of V
 // unchanged (matches the reference: too small a tile grid for a 3x3
@@ -161,9 +112,12 @@ PerPixelMotion VectorsPerPixel(const Plane& mdy_in, const Plane& mdx_in,
 }
 
 Plane WarpByTiles(const Plane& a, const Plane& mdy, const Plane& mdx, int tile) {
+  return WarpByTiles(a, VectorsPerPixel(mdy, mdx, tile, a.height(), a.width()));
+}
+
+Plane WarpByTiles(const Plane& a, const PerPixelMotion& v) {
   const int h = a.height();
   const int w = a.width();
-  const PerPixelMotion v = VectorsPerPixel(mdy, mdx, tile, h, w);
   Plane out(h, w);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -180,7 +134,12 @@ Plane WarpByTiles(const Plane& a, const Plane& mdy, const Plane& mdx, int tile) 
 
 Plane WarpBilinearTiles(const Plane& a, const Plane& dyf, const Plane& dxf,
                         int tile, float row_offset, int out_h, int out_w) {
-  const PerPixelMotion v = VectorsPerPixel(dyf, dxf, tile, out_h, out_w);
+  return WarpBilinearTiles(a, VectorsPerPixel(dyf, dxf, tile, out_h, out_w),
+                           row_offset, out_h, out_w);
+}
+
+Plane WarpBilinearTiles(const Plane& a, const PerPixelMotion& v,
+                        float row_offset, int out_h, int out_w) {
   const int hs = a.height();
   const int ws = a.width();
   Plane out(out_h, out_w);
@@ -283,9 +242,13 @@ Plane ComplexCoherence(const ComplexPlane& z1, const ComplexPlane& z2, int r) {
 
 ComplexPlane WarpByTilesComplex(const ComplexPlane& a, const Plane& mdy,
                                 const Plane& mdx, int tile) {
+  return WarpByTilesComplex(
+      a, VectorsPerPixel(mdy, mdx, tile, a.height(), a.width()));
+}
+
+ComplexPlane WarpByTilesComplex(const ComplexPlane& a, const PerPixelMotion& v) {
   const int h = a.height();
   const int w = a.width();
-  const PerPixelMotion v = VectorsPerPixel(mdy, mdx, tile, h, w);
   ComplexPlane out(h, w);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -318,12 +281,29 @@ Plane UpsampleConfidence(const Plane& conf, int tile, int out_h, int out_w) {
   return BoxBlur(std::move(px), 8);
 }
 
+Plane UpsampleConfidenceFast(const Plane& conf, int tile, int out_h,
+                             int out_w) {
+  Plane c2(conf.height(), conf.width());
+  for (size_t i = 0; i < conf.size(); ++i) c2[i] = conf[i] * conf[i];
+  // The reference routes conf**2 through _vectors_per_pixel (both channels
+  // equal), inheriting its 3x3 median outlier-snap and the tile-center
+  // bilinear interpolation; mirror that exactly and take one channel.
+  PerPixelMotion v = VectorsPerPixel(c2, c2, tile, out_h, out_w);
+  return std::move(v.dy);
+}
+
 McWarpResult McWarp(const Plane& y_from, const Plane& y_to,
                     const std::vector<Plane>& arrays, int tile, int search) {
   const MotionField mf = EstimateMotion(y_from, y_to, tile, search);
   McWarpResult r;
   r.warped.reserve(arrays.size());
-  for (const Plane& a : arrays) r.warped.push_back(WarpByTiles(a, mf.dy, mf.dx, tile));
+  if (!arrays.empty()) {
+    // One VectorsPerPixel interpolation shared by every warped array
+    // (THEORY 9f, exact rewrite benefiting both modes).
+    const PerPixelMotion v = VectorsPerPixel(
+        mf.dy, mf.dx, tile, arrays.front().height(), arrays.front().width());
+    for (const Plane& a : arrays) r.warped.push_back(WarpByTiles(a, v));
+  }
   r.confidence = UpsampleConfidence(mf.confidence, tile, y_from.height(), y_from.width());
   return r;
 }
@@ -345,7 +325,10 @@ MotionCompensatedResult MotionCompensateEnvelope(
   const int out_h = y_cur.height();
   const int out_w = y_cur.width();
 
-  const Plane yw = WarpBilinearTiles(env.luma, mf->dy, mf->dx, tile, row_off, out_h, out_w);
+  // One per-pixel vector interpolation shared by the luma + chroma-re +
+  // chroma-im warps (THEORY 9f, "once per warp trio instead of three times").
+  const PerPixelMotion vpix = VectorsPerPixel(mf->dy, mf->dx, tile, out_h, out_w);
+  const Plane yw = WarpBilinearTiles(env.luma, vpix, row_off, out_h, out_w);
 
   // WarpBilinearTiles only takes real planes, so warp chi_b's real/imag
   // parts separately (matches the reference's Cw = warp(.real) + 1j *
@@ -356,8 +339,8 @@ MotionCompensatedResult MotionCompensateEnvelope(
     env_chi_re[i] = env.chroma[i].real();
     env_chi_im[i] = env.chroma[i].imag();
   }
-  const Plane cw_re = WarpBilinearTiles(env_chi_re, mf->dy, mf->dx, tile, row_off, out_h, out_w);
-  const Plane cw_im = WarpBilinearTiles(env_chi_im, mf->dy, mf->dx, tile, row_off, out_h, out_w);
+  const Plane cw_re = WarpBilinearTiles(env_chi_re, vpix, row_off, out_h, out_w);
+  const Plane cw_im = WarpBilinearTiles(env_chi_im, vpix, row_off, out_h, out_w);
 
   MotionCompensatedResult result;
   result.composite = Plane(out_h, out_w);
@@ -380,7 +363,8 @@ MotionCompensatedResult MotionCompensateEnvelope(
 
 MotionCompensatedResult MotionCompensatePrev(
     const NeighborRawState& prev, const Plane& y_cur_init, int tile,
-    int search, const MotionField* motion) {
+    int search, const MotionField* motion, bool fast,
+    const PerPixelMotion* vpix_in) {
   MotionField local_motion;
   const MotionField* mf = motion;
   if (!mf) {
@@ -388,10 +372,23 @@ MotionCompensatedResult MotionCompensatePrev(
     mf = &local_motion;
   }
   MotionCompensatedResult result;
-  result.composite = WarpByTiles(prev.composite, mf->dy, mf->dx, tile);
-  result.carrier = WarpByTilesComplex(prev.carrier, mf->dy, mf->dx, tile);
+  // One per-pixel vector interpolation shared by the composite and carrier
+  // warps (THEORY 9f, exact rewrite benefiting both modes) — and by the
+  // caller's own warps when it supplies `vpix_in`.
+  PerPixelMotion vpix_local;
+  if (!vpix_in) {
+    vpix_local = VectorsPerPixel(mf->dy, mf->dx, tile,
+                                 prev.composite.height(),
+                                 prev.composite.width());
+  }
+  const PerPixelMotion& vpix = vpix_in ? *vpix_in : vpix_local;
+  result.composite = WarpByTiles(prev.composite, vpix);
+  result.carrier = WarpByTilesComplex(prev.carrier, vpix);
   result.confidence =
-      UpsampleConfidence(mf->confidence, tile, prev.luma.height(), prev.luma.width());
+      fast ? UpsampleConfidenceFast(mf->confidence, tile, prev.luma.height(),
+                                    prev.luma.width())
+           : UpsampleConfidence(mf->confidence, tile, prev.luma.height(),
+                                prev.luma.width());
   return result;
 }
 

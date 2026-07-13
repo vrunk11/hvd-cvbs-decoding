@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "engine/hvd_config.h"
+#include "engine/sequence.h"
 #include "engine/ntsc_geometry.h"
 #include "engine/plane.h"
 #include "engine/temporal.h"
@@ -105,6 +106,13 @@ class HvdEngine {
   // should get luma from the source's own clean Y channel directly instead.
   FrameYc DecodeChromaOnly(const FieldInput& first, const FieldInput& second,
                            const FieldGeometry& g, const HvdConfig& cfg);
+
+  // Decode a window of consecutive fields through the sequence pipeline
+  // (see sequence.h) using this engine's FFT context for the holographic
+  // inits. Thin wrapper so callers don't need access to the private Fft2d.
+  std::vector<DecodedField> DecodeSequenceWindow(
+      const std::vector<FieldObs>& fields, const FieldGeometry& g,
+      const HvdConfig& cfg);
 
   // Forwards to Fft2d::SetThreadCount — see its doc comment in fft2d.h.
   // Parallel-export workers (hvd_chroma_decoder_stage.cpp) MUST call this

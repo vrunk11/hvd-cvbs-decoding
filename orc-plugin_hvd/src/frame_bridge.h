@@ -102,6 +102,52 @@ YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
                              const NeighborRawState* prev_frame = nullptr,
                              NeighborRawState* out_state = nullptr);
 
+// De-weave a field-sequential composite frame buffer into its two fields
+// (IRE), exactly as DecodeFrameBuffer does internally — exposed so the
+// sequence path shares one definition of the layout.
+// `field1_is_bottom` sets the is_first_field flags accordingly (block 1 of
+// the buffer is the temporally-first field; whether it is the TOP field is
+// resolved by ResolveField1IsBottom below).
+void SplitFrameFields(const int16_t* frame, const FrameParams& fp,
+                      FieldInput* top, FieldInput* bottom,
+                      bool field1_is_bottom = false);
+
+// Signal-measured field-order detection: under the true spatial order each
+// field's lines interpolate the other's at +0.5 line, under the inverted
+// order at -0.5 — so comparing |block2 - interp(block1, +0.5)| against
+// |block2 - interp(block1, -0.5)| on low-passed active luma votes the
+// order deterministically wherever the content has vertical detail
+// (motion inflates both sides ~equally; the margin still points the same
+// way). Returns +1 (field 1 = top), -1 (field 1 = bottom), or 0 (no
+// confident vote — content too flat).
+int DetectFieldParity(const FieldInput& block1, const FieldInput& block2,
+                      const FrameParams& fp);
+
+// Resolve HvdConfig::field_order for one frame: forced values pass
+// through; auto measures with DetectFieldParity and falls back to the
+// ld-decode format convention (field 1 = top) on a 0 vote.
+bool ResolveField1IsBottom(const FieldInput& block1, const FieldInput& block2,
+                           const FrameParams& fp, const HvdConfig& cfg);
+
+// Decode a WINDOW of consecutive frames through the field-granularity
+// sequence pipeline (engine/sequence.h — the reference's decode_sequence,
+// its only validated 3D and the designed answer to frame-weave combing on
+// motion). `frames` are the raw field-sequential buffers of frames
+// [w0, w0+frames.size()); the returned vector holds one YcFrameS16 per
+// CORE frame [core_begin, core_end) (window-relative indices) — the
+// overlap frames are context only. Field parity falls back to index
+// order (field1 = top), the same fallback the reference uses when
+// per-field metadata is unavailable; FrameParams carries none.
+//
+// ACC is measured over the whole window (median burst amplitude across
+// its fields), matching the reference. With cfg.output_fidelity (default)
+// the lossless split invariant luma + chroma == composite holds inside
+// the active picture, exactly like the frame path; with it off, luma is
+// the NR/anchored estimate and the invariant intentionally does not hold.
+std::vector<YcFrameS16> DecodeFrameSequenceWindow(
+    const std::vector<const int16_t*>& frames, int core_begin, int core_end,
+    const FrameParams& fp, const HvdConfig& cfg, HvdEngine& engine);
+
 // Convenience overload for tests/one-off calls: constructs a throwaway
 // engine internally. Prefer the engine-taking overload above for any
 // repeated/per-sequence decoding (which is every real use in the plugin) —

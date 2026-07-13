@@ -33,14 +33,48 @@ struct HvdConfig {
   // residual luma sees an edge (kills hanging dots at vertical transitions).
   float structure_coupling = 0.25F;
 
+  // Oriented (+/-45 deg) chroma prior weight, relative to mu_v and
+  // distance-normalised by 1/2 (a diagonal step is sqrt(2) px); 0 disables.
+  // Measured in the reference as a trade-off, not a win: -1.0 dB on
+  // axis-aligned sharp chroma (SMPTE) vs +2.0 dB on diagonal cross-colour
+  // torture (zoneplate) — hence off by default; a documented dial for
+  // diagonal-artifact-heavy material (fine weaves, venetian blinds). The
+  // horizontal/vertical/diagonal weights are renormalised together so the
+  // TOTAL chroma prior mass is unchanged: the oriented terms redistribute
+  // smoothing across directions, they don't add more of it. (THEORY 9e.)
+  float diag_prior = 0.0F;
+
   // --- Solver budget ------------------------------------------------------
   // Total conjugate-gradient iterations across all IRLS outer passes.
   // 0 => pure holographic reconstruction (fast preview, no refinement).
   int cg_iterations = 60;
   // Number of IRLS (lagged-diffusivity) outer re-weightings.
   int irls_outer = 4;
+  // CG relative gradient-norm early-exit: stop an inner CG loop once
+  // ||g||^2 < tol^2 * ||g0||^2. 0 = auto (0.02 slow / 0.10 fast), matching
+  // the reference's cg_tol. Iteration counts stay the CEILING; this lets
+  // already-converged solves return early instead of burning the budget.
+  float cg_tol = 0.0F;
+  // FAST MODE (THEORY 9f — written as the optimisation spec for this port):
+  // same algorithm, cheaper logistics. In this engine it currently wires up
+  // the parts the frame-level path exercises — the 2/3 CG-budget cap, the
+  // looser auto cg_tol (0.10), and tile-resolution confidence maps in
+  // MotionCompensatePrev (bilinear interpolation of the 24x24-ish tile map
+  // instead of a full-res squared upsample + radius-8 blur; ~256x cheaper,
+  // visually identical). The decode_sequence-only components (shared
+  // motion cache, predicted+verified ME for long offsets, deferred
+  // coherence) have their building blocks ported (VerifyMotion,
+  // FitTrajectory/TrajectorySnap, the MotionField* precompute hooks) and
+  // activate when that pipeline lands. Reference measurement: >=2x wall
+  // clock, never worse than 0.2 dB.
+  bool fast = false;
 
   // --- Holographic init bandwidths (sideband crop) ------------------------
+  // NOTE: vestigial in the REFERENCE too — its holographic_init overrides
+  // these at every call site (dataclasses.replace with 0.8/120, 1.8/30 for
+  // the two Dubois variants and 1.3/60 for the symmetry certifier), so the
+  // user-facing values are never consumed there either. Kept declared for
+  // config-surface parity; the C++ init hardcodes the same three pairs.
   float init_lpf_h_mhz = 1.3F;    // horizontal chroma bandwidth (MHz)
   float init_lpf_v_cph = 60.0F;   // vertical bandwidth (cycles / picture height)
   // Enable the spectral-symmetry ("Transform NTSC, repaired") init variant.
@@ -111,8 +145,47 @@ struct HvdConfig {
   // from the reference, since the reference has no equivalent "on but at
   // a sensible strength" state; treat it as a starting point to tune, not
   // a verified-correct constant.
+  // FIELD ORDER. The TBC stores fields in TEMPORAL order; for a
+  // well-formed ld-decode .tbc the FORMAT already fixes the spatial
+  // mapping (frames are assembled first-field-first and the first field
+  // carries the even frame lines) — so there is nothing to guess. The
+  // host API surface, however, exposes no per-field isFirstField, so
+  // rather than trusting an assumption across every host/capture, AUTO
+  // (default) MEASURES the order from the signal itself: under the true
+  // order, each field's lines interpolate the other field's at +0.5 line,
+  // under the inverted order at -0.5 — a deterministic half-line vertical
+  // correlation test (DetectFieldParity in frame_bridge), decided per
+  // frame with a relative margin and falling back to the format
+  // convention (field 1 = top) when content has no vertical detail to
+  // vote with. 1/2 force the order manually (diagnosis: with the wrong
+  // order, static horizontal edges serrate one line and motion combs even
+  // through a player's deinterlacer).
+  int field_order = 0;  // 0 = auto (measured), 1 = field 1 top, 2 = field 1 bottom
+  // DECODE UNIT for the 2D path. false (reference default frame_decode=True):
+  // weave the two fields and decode at frame geometry — maximum vertical
+  // chroma resolution on STATIC content, but the woven frame mixes two
+  // instants 1/60 s apart, and the vertical chroma prior then smooths chi
+  // across lines from DIFFERENT times: on anything moving, chi is wrong
+  // along the serrated edges and the residual shows as uncancelled chroma
+  // carrier (dot-crawl/rainbow) in the fidelity luma Y = S - Re[chi c].
+  // THEORY section 5 calls weaving-before-decoding "a failure" for exactly
+  // this reason; the reference ships decode_field / --per-field as the
+  // remedy. true: decode each field independently (the sequence pipeline
+  // with no temporal terms — same math as the reference's decode_field),
+  // motion-clean at the cost of vertical chroma resolution on static
+  // detail. The 3D path is per-field always.
+  bool per_field = false;
   bool enable_temporal = false;
-  float temporal_strength = 1.0F;
+  // Measured (synthetic pan + static scenes, harness in docs/PORTING.md
+  // section 8): at strength 1.0 the frame-level neighbour term LOWERS
+  // chroma PSNR by 3-5 dB even on static content — the |dc|^2 ~= 4 chroma
+  // leverage triples the effective data weight against lambda_c, lifting
+  // chroma noise; the Python reference's frame-level path behaves
+  // identically (its validated 3D gains come from decode_sequence, not
+  // from this term). 0.25 keeps the term subtle instead of harmful; the
+  // previous 1.0 default was a guess this project explicitly flagged as
+  // "a starting point to tune, not a verified-correct constant".
+  float temporal_strength = 0.25F;
   bool bidirectional = true;       // declared for decode_sequence's richer
                                     // path; DecodeFrame only ever sees PAST
                                     // frames (a future frame isn't available
@@ -141,6 +214,16 @@ struct HvdConfig {
   // reads these yet; DecodeFrame's simpler frame-level 3D mode has no
   // concept of "extended" neighbour offsets (its neighbour list is just
   // whatever the caller passes) or of chunking/coherence gating at all.
+  //
+  // trajectory_fit (THEORY 9e): fit ONE per-tile velocity across all the
+  // sequence pipeline's temporal offsets (six noisy measurements of one
+  // physical motion) and snap agreeing pairwise vectors onto k*v under
+  // consensus; disagreement is preserved (occlusion/acceleration is
+  // signal). The engine primitives (FitTrajectory/TrajectorySnap in
+  // motion.h) are ported and unit-tested; this flag gates their use once
+  // the multi-offset pipeline exists. A single-neighbour DecodeFrame has
+  // only one offset, so there is no trajectory to fit yet.
+  bool trajectory_fit = true;
   bool extended_temporal = true;  // decode_sequence: also use fields f±3
   float coherence_gate = 0.6F;
   int chunk_frames = 6;

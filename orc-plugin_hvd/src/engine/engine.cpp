@@ -10,6 +10,8 @@
 #include "engine/fft2d.h"
 #include "engine/holographic_init.h"
 #include "engine/lockin.h"
+#include "engine/motion.h"
+#include "engine/temporal.h"
 #include "engine/variational.h"
 
 namespace hvd {
@@ -103,6 +105,12 @@ WovenFrame WeaveAndBuildCarrier(const FieldInput& first, const FieldInput& secon
 HvdEngine::HvdEngine() : fft_(std::make_unique<Fft2d>()) {}
 HvdEngine::~HvdEngine() = default;
 
+std::vector<DecodedField> HvdEngine::DecodeSequenceWindow(
+    const std::vector<FieldObs>& fields, const FieldGeometry& g,
+    const HvdConfig& cfg) {
+  return DecodeFieldWindow(fields, g, cfg, fft_.get());
+}
+
 void HvdEngine::SetFftThreads(int n) { fft_->SetThreadCount(n); }
 
 FrameYc HvdEngine::DecodeFrame(const FieldInput& first, const FieldInput& second,
@@ -129,8 +137,53 @@ FrameYc HvdEngine::DecodeFrame(const FieldInput& first, const FieldInput& second
       }
       neighbors.reserve(prev_frames.size());
       for (const NeighborRawState& prev : prev_frames) {
-        const MotionCompensatedResult mc =
-            MotionCompensatePrev(prev, init.luma, cfg.mc_tile, cfg.mc_search);
+        // Estimate the motion ONCE here (instead of inside
+        // MotionCompensatePrev) so the coherence gate below can reuse it.
+        const MotionField mo =
+            EstimateMotion(prev.luma, init.luma, cfg.mc_tile, cfg.mc_search);
+        MotionCompensatedResult mc = MotionCompensatePrev(
+            prev, init.luma, cfg.mc_tile, cfg.mc_search, &mo, cfg.fast);
+
+        // InSAR coherence gate (reference decode_sequence's
+        // `coherence_gate`, ported here because DecodeFrame's own 3D term
+        // otherwise has NO phase-sensitive motion defence: the block-match
+        // confidence is an SSD quantity, blind to chroma-phase
+        // decorrelation, and around moving objects the per-pixel
+        // interpolation of tile vectors warps the neighbour's CARRIER by
+        // fractional-tile amounts — 1 px = 90 deg at 4fsc — turning the
+        // temporal chroma equation toxic in a band around every moving
+        // edge. Measured on a synthetic 8 px pan: 3D was LOSING 3.5 dB vs
+        // 2D without this gate, bit-matching the reference's own
+        // frame-level path, which has the same hole; decode_sequence is
+        // where the reference gates it.) The neighbour's baseband chi is
+        // warped bilinearly (legal in baseband, same woven-frame grid so
+        // row offset 0) and compared against the current INIT chi — the
+        // only chi available pre-solve at frame level; the holographic
+        // init is a credible phasor field for a correlation measurement.
+        if (effective_cfg.coherence_gate > 0.0F && !prev.chroma.empty() &&
+            prev.chroma.size() == init.chroma.size()) {
+          const int hh = init.chroma.height();
+          const int ww = init.chroma.width();
+          const PerPixelMotion vpx =
+              VectorsPerPixel(mo.dy, mo.dx, cfg.mc_tile, hh, ww);
+          Plane re(hh, ww);
+          Plane im(hh, ww);
+          for (size_t i = 0; i < prev.chroma.size(); ++i) {
+            re[i] = prev.chroma[i].real();
+            im[i] = prev.chroma[i].imag();
+          }
+          const Plane wre = WarpBilinearTiles(re, vpx, 0.0F, hh, ww);
+          const Plane wim = WarpBilinearTiles(im, vpx, 0.0F, hh, ww);
+          ComplexPlane cw(hh, ww);
+          for (size_t i = 0; i < cw.size(); ++i) cw[i] = Complex{wre[i], wim[i]};
+          // r=6, the reference's complex_coherence default; the (1-a)+a*g
+          // form floors the gate so grey content (|chi| ~ 0, gamma = pure
+          // noise) keeps (1 - a) of its confidence.
+          const Plane gamma = ComplexCoherence(init.chroma, cw, 6);
+          const float a = effective_cfg.coherence_gate;
+          for (size_t i = 0; i < mc.confidence.size(); ++i)
+            mc.confidence[i] *= (1.0F - a) + a * gamma[i];
+        }
         neighbors.push_back(NeighborTerm{mc.composite, mc.carrier, mc.confidence});
       }
     }

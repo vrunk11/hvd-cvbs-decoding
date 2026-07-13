@@ -354,6 +354,37 @@ FFTW plans should be created once per field geometry; tiles and
 fields parallelise trivially (each field's refine is independent
 within a pass).
 
+## 9g. Post-port audit findings (bugs found by porting)
+
+The C++ port re-derived every geometric convention, which surfaced real
+defects in this reference:
+
+* **Coherence-gate half-line double-compensation** (fixed). The bilinear
+  warps take a `row_offset` because the convention was "motion carries no
+  parity component" — which held while `estimate_motion`'s zero-motion
+  margin rule zeroed static cross-parity estimates. The 9e trajectory
+  snap deliberately re-introduces h_k = (p_k - p_j)/2 into the pairwise
+  vectors, so the gate's warp (snapped motion + row_offset) shifted the
+  neighbour chi by a FULL line on exactly the static consensus tiles the
+  gate protects (measured: mean gamma 0.970 vs 0.999 on static content
+  with vertically varying chroma). Fix: the snapped/subpixel motion
+  already carries the total inter-grid displacement — the gate warp uses
+  row_offset = 0. `synth_reference` keeps its row_offset: its motion
+  comes from fresh margin-zeroed estimates, where the offset is exactly
+  right on static content (the case NR cares about) and the robust
+  weights absorb the residual half-line on motion.
+* **Sign-contradicting comment**: one comment stated h_k = (p_j - p_k)/2
+  while the code (correctly) uses (p_k - p_j)/2. Comment fixed; the
+  derivation stands.
+* **Dead code removed**: `_laplacian` (never called), the unused
+  rows/r0/fr/r1 block in `drizzle_frame`, the unused Y cofactor in
+  `psi_closed_form` (a full-array 3x3 cofactor expansion computed and
+  discarded per pixel).
+* **Kept deliberately**: `mc_warp` / `envelope_of` /
+  `motion_compensate_envelope` are call-site dead but are the recorded
+  negative result (the envelope-resampled neighbour variant that leaked
+  vertical luma gradients into chroma); annotated as such.
+
 ## 10. Deferred items, with reasons
 
 * **Multigrid / coarse-to-fine solving**: naive spatial coarsening is

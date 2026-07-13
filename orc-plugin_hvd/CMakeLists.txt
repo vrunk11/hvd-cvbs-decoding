@@ -166,6 +166,7 @@ add_library(hvd_core STATIC
     src/engine/colour.cpp
     src/engine/motion.cpp
     src/engine/temporal.cpp
+    src/engine/sequence.cpp
     src/engine/engine.cpp
     src/frame_bridge.cpp
 )

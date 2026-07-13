@@ -40,7 +40,11 @@ set(HVD_ENGINE_TESTS
     colour_test
     frame_bridge_test
     motion_test
+    motion_v2_test
     temporal_test
+    sequence_test
+    field_order_test
+    variational_v2_test
     engine_temporal_test)
 
 foreach(t ${HVD_ENGINE_TESTS})

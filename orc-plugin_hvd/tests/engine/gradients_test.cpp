@@ -14,6 +14,10 @@
 namespace {
 
 using hvd::ComplexPlane;
+using hvd::D1Into;
+using hvd::D1TInto;
+using hvd::D2Into;
+using hvd::D2TInto;
 using hvd::Dx;
 using hvd::DxT;
 using hvd::Dy;
@@ -39,6 +43,16 @@ void CheckAdjointReal(int h, int w, std::mt19937* rng) {
   // <Dx a, b> == <a, DxT b>
   CHECK_NEAR(DotReal(Dx(a), b), DotReal(a, DxT(b)), 1e-3);
   CHECK_NEAR(DotReal(Dy(a), b), DotReal(a, DyT(b)), 1e-3);
+
+  // Diagonal (+/-45 deg) operators for the oriented chroma prior: same
+  // identity (the reference verified its _d1/_d2 adjoints to 1e-14).
+  Plane d1a(h, w), d1tb(h, w), d2a(h, w), d2tb(h, w);
+  D1Into(a, d1a);
+  D1TInto(b, d1tb);
+  D2Into(a, d2a);
+  D2TInto(b, d2tb);
+  CHECK_NEAR(DotReal(d1a, b), DotReal(a, d1tb), 1e-3);
+  CHECK_NEAR(DotReal(d2a, b), DotReal(a, d2tb), 1e-3);
 }
 
 }  // namespace

@@ -173,6 +173,92 @@ void DyTInto(const BasicPlane<T>& a, BasicPlane<T>& d) {
   for (int x = 0; x < w; ++x) d.at(h - 1, x) = a.at(h - 2, x);
 }
 
+// ---------------------------------------------------------------------------
+// Diagonal (+/-45 deg) forward differences with Neumann boundaries, for the
+// oriented chroma priors (`--diag-prior`; THEORY 9e). Exact ports of the
+// reference's `_d1/_d1T/_d2/_d2T`, adjoint-exact by construction (the
+// reference verified <D1 a, b> == <a, D1T b> to 1e-14; gradients_test.cpp
+// checks the same identity here). The adjoints are written in GATHER form —
+// each output pixel reads its own contributors — so the OpenMP loops have no
+// write conflicts, unlike a literal transcription of NumPy's scatter (-=/+=).
+// ---------------------------------------------------------------------------
+
+// +45 deg: d[:-1, :-1] = a[1:, 1:] - a[:-1, :-1]; last row & column zero.
+template <typename T>
+void D1Into(const BasicPlane<T>& a, BasicPlane<T>& d) {
+  const int h = a.height();
+  const int w = a.width();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h; ++y) {
+    if (y + 1 < h) {
+      for (int x = 0; x + 1 < w; ++x) d.at(y, x) = a.at(y + 1, x + 1) - a.at(y, x);
+      if (w > 0) d.at(y, w - 1) = T{};
+    } else {
+      for (int x = 0; x < w; ++x) d.at(y, x) = T{};
+    }
+  }
+}
+
+// Adjoint of D1 (scatter form: d[:-1,:-1] -= a[:-1,:-1]; d[1:,1:] += a[:-1,:-1]):
+//   d(y, x) = -a(y, x)       when y < h-1 and x < w-1
+//           + a(y-1, x-1)    when y >= 1  and x >= 1
+template <typename T>
+void D1TInto(const BasicPlane<T>& a, BasicPlane<T>& d) {
+  const int h = a.height();
+  const int w = a.width();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      T v{};
+      if (y + 1 < h && x + 1 < w) v = v - a.at(y, x);
+      if (y >= 1 && x >= 1) v = v + a.at(y - 1, x - 1);
+      d.at(y, x) = v;
+    }
+  }
+}
+
+// -45 deg: d[:-1, 1:] = a[1:, :-1] - a[:-1, 1:]; last row & first column zero.
+template <typename T>
+void D2Into(const BasicPlane<T>& a, BasicPlane<T>& d) {
+  const int h = a.height();
+  const int w = a.width();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h; ++y) {
+    if (y + 1 < h) {
+      if (w > 0) d.at(y, 0) = T{};
+      for (int x = 1; x < w; ++x) d.at(y, x) = a.at(y + 1, x - 1) - a.at(y, x);
+    } else {
+      for (int x = 0; x < w; ++x) d.at(y, x) = T{};
+    }
+  }
+}
+
+// Adjoint of D2 (scatter form: d[:-1,1:] -= a[:-1,1:]; d[1:,:-1] += a[:-1,1:]):
+//   d(y, x) = -a(y, x)       when y < h-1 and x >= 1
+//           + a(y-1, x+1)    when y >= 1  and x < w-1
+template <typename T>
+void D2TInto(const BasicPlane<T>& a, BasicPlane<T>& d) {
+  const int h = a.height();
+  const int w = a.width();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      T v{};
+      if (y + 1 < h && x >= 1) v = v - a.at(y, x);
+      if (y >= 1 && x + 1 < w) v = v + a.at(y - 1, x + 1);
+      d.at(y, x) = v;
+    }
+  }
+}
+
 }  // namespace hvd
 
 #endif  // ORC_PLUGIN_HVD_ENGINE_GRADIENTS_H_

@@ -32,6 +32,12 @@ constexpr const char* kCharbonnierEps = "charbonnier_eps";
 constexpr const char* kChromaEps = "chroma_eps";
 constexpr const char* kStructureCoupling = "structure_coupling";
 constexpr const char* kCgIterations = "cg_iterations";
+constexpr const char* kFast = "fast";
+constexpr const char* kDiagPrior = "diag_prior";
+constexpr const char* kPasses = "passes";
+constexpr const char* kChunkFrames = "chunk_frames";
+constexpr const char* kFieldOrder = "field_order";
+constexpr const char* kPerField = "per_field";
 constexpr const char* kAcc = "acc";
 constexpr const char* kChromaGain = "chroma_gain";
 constexpr const char* kMonochrome = "monochrome";
@@ -150,28 +156,50 @@ const ::hvd::YcFrameS16& HvdDecodedRepresentation::decoded(FrameID id) const
             if (luma && chroma) {
                 yc = ::hvd::DecodeYcFrameBuffer(luma, chroma, fp, config_, engine_);
             }
-            // No frame-level temporal wiring on the Y/C-native path yet —
-            // DecodeChromaOnly has no prev_frames parameter (see its doc
-            // comment in engine.h: there's no Y/C arbitration happening
-            // there for a temporal term to improve). prev_frame_id_/
-            // prev_frame_state_ are only ever populated by the composite
-            // path below, so switching between the two source kinds
-            // simply won't chain a temporal neighbour — not unsafe, just
-            // inert here.
+            // No temporal wiring on the Y/C-native path — DecodeChromaOnly
+            // has no prev_frames parameter (see its doc comment in
+            // engine.h: there's no Y/C arbitration happening there for a
+            // temporal term to improve).
         } else if (const sample_type* frame = source_->get_frame(id)) {
-            // Only treat the cached state as a real temporal neighbour if
-            // it's truly the immediately preceding frame — see this
-            // member's doc comment in the header for why anything else
-            // gets discarded instead of fed in as a misleading neighbour.
-            const ::hvd::NeighborRawState* prev =
-                (prev_frame_id_.has_value() && *prev_frame_id_ + 1 == id)
-                    ? &prev_frame_state_
-                    : nullptr;
-            ::hvd::NeighborRawState this_frame_state;
-            yc = ::hvd::DecodeFrameBuffer(frame, fp, config_, engine_, prev,
-                                          &this_frame_state);
-            prev_frame_id_ = id;
-            prev_frame_state_ = std::move(this_frame_state);
+            const bool field_path = config_.per_field || config_.enable_temporal;
+            bool done = false;
+            if (field_path) {
+                // Preview through the SAME field pipeline as the export
+                // (per-field 2D, or a mini 3D window of frame id +/- 1):
+                // what you judge in the preview is what the export does.
+                // This replaces the earlier frame-level 3D preview and its
+                // self-priming chain outright — the frame-level temporal
+                // term remains only as the Y/C-native export fallback.
+                const bool coupled = config_.enable_temporal &&
+                                     config_.temporal_strength > 0.0F &&
+                                     config_.cg_iterations > 0;
+                std::vector<const sample_type*> window;
+                FrameID w0 = id;
+                if (coupled && id > 0 && source_->get_frame(id - 1)) {
+                    w0 = id - 1;
+                }
+                for (FrameID f = w0;; ++f) {
+                    const sample_type* p = source_->get_frame(f);
+                    if (!p) break;
+                    window.push_back(p);
+                    if (!coupled && f == id) break;
+                    if (f >= id + 1) break;
+                }
+                const int core = static_cast<int>(id - w0);
+                if (core >= 0 && core < static_cast<int>(window.size())) {
+                    std::vector<::hvd::YcFrameS16> frames =
+                        ::hvd::DecodeFrameSequenceWindow(
+                            window, core, core + 1, fp, config_, engine_);
+                    if (frames.size() == 1 && !frames[0].luma.empty()) {
+                        yc = std::move(frames[0]);
+                        done = true;
+                    }
+                }
+            }
+            if (!done) {
+                yc = ::hvd::DecodeFrameBuffer(frame, fp, config_, engine_,
+                                              nullptr, nullptr);
+            }
         }
     }
     auto [ins, ok] = yc_cache_.emplace(id, std::move(yc));
@@ -360,6 +388,62 @@ bool HvdDecodedRepresentation::decode_and_write_rgb24(
     return WriteWovenAsRgb24(pic, fp, out);
 }
 
+bool HvdDecodedRepresentation::decode_sequence_chunk_and_write_rgb24(
+    FrameID t0, FrameID t1, FrameID range_first, FrameID range_last,
+    ::hvd::HvdEngine& engine, std::mutex& read_mutex, std::ostream& out) const
+{
+    if (t1 < t0) return false;
+    ::hvd::FrameParams fp;
+    std::vector<std::vector<sample_type>> window;  // owned raw buffers
+    FrameID w0 = t0;
+    {
+        // Copy the whole window's raw samples under the read lock; the
+        // expensive decode happens below on data we own.
+        std::lock_guard<std::mutex> lock(read_mutex);
+        if (!source_) return false;
+        if (source_->has_separate_channels()) return false;  // no composite
+        fp = frame_params();
+        if (fp.frame_width <= 0 || fp.frame_height <= 0) return false;
+        const size_t n = static_cast<size_t>(fp.frame_width) * fp.frame_height;
+
+        // Overlap provides temporal context; with the temporal terms off
+        // (pure per-field 2D) the fields are decoupled and context is
+        // useless weight.
+        const bool coupled = config_.enable_temporal &&
+                             config_.temporal_strength > 0.0F &&
+                             config_.cg_iterations > 0;
+        const FrameID ov = coupled
+            ? static_cast<FrameID>(std::max(0, config_.chunk_overlap))
+            : FrameID{0};
+        w0 = (t0 > range_first + ov) ? (t0 - ov) : range_first;
+        const FrameID w1 = std::min(t1 + ov, range_last);
+        window.reserve(static_cast<size_t>(w1 - w0 + 1));
+        for (FrameID id = w0; id <= w1; ++id) {
+            const sample_type* frame = source_->get_frame(id);
+            if (!frame) return false;
+            window.emplace_back(frame, frame + n);
+        }
+    }
+
+    std::vector<const int16_t*> ptrs;
+    ptrs.reserve(window.size());
+    for (const auto& buf : window) ptrs.push_back(buf.data());
+    const int core_begin = static_cast<int>(t0 - w0);
+    const int core_end = static_cast<int>(t1 - w0) + 1;
+
+    const std::vector<::hvd::YcFrameS16> frames =
+        ::hvd::DecodeFrameSequenceWindow(ptrs, core_begin, core_end, fp,
+                                         config_, engine);
+    if (frames.size() != static_cast<size_t>(core_end - core_begin))
+        return false;
+    for (const ::hvd::YcFrameS16& yc : frames) {
+        if (yc.luma.empty()) return false;
+        const WovenActivePicture pic = ReorderToWoven(yc, fp);
+        if (!WriteWovenAsRgb24(pic, fp, out)) return false;
+    }
+    return true;
+}
+
 std::pair<uint32_t, uint32_t> HvdDecodedRepresentation::active_picture_size() const
 {
     const ::hvd::FrameParams fp = frame_params();
@@ -470,24 +554,70 @@ bool HvdChromaDecoderStage::trigger(
 
     if (progress_callback_) progress_callback_(0, total, "Starting export...");
 
-    if (config_.enable_temporal) {
-        // Temporal mode: frame N's decode needs frame N-1's ALREADY-DECODED
-        // state (see engine.h's DecodeFrame doc comment) — there's no such
-        // thing as "parallel but sequential", chaining is inherently
-        // serial. We don't trade that away for throughput (no quality
-        // loss): this runs single-threaded ACROSS frames, but with full
-        // per-frame parallelism (OpenMP/FFTW use every core) since only
-        // one frame is ever in flight here — no oversubscription concern,
-        // unlike the frame-parallel path below where each of several
-        // concurrent workers must cap itself.
+    if (config_.enable_temporal || config_.per_field) {
+        // Temporal mode: the FIELD-granularity sequence pipeline
+        // (engine/sequence.h — the reference's decode_sequence, its only
+        // validated 3D and the designed answer to frame-weave combing on
+        // moving objects). Frames are processed in chunks of
+        // config_.chunk_frames with config_.chunk_overlap frames of
+        // temporal context on each side; memory stays bounded to one
+        // window, and only the core frames of each chunk are written.
+        // Inherently serial ACROSS chunks (each is independent, but
+        // in-order output is the contract) with full per-chunk parallelism
+        // (OpenMP/FFTW use every core; only one window in flight).
         ::hvd::HvdEngine engine;
         engine.SetFftThreads(config_.fft_threads);
-        std::mutex read_mutex;  // decode_and_write_rgb24 always takes one,
-                                // even though nothing else touches source_
+        std::mutex read_mutex;  // the chunk reader always takes one, even
+                                // though nothing else touches source_
                                 // concurrently on this path
+        const FrameID chunk = static_cast<FrameID>(
+            std::max(1, config_.chunk_frames));
+        uint64_t written = 0;
+        // The reference's own gate: decode_sequence falls back to per-frame
+        // decoding when temporal_strength <= 0 (nothing for the field
+        // pipeline's neighbour equations to weigh).
+        bool sequence_ok =
+            config_.per_field ||
+            (config_.temporal_strength > 0.0F && config_.cg_iterations > 0);
+        for (FrameID t0 = range.first; sequence_ok && t0 <= range.last; ) {
+            const FrameID t1 = std::min(t0 + chunk - 1, range.last);
+            if (!repr->decode_sequence_chunk_and_write_rgb24(
+                    t0, t1, range.first, range.last, engine, read_mutex,
+                    out)) {
+                // Y/C-native source (no composite for the field pipeline)
+                // or read failure: fall back to the frame-level chain
+                // below rather than failing the export outright — but only
+                // if nothing has been written yet (a mid-stream format
+                // switch would corrupt the output).
+                sequence_ok = false;
+                break;
+            }
+            written += t1 - t0 + 1;
+            if (progress_callback_) {
+                progress_callback_(written, total,
+                                   "Exported frame " + std::to_string(written) +
+                                       "/" + std::to_string(total) +
+                                       " (3D sequence)");
+            }
+            t0 = t1 + 1;
+        }
+        if (sequence_ok) {
+            if (written == 0) return fail("frame range was empty");
+            export_status_ = "Export complete: " + std::to_string(written) +
+                             " frames (3D field sequence) -> " + output_path_;
+            trigger_in_progress_.store(false);
+            return true;
+        }
+        if (written > 0)
+            return fail("sequence decode failed mid-export at frame " +
+                        std::to_string(written));
+
+        // ---- Fallback: frame-level temporal chain (previous behaviour,
+        // used for Y/C-native sources where the composite field pipeline
+        // has nothing to run on). Frame N's decode needs frame N-1's
+        // already-decoded state — inherently serial across frames.
         std::optional<FrameID> prev_id;
         ::hvd::NeighborRawState prev_state;
-        uint64_t written = 0;
         for (FrameID id = range.first; id <= range.last; ++id) {
             const ::hvd::NeighborRawState* prev =
                 (prev_id.has_value() && *prev_id + 1 == id) ? &prev_state : nullptr;
@@ -683,6 +813,21 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "Conjugate-gradient iterations. 0 = holographic init only "
             "(fast preview).",
             ParameterType::INT32, integer(0, 400, 60)},
+        ParameterDescriptor{kFast, "Fast mode",
+            "Same algorithm, cheaper logistics (reference's --fast, THEORY "
+            "9f): adaptive solver early-exit with a 2/3 iteration cap, and "
+            "tile-resolution motion-confidence maps in the 3D path. "
+            "Reference measurement: >=2x speed, never worse than 0.2 dB.",
+            ParameterType::BOOL, boolean(false)},
+        ParameterDescriptor{kDiagPrior, "Diagonal chroma prior",
+            "Oriented +/-45 deg chroma prior weight (reference's "
+            "--diag-prior), renormalised so total prior mass is unchanged. "
+            "A measured trade-off, not a win: trades axis-aligned chroma "
+            "sharpness (-1 dB on SMPTE bars) for diagonal cross-colour "
+            "suppression (+2 dB on zoneplate torture). 0 = off (default); "
+            "try ~0.5-1.0 on diagonal-artifact-heavy material such as fine "
+            "weaves or venetian blinds.",
+            ParameterType::DOUBLE, real(0.0, 2.0, 0.0)},
         ParameterDescriptor{kAcc, "Automatic Color Control",
             "Calibrate saturation from burst amplitude (colour path only).",
             ParameterType::BOOL, boolean(true)},
@@ -712,21 +857,62 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "keep whichever measures fastest.",
             ParameterType::INT32, integer(1, 64, 4)},
         ParameterDescriptor{kEnableTemporal, "Enable 3D (temporal)",
-            "Use the immediately preceding frame as extra motion-"
-            "compensated evidence in the solve. Off by default (pure 2D). "
-            "Independent of Temporal strength below, so you can toggle "
-            "this without losing your tuned strength value. Frame-level "
-            "3D only — decode_sequence's richer bidirectional/chunked "
-            "pipeline isn't wired up.",
+            "3D decoding. EXPORT uses the field-granularity sequence "
+            "pipeline (the reference's decode_sequence — its validated 3D: "
+            "per-field decoding kills the frame-weave's combing on moving "
+            "objects, six motion-gated neighbour equations per field lift "
+            "the Y/C ambiguity, and from pass 2 the synth-reference anchor "
+            "adds temporal NR; measured +1.9 dB single-pass and +6.4 dB "
+            "anchored on the regression scene). PREVIEW still uses the "
+            "lighter frame-level term (self-primed with frame N-1), whose "
+            "effect is intentionally subtle — judge 3D quality from an "
+            "export, not the preview.",
             ParameterType::BOOL, boolean(false)},
+        ParameterDescriptor{kPasses, "3D passes",
+            "Gauss-Seidel fixed-point passes over each export chunk "
+            "(sequence pipeline only). 1 = single pass. From pass 2 the "
+            "decode->NR->re-encode anchor engages: motion-compensated "
+            "temporal noise reduction whose reference never gets trusted "
+            "where the raw data contradicts it. 2 is the reference's "
+            "anchored-mode value.",
+            ParameterType::INT32, integer(1, 4, 1)},
+        ParameterDescriptor{kPerField, "Per-field decode (2D)",
+            "Decode each field independently instead of weaving the two "
+            "fields into a frame first. The woven frame mixes two instants "
+            "1/60 s apart, so the vertical chroma smoothing crosses TIME on "
+            "anything moving — the residual shows as uncancelled chroma "
+            "(dot-crawl/rainbow crawling on moving edges). If you see that "
+            "artifact, turn this ON: motion becomes as clean as static "
+            "content, at the cost of some vertical chroma resolution on "
+            "static detail. (The reference's --per-field; its THEORY calls "
+            "weave-before-decode 'a failure' for temporal contamination. "
+            "3D always decodes per field.)",
+            ParameterType::BOOL, boolean(false)},
+        ParameterDescriptor{kFieldOrder, "Field order",
+            "0 = Auto (default): the order is MEASURED from the signal — "
+            "under the true order each field's lines interpolate the "
+            "other's at +0.5 line, under the inverted order at -0.5, a "
+            "deterministic half-line vertical correlation vote (majority "
+            "over the export window; falls back to the ld-decode format "
+            "convention, field 1 = top, on flat content). 1 = force "
+            "field 1 top. 2 = force field 1 bottom. Wrong-order symptoms: "
+            "one-line serration on static horizontal edges, and motion "
+            "that combs even through a player's deinterlacer.",
+            ParameterType::INT32, integer(0, 2, 0)},
+        ParameterDescriptor{kChunkFrames, "3D chunk size",
+            "Frames per export window in 3D mode (plus 2 frames of context "
+            "on each side). Bounds memory; larger chunks slightly reduce "
+            "edge effects at chunk boundaries.",
+            ParameterType::INT32, integer(1, 24, 6)},
         ParameterDescriptor{kTemporalStrength, "Temporal strength",
             "Weight of the motion-compensated previous-frame data terms in "
             "the solve, once Enable 3D is on (has no effect otherwise). "
             "Export automatically switches to a slower, sequential mode "
             "when 3D is enabled so the temporal chain carries through the "
             "whole export with no quality loss (see "
-            "HvdChromaDecoderStage::trigger()).",
-            ParameterType::DOUBLE, real(0.0, 4.0, 1.0)},
+            "HvdChromaDecoderStage::trigger()). Default lowered to 0.25 "
+            "after measurement — see Enable 3D's description.",
+            ParameterType::DOUBLE, real(0.0, 4.0, 0.25)},
         ParameterDescriptor{kMcTile, "Motion tile size (px)",
             "Block-matching tile size for the temporal path.",
             ParameterType::INT32, integer(8, 128, 32)},
@@ -752,6 +938,12 @@ HvdChromaDecoderStage::get_parameters() const
         {kChromaEps, static_cast<double>(config_.chroma_eps)},
         {kStructureCoupling, static_cast<double>(config_.structure_coupling)},
         {kCgIterations, static_cast<int32_t>(config_.cg_iterations)},
+        {kFast, config_.fast},
+        {kPasses, static_cast<int32_t>(config_.passes)},
+        {kChunkFrames, static_cast<int32_t>(config_.chunk_frames)},
+        {kFieldOrder, static_cast<int32_t>(config_.field_order)},
+        {kPerField, config_.per_field},
+        {kDiagPrior, static_cast<double>(config_.diag_prior)},
         {kAcc, config_.acc},
         {kChromaGain, static_cast<double>(config_.chroma_gain)},
         {kMonochrome, config_.monochrome},
@@ -797,6 +989,12 @@ bool HvdChromaDecoderStage::set_parameters(
     get_double(kChromaEps, config_.chroma_eps);
     get_double(kStructureCoupling, config_.structure_coupling);
     get_int(kCgIterations, config_.cg_iterations);
+    get_bool(kFast, config_.fast);
+    get_int(kPasses, config_.passes);
+    get_int(kChunkFrames, config_.chunk_frames);
+    get_int(kFieldOrder, config_.field_order);
+    get_bool(kPerField, config_.per_field);
+    get_double(kDiagPrior, config_.diag_prior);
     get_bool(kAcc, config_.acc);
     get_double(kChromaGain, config_.chroma_gain);
     get_bool(kMonochrome, config_.monochrome);

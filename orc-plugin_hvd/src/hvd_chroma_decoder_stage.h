@@ -115,6 +115,19 @@ public:
                                 const ::hvd::NeighborRawState* prev_frame = nullptr,
                                 ::hvd::NeighborRawState* out_state = nullptr) const;
 
+    // Sequence (field-granularity 3D, engine/sequence.h) export of ONE
+    // chunk: decodes frames [t0, t1] with config chunk_overlap frames of
+    // context on each side (clamped to [range_first, range_last]) and
+    // writes the chunk's core frames, in order, as raw RGB24. Reads the
+    // window's raw buffers under `read_mutex`, decodes outside it. Returns
+    // false on read/geometry failure or if the source is Y/C-native (no
+    // composite to run the pipeline on — the caller should fall back to
+    // the frame path).
+    bool decode_sequence_chunk_and_write_rgb24(
+        FrameID t0, FrameID t1, FrameID range_first, FrameID range_last,
+        ::hvd::HvdEngine& engine, std::mutex& read_mutex,
+        std::ostream& out) const;
+
 private:
     const ::hvd::YcFrameS16& decoded(FrameID id) const;
     ::hvd::FrameParams frame_params() const;
@@ -153,19 +166,13 @@ private:
     mutable std::mutex mutex_;
     mutable std::map<FrameID, ::hvd::YcFrameS16> yc_cache_;
 
-    // Frame-level 3D temporal state (see engine.h's DecodeFrame doc
-    // comment): the raw state of the last frame decoded THROUGH decoded()
-    // (guarded by mutex_ along with everything else here). Only used as a
-    // temporal neighbour on the NEXT call if that call's FrameID is
-    // exactly prev_frame_id_ + 1 — anything else (a preview scrub to a
-    // distant frame) means this cached state isn't really adjacent, so
-    // it's discarded rather than fed in as a misleading "previous frame".
-    // This member is specific to the preview/cached path; export_now()'s
-    // temporal-chained mode keeps its OWN local chain instead (a sequential
-    // export shouldn't perturb whatever the preview was in the middle of,
-    // and vice versa) — see HvdChromaDecoderStage::trigger().
-    mutable std::optional<FrameID> prev_frame_id_;
-    mutable ::hvd::NeighborRawState prev_frame_state_;
+    // (The frame-level 3D temporal chain that used to live here — a
+    // prev_frame_id_/prev_frame_state_ pair fed to DecodeFrameBuffer — is
+    // gone: the preview now goes through the same field-granularity
+    // sequence pipeline as the export, which carries its own temporal
+    // window. The frame-level temporal term survives only as the export
+    // fallback for Y/C-native sources, which keeps its state locally in
+    // trigger().)
 };
 
 // ---------------------------------------------------------------------------
