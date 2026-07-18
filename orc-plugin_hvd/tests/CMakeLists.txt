@@ -44,8 +44,7 @@ set(HVD_ENGINE_TESTS
     temporal_test
     sequence_test
     field_order_test
-    variational_v2_test
-    engine_temporal_test)
+    variational_v2_test)
 
 foreach(t ${HVD_ENGINE_TESTS})
     add_executable(${t} engine/${t}.cpp)

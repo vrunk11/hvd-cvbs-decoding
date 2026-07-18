@@ -7,6 +7,8 @@
 
 #include "engine/engine.h"
 #include "engine/lockin.h"
+#include <fstream>
+#include <cstdio>
 
 namespace hvd {
 
@@ -140,9 +142,7 @@ bool ResolveField1IsBottom(const FieldInput& block1, const FieldInput& block2,
 }
 
 YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
-                             const HvdConfig& cfg, HvdEngine& engine,
-                             const NeighborRawState* prev_frame,
-                             NeighborRawState* out_state) {
+                             const HvdConfig& cfg, HvdEngine& engine) {
   const int fw = fp.frame_width;
   const int fh = fp.frame_height;
   const int f1 = fp.field1_lines;
@@ -162,16 +162,8 @@ YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
     bottom.is_first_field = f1_bottom;
   }
 
-  std::vector<NeighborRawState> prev_frames;
-  if (prev_frame && cfg.enable_temporal) prev_frames.push_back(*prev_frame);
-  const FrameYc yc = engine.DecodeFrame(top, bottom, g, cfg, prev_frames);
+  const FrameYc yc = engine.DecodeFrame(top, bottom, g, cfg);
 
-  if (out_state) {
-    out_state->luma = yc.luma;
-    out_state->composite = yc.composite;
-    out_state->carrier = yc.carrier;
-    out_state->chroma = yc.chroma_phasor;  // for the coherence gate
-  }
 
   // --- Re-weave into a field-sequential Y/C split --------------------------
   YcFrameS16 out;
@@ -341,7 +333,8 @@ YcFrameS16 DecodeYcFrameBuffer(const int16_t* luma, const int16_t* chroma,
 
 std::vector<YcFrameS16> DecodeFrameSequenceWindow(
     const std::vector<const int16_t*>& frames, int core_begin, int core_end,
-    const FrameParams& fp, const HvdConfig& cfg, HvdEngine& engine) {
+    const FrameParams& fp, const HvdConfig& cfg, HvdEngine& engine,
+    int64_t base_frame_id) {
   std::vector<YcFrameS16> out;
   const int nframes = static_cast<int>(frames.size());
   if (nframes == 0 || core_begin < 0 || core_end > nframes ||
@@ -403,8 +396,69 @@ std::vector<YcFrameS16> DecodeFrameSequenceWindow(
   const float gain = cfg.chroma_gain * acc_gain;
 
   // --- The pipeline itself -------------------------------------------------
+  SequenceDiagnostics diag;
   const std::vector<DecodedField> dec =
-      engine.DecodeSequenceWindow(fields, g, cfg);
+      engine.DecodeSequenceWindow(fields, g, cfg, &diag);
+
+  // ---- diagnostic maps (cfg.debug_dir non-empty) ---------------------------
+  if (!cfg.debug_dir.empty()) {
+    // Per-chunk decision log.
+    {
+      std::ofstream log(cfg.debug_dir + "/diag.txt", std::ios::app);
+      log << "frames " << (base_frame_id + core_begin) << ".."
+          << (base_frame_id + core_end - 1) << ": f1_bottom=" << f1_bottom
+          << " sigma=" << diag.sigma_ire << " amb=" << diag.ambiguity_ire
+          << " strength=" << diag.resolved_strength
+          << " eps_t=" << diag.temporal_eps << " nr_eps=" << diag.nr_eps
+          << " acc=" << acc_gain << "\n";
+    }
+    // Per exported frame: woven map of residual chroma-in-luma (the
+    // visible rainbow, measured). NOT a plain demod of Y — that lights up
+    // on any legitimate luma texture near f_sc (fine folds, fan grilles,
+    // small text) even when separation succeeded, which sent the first
+    // artifact hunt after ghosts. The discriminator is parity physics:
+    // between same-parity fields the carrier has flipped, so legitimate
+    // static luma flips sign in the demod and CANCELS in the pair SUM,
+    // while residual chroma-in-Y (a correlated separation error) is
+    // coherent and survives. Triangle-7 demod; 0..8 IRE -> 0..255.
+    for (int t = core_begin; t < core_end; ++t) {
+      const int lines = dec[2 * t].luma.height();
+      const int aw = dec[2 * t].luma.width();
+      const int nfields = static_cast<int>(dec.size());
+      std::vector<uint8_t> img(static_cast<size_t>(2 * lines) * aw, 0);
+      for (int half = 0; half < 2; ++half) {
+        const int j = 2 * t + half;
+        const int j2 = (j + 2 < nfields) ? j + 2 : j - 2;  // same parity
+        const int p = fields[j].parity;
+        static constexpr float kW[7] = {1, 2, 3, 4, 3, 2, 1};
+        for (int r = 0; r < lines; ++r) {
+          for (int x = 0; x + 7 <= aw; ++x) {
+            Complex dj{0.0F, 0.0F};
+            Complex dk{0.0F, 0.0F};
+            for (int k = 0; k < 7; ++k) {
+              dj += kW[k] * dec[j].luma.at(r, x + k) *
+                    std::conj(fields[j].carrier.at(r, x + k));
+              if (j2 >= 0)
+                dk += kW[k] * dec[j2].luma.at(r, x + k) *
+                      std::conj(fields[j2].carrier.at(r, x + k));
+            }
+            const float e = (j2 >= 0) ? std::abs(dj + dk) / 32.0F
+                                      : std::abs(dj) / 16.0F;
+            const int v = std::clamp(static_cast<int>(e * 32.0F), 0, 255);
+            img[static_cast<size_t>(2 * r + p) * aw + x + 3] =
+                static_cast<uint8_t>(v);
+          }
+        }
+      }
+      char name[64];
+      std::snprintf(name, sizeof(name), "/rainbow_%06lld.pgm",
+                    static_cast<long long>(base_frame_id + t));
+      std::ofstream pgm(cfg.debug_dir + name, std::ios::binary);
+      pgm << "P5\n" << aw << " " << 2 * lines << "\n255\n";
+      pgm.write(reinterpret_cast<const char*>(img.data()),
+                static_cast<std::streamsize>(img.size()));
+    }
+  }
 
   // --- Weave core frames by parity and repackage as YcFrameS16 -------------
   const int fal = g.first_active_field_line;

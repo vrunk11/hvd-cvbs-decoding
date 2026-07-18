@@ -68,6 +68,18 @@ struct DecodedField {
   ComplexPlane chroma;  // chi = V - iU (IRE), fully guided separation
 };
 
+// What the driver DECIDED for a window — filled when the caller passes a
+// non-null pointer; exists for the diagnostic maps (rainbow debugging:
+// when an artifact report can't be reproduced synthetically, the first
+// question is what the decoder chose on the user's own content).
+struct SequenceDiagnostics {
+  float resolved_strength = 0.0F;  // after the adaptive resolution
+  float ambiguity_ire = 0.0F;      // the measured Y/C ambiguity
+  float sigma_ire = 0.0F;          // measured composite noise
+  float temporal_eps = 0.0F;       // resolved robust gate
+  float nr_eps = 0.0F;
+};
+
 // Decode one window of consecutive fields (chunk + overlap, typically
 // 2*(chunk_frames + 2*chunk_overlap) fields; all fields must share one
 // shape). Ports the whole per-window body of decode_sequence:
@@ -85,7 +97,9 @@ struct DecodedField {
 // non-overlap core of the window.
 std::vector<DecodedField> DecodeFieldWindow(const std::vector<FieldObs>& fields,
                                             const FieldGeometry& g,
-                                            const HvdConfig& cfg, Fft2d* fft);
+                                            const HvdConfig& cfg, Fft2d* fft,
+                                            SequenceDiagnostics* diag = nullptr);
+
 
 // Test seam: same driver, but with the per-field initial (Y, chi) supplied
 // by the caller instead of computed by HolographicInit — lets the whole 3D
@@ -118,7 +132,7 @@ DrizzleResult DrizzleFrame(int j0, const std::vector<Plane>& Ys,
 std::vector<DecodedField> DecodeFieldWindowWithInits(
     const std::vector<FieldObs>& fields,
     const std::vector<DecodedField>& inits, const FieldGeometry& g,
-    const HvdConfig& cfg);
+    const HvdConfig& cfg, SequenceDiagnostics* diag = nullptr);
 
 }  // namespace hvd
 

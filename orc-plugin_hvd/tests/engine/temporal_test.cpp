@@ -44,27 +44,6 @@ hvd::ComplexPlane MakeCarrier(int h, int w) {
 void RunTests() {
   constexpr int kH = 64, kW = 64;
 
-  // --- EnvelopeOf: Re(chi_b * carrier) must equal Cb EXACTLY (up to float
-  // rounding), since |carrier| == 1 by construction — this is a pure
-  // algebraic identity of the envelope construction, not an approximation,
-  // regardless of what q (the quadrature term) is. ------------------------
-  {
-    const hvd::Plane s = MakeTexture(kH, kW);
-    const hvd::ComplexPlane carrier = MakeCarrier(kH, kW);
-    const hvd::Envelope env = hvd::EnvelopeOf(s, carrier);
-    CHECK(env.luma.height() == kH - 1);
-    CHECK(env.chroma.height() == kH - 1);
-
-    for (int y = 0; y < kH - 1; ++y) {
-      for (int x = 0; x < kW; ++x) {
-        const float cb = 0.5F * (s.at(y, x) - s.at(y + 1, x));
-        const float reconstructed =
-            (env.chroma.at(y, x) * carrier.at(y, x)).real();
-        CHECK_NEAR(reconstructed, cb, 1e-3);
-      }
-    }
-  }
-
   // --- WarpByTiles: with a uniform per-tile shift, the warped output at
   // an interior pixel must equal the source sampled at (y - dy, x - dx) —
   // this is the operator's own definition, so this checks the tile
@@ -121,30 +100,6 @@ void RunTests() {
     mean /= static_cast<float>(cross_coherence.size());
     CHECK(mean < 0.5F);
   }
-  // --- McWarp: estimate motion from ref toward a shifted "cur", then warp
-  // ref itself through that motion field — the result should land back on
-  // cur at interior pixels (exercises EstimateMotion + WarpByTiles
-  // together, the actual composition used by the reference). -------------
-  {
-    const hvd::Plane ref = MakeTexture(kH, kW);
-    constexpr int kShiftY = 3, kShiftX = -2;
-    hvd::Plane cur(kH, kW);
-    for (int y = 0; y < kH; ++y) {
-      const int sy = std::clamp(y - kShiftY, 0, kH - 1);
-      for (int x = 0; x < kW; ++x) {
-        const int sx = std::clamp(x - kShiftX, 0, kW - 1);
-        cur.at(y, x) = ref.at(sy, sx);
-      }
-    }
-    const hvd::McWarpResult mc = hvd::McWarp(ref, cur, {ref}, 32, 8);
-    CHECK(mc.warped.size() == 1);
-    for (int y = 8; y < kH - 8; ++y) {
-      for (int x = 8; x < kW - 8; ++x) {
-        CHECK_NEAR(mc.warped[0].at(y, x), cur.at(y, x), 2.0);
-      }
-    }
-  }
-
   // --- MotionCompensatePrev, with an EXPLICIT motion field (isolates the
   // warp wiring from the estimator's own behaviour): result.composite must
   // equal WarpByTiles(prev.composite, ...) exactly, and result.carrier the
@@ -184,41 +139,7 @@ void RunTests() {
     CHECK(r.confidence.width() == kW);
   }
 
-  // --- MotionCompensateEnvelope: with an explicit zero motion field and
-  // same-parity neighbour, just check the plumbing produces finite,
-  // correctly-shaped output — deriving a tight closed-form check here
-  // would need re-deriving the half-line resampling algebra, which isn't
-  // worth it for a sanity test at this stage. -----------------------------
-  {
-    const hvd::Plane composite = MakeTexture(kH, kW);
-    const hvd::ComplexPlane carrier = MakeCarrier(kH, kW);
-    hvd::NeighborRawState nb;
-    nb.luma = MakeTexture(kH, kW);
-    nb.composite = composite;
-    nb.carrier = carrier;
 
-    constexpr int kTile = 16;
-    const int th = (kH + kTile - 1) / kTile;
-    const int tw = (kW + kTile - 1) / kTile;
-    hvd::MotionField zero_motion;
-    zero_motion.tile = kTile;
-    zero_motion.dy = hvd::Plane(th, tw, 0.0F);
-    zero_motion.dx = hvd::Plane(th, tw, 0.0F);
-    zero_motion.confidence = hvd::Plane(th, tw, 0.5F);
-
-    const hvd::Plane y_cur = MakeTexture(kH, kW);
-    const hvd::MotionCompensatedResult r = hvd::MotionCompensateEnvelope(
-        nb, y_cur, carrier, /*parity_cur=*/0, /*parity_nb=*/0, kTile, 8,
-        &zero_motion);
-
-    CHECK(r.composite.height() == kH);
-    CHECK(r.composite.width() == kW);
-    for (size_t i = 0; i < r.composite.size(); ++i) {
-      CHECK(std::isfinite(r.composite[i]));
-      CHECK(std::isfinite(r.carrier[i].real()));
-      CHECK(std::isfinite(r.carrier[i].imag()));
-    }
-  }
 }
 
 TEST_MAIN()

@@ -62,19 +62,6 @@ Plane WarpBilinearTiles(const Plane& a, const Plane& dyf, const Plane& dxf,
 Plane WarpBilinearTiles(const Plane& a, const PerPixelMotion& v,
                         float row_offset, int out_h, int out_w);
 
-// Line-pair comb separation of a raw field into baseband envelope samples
-// on the HALF-LINE grid (between lines m and m+1) — see envelope_of in the
-// reference for the derivation. `carrier` is exp(i*phi) at the SAME
-// resolution as `s` (this engine already builds that via MakeCarrier,
-// unlike the Python reference which stores raw phi and re-exponentiates
-// here — passing the carrier directly avoids redoing that plumbing).
-// Output height is s.height() - 1.
-struct Envelope {
-  Plane luma;          // Yb, baseband luma on the half-line grid
-  ComplexPlane chroma;  // chi_b, baseband chroma phasor on the half-line grid
-};
-Envelope EnvelopeOf(const Plane& s, const ComplexPlane& carrier);
-
 // InSAR-style local complex coherence between two chroma phasor fields:
 //   gamma = |<z1 * conj(z2)>| / sqrt(<|z1|^2> * <|z2|^2>)
 // (box-blurred local averages, radius r). Phase-sensitive where a plain
@@ -112,16 +99,6 @@ Plane UpsampleConfidence(const Plane& conf, int tile, int out_h, int out_w);
 Plane UpsampleConfidenceFast(const Plane& conf, int tile, int out_h,
                              int out_w);
 
-// Estimates motion from y_from toward y_to and warps every plane in
-// `arrays` accordingly (integer-pel — these are still-modulated composite-
-// domain arrays, not baseband). Matches mc_warp in the reference.
-struct McWarpResult {
-  std::vector<Plane> warped;
-  Plane confidence;
-};
-McWarpResult McWarp(const Plane& y_from, const Plane& y_to,
-                    const std::vector<Plane>& arrays, int tile, int search);
-
 // One neighbour frame's raw measurements. `luma` is a STABLE reference used
 // only for motion matching (the reference uses the holographic-init luma
 // here, never a fully-refined decode — deliberately, so multiple IRLS/CG
@@ -143,36 +120,19 @@ struct NeighborRawState {
   ComplexPlane chroma;
 };
 
-// Envelope-domain neighbour resampling (motion_compensate_envelope in the
-// reference): comb-separates the neighbour's raw field into baseband
-// (Yb, chi_b), motion-warps it with SUB-PIXEL bilinear interpolation
-// (legal in baseband — forbidden on the still-modulated carrier), then
-// re-encodes it at the CURRENT field's own phase + 180 deg. This is what
-// makes the half-line parity offset between opposite-parity fields vanish
-// by construction (the comb's half-grid IS the other parity's grid) and
-// gives |dc| = 2 (maximal chroma leverage) for every neighbour, vs sqrt(2)
-// for the plain raw-adjacent-field pairing in MotionCompensatePrev below.
-// `parity_cur`/`parity_nb` are 0 (top field) or 1 (bottom field) — pass the
-// TRUE spatial parity (e.g. from capture metadata), not just index parity,
-// on sources that can start on a second field or skip fields.
-// If `motion` is null, it's estimated internally from neighbor.luma vs
-// y_cur; pass a precomputed one to reuse a motion field across calls.
-struct MotionCompensatedResult {
-  Plane composite;       // S_w: re-encoded composite estimate
-  ComplexPlane carrier;  // c_w: the (phase-flipped) carrier S_w is expressed against
-  Plane confidence;
-};
-MotionCompensatedResult MotionCompensateEnvelope(
-    const NeighborRawState& neighbor, const Plane& y_cur,
-    const ComplexPlane& carrier_cur, int parity_cur, int parity_nb, int tile,
-    int search, const MotionField* motion = nullptr);
-
 // Simpler neighbour resampling (motion_compensate_prev in the reference):
 // integer-pel warp of the neighbour's raw composite AND raw carrier phase
 // toward the current frame — no envelope separation, no sub-pixel warp, no
-// re-encoding. Cheaper, and the natural choice for same-parity neighbours
-// (e.g. +/-2 fields, 1 frame apart) where MotionCompensateEnvelope's
-// cross-parity machinery isn't needed.
+// re-encoding. (An envelope-resampled variant was tried in the reference
+// and REJECTED — its 1-line comb leaks vertical luma gradients into
+// chroma; the raw warp is the design, per the decode_sequence comment and
+// THEORY 9g. The envelope machinery was removed in the cleanup pass.)
+struct MotionCompensatedResult {
+  Plane composite;       // warped raw composite (IRE)
+  ComplexPlane carrier;  // warped carrier phasor
+  Plane confidence;      // per-pixel confidence in [0, 1]
+};
+
 // `fast` selects the tile-resolution confidence upsample
 // (UpsampleConfidenceFast) instead of the full-res squared+blurred one.
 // `vpix`: optional precomputed per-pixel vectors for `motion` at the

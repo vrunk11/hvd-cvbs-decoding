@@ -385,6 +385,48 @@ defects in this reference:
   negative result (the envelope-resampled neighbour variant that leaked
   vertical luma gradients into chroma); annotated as such.
 
+## 9h. The odd-offset half-line gate (thin horizontal detail)
+
+Found from a real-footage rainbow map (bright residual on thin window
+ledges/blinds and on a textured curtain) and reproduced synthetically:
+
+* The curtain was a MEASUREMENT ghost: a plain carrier-band demod of the
+  decoded luma lights up on any legitimate luma texture near f_sc even
+  when separation succeeded. The discriminator is parity physics —
+  between same-parity fields the carrier has flipped, legitimate static
+  luma flips sign in the demod and cancels in the pair SUM, residual
+  chroma-in-Y survives. The diagnostic map now uses the pair sum.
+* Thin horizontal chroma detail was a REAL hole. A feature 1..4 frame
+  lines high sits at/beyond the opposite parity's vertical Nyquist: that
+  parity genuinely cannot see it, so its neighbour equations vote
+  "background" — and their residual OSCILLATES with x as |dchi*cos|, so
+  the robust weight gates some columns and passes confident wrong votes
+  at the cosine zeros. Measured: 3D made 1-frame-line chroma detail
+  WORSE than 2D (5.2 vs 3.5 IRE chi error).
+
+The fix is a deterministic gate on the ODD offsets' confidence, and its
+form was found by measurement as much as derivation — the failed
+variants are part of the record:
+
+* composite-based envelope: unusable — within a field the carrier flips
+  180 deg per LINE (consecutive field lines are consecutive in scan
+  time), so |dS/dline| ~ 2|chi| on flat saturated colour; the gate
+  correlated with chroma and cost -8.6 dB on the saturated chart.
+* residual-dependent gate: unusable — the dangerous votes are exactly
+  the ones whose residual passes through zero with x.
+* hard geometric variants (min of sides, near-minus-far): each traded
+  the chart against thin lines without dominating.
+
+Final form: BASEBAND one-sided-max envelope (central diffs are exactly
+zero ON a one-row feature) of sqrt(dY^2 + |dchi|^2), horizontally-only
+smoothed (a 2D blur dilutes a one-row footprint ~2.5x), floored at
+0.35 — step edges are visible to the opposite parity, merely displaced,
+and their biased-but-informative equations must keep enough mass for
+the joint solve to absorb (hard-gating them cost 4.4 dB of 3D gain on
+the chart). Measured: the reference chart is bit-restored (43.47 /
+40.74 dB), 2-frame-line chroma bands improve ~2-3x under 3D instead of
+degrading, and the visible rainbow metric halves on every band.
+
 ## 10. Deferred items, with reasons
 
 * **Multigrid / coarse-to-fine solving**: naive spatial coarsening is

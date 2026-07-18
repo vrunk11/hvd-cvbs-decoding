@@ -255,14 +255,15 @@ FieldObs PrepareFieldObs(const FieldInput& field, const FieldGeometry& g,
 
 std::vector<DecodedField> DecodeFieldWindow(const std::vector<FieldObs>& fields,
                                             const FieldGeometry& g,
-                                            const HvdConfig& cfg, Fft2d* fft) {
+                                            const HvdConfig& cfg, Fft2d* fft,
+                                            SequenceDiagnostics* diag) {
   std::vector<DecodedField> inits(fields.size());
   for (size_t j = 0; j < fields.size(); ++j) {
     HoloInit hi = HolographicInit(fields[j].s, fields[j].carrier, g, cfg, fft);
     inits[j].luma = std::move(hi.luma);
     inits[j].chroma = std::move(hi.chroma);
   }
-  return DecodeFieldWindowWithInits(fields, inits, g, cfg);
+  return DecodeFieldWindowWithInits(fields, inits, g, cfg, diag);
 }
 
 DrizzleResult DrizzleFrame(int j0, const std::vector<Plane>& Ys,
@@ -395,7 +396,7 @@ DrizzleResult DrizzleFrame(int j0, const std::vector<Plane>& Ys,
 std::vector<DecodedField> DecodeFieldWindowWithInits(
     const std::vector<FieldObs>& fields,
     const std::vector<DecodedField>& inits, const FieldGeometry& g,
-    const HvdConfig& cfg_in) {
+    const HvdConfig& cfg_in, SequenceDiagnostics* diag) {
   (void)g;
   const int nf = static_cast<int>(fields.size());
   std::vector<DecodedField> out(nf);
@@ -410,6 +411,7 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
     sigmas.reserve(fields.size());
     for (const FieldObs& f : fields) sigmas.push_back(EstimateNoiseIre(f.s));
     const float sigma = MedianOf(std::move(sigmas));
+    if (diag) diag->sigma_ire = sigma;
     if (ccfg.temporal_eps <= 0.0F)
       ccfg.temporal_eps = std::clamp(7.0F * sigma, 4.0F, 20.0F);
     if (ccfg.nr_eps <= 0.0F)
@@ -424,7 +426,6 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
     offs = ccfg.bidirectional ? std::vector<int>{-2, -1, 1, 2}
                               : std::vector<int>{-2, -1};
   }
-  const int n_passes = std::max(1, ccfg.passes);
 
   std::vector<Plane> Ys(nf);
   std::vector<ComplexPlane> chis(nf);
@@ -449,8 +450,93 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
   // slow mode via a distinct map per pass.
   std::map<std::pair<int, int>, MotionField> mcache_fast;
 
+  // ADAPTIVE temporal strength. Convention: strength < 0 => 3D OFF (the
+  // stage passes -1 when the switch is off); == 0 => AUTO (measure the
+  // content); > 0 => fixed (reference behaviour). The right strength is a
+  // property of the CONTENT: on Y/C-ambiguous material (luma energy at
+  // the subcarrier) the neighbour equations resolve what 2D cannot and
+  // deserve to be strong; on unambiguous material they can only lift
+  // chroma noise and should stay weak. The measurement uses the phase
+  // physics directly: d_j = 5-tap demod of S by the field's own carrier;
+  // for a same-parity pair (j, j+2) the carrier has flipped 180 degrees,
+  // so true (static) chroma appears IDENTICALLY in both while luma
+  // leaking through the chroma band flips sign — (d_j - d_{j+2}) / 2
+  // isolates exactly the ambiguous energy. Noise is subtracted in
+  // quadrature via the same sigma the robust gates calibrated from;
+  // motion only biases the estimate upward, i.e. toward "more 3D", where
+  // the per-pixel gates already protect the result.
+  if (ccfg.temporal_strength == 0.0F && ccfg.cg_iterations > 0 && nf > 2) {
+    std::vector<float> ambs;
+    for (int j = 0; j + 2 < nf; ++j) {
+      const Plane& Sj = fields[j].s;
+      const Plane& Sk = fields[j + 2].s;
+      const int hh = Sj.height();
+      const int ww = Sj.width();
+      // Crude demod, decimated: this is a scalar calibration, not a decode.
+      double acc = 0.0;
+      long n = 0;
+      for (int y = 2; y < hh - 2; y += 3) {
+        for (int x = 4; x + 7 < ww; x += 4) {
+          // Triangle-7 (= box4 convolved with box4): a DOUBLE null at the
+          // carrier frequency (pi/2 rad/px at 4fsc). The demod shifts
+          // ordinary luma to ~pi/2; a single 4-tap null is exact only ON
+          // the carrier and leaks ~9% a tenth of a radian away — enough
+          // for a 20 IRE luma ramp to dwarf real ambiguity. The double
+          // null rejects the whole neighbourhood (<1% at +/-0.12 rad), so
+          // what survives is energy that genuinely sat NEAR fsc before
+          // the demod: the actual Y/C ambiguity.
+          auto demod = [&](const Plane& S, const ComplexPlane& car) {
+            static constexpr float kW[7] = {1.0F, 2.0F, 3.0F, 4.0F,
+                                            3.0F, 2.0F, 1.0F};
+            Complex d{0.0F, 0.0F};
+            for (int k = 0; k < 7; ++k)
+              d += kW[k] * S.at(y, x + k) * std::conj(car.at(y, x + k));
+            return d * (1.0F / 16.0F);
+          };
+          const Complex dj = demod(Sj, fields[j].carrier);
+          const Complex dk = demod(Sk, fields[j + 2].carrier);
+          acc += 0.25 * std::norm(dj - dk);
+          ++n;
+        }
+      }
+      if (n > 0) ambs.push_back(std::sqrt(static_cast<float>(acc / n)));
+    }
+    float amb = MedianOf(std::move(ambs));
+    // Remove the noise contribution: the triangle-7 demod carries
+    // sum(w^2)/16^2 = 44/256 of sigma^2 per field; the half-difference of
+    // two fields halves that -> rms ~= 0.29*sigma. Use the same sigma the
+    // robust gates calibrated from.
+    const float sigma_d = ccfg.nr_eps > 0.0F ? ccfg.nr_eps / 3.0F : 1.0F;
+    const float noise_floor = sigma_d * 0.29F;
+    amb = std::sqrt(std::max(0.0F, amb * amb - noise_floor * noise_floor));
+    // Map ambiguity (IRE of leaked luma in the chroma band) onto strength
+    // around the reference's --3d value (~1 IRE of leak deserves 0.5;
+    // heavy cross-colour saturates at 1.5). NO floor: measured on the
+    // clean regression scene, even a small forced strength (plus the
+    // anchor it drags in) costs ~3 dB where there is no ambiguity to
+    // resolve — amb ~ 0 must mean genuinely OFF.
+    ccfg.temporal_strength =
+        std::clamp(0.5F * amb - 0.05F, 0.0F, 1.5F);
+    if (diag) diag->ambiguity_ire = amb;
+  }
+  if (ccfg.temporal_strength < 0.0F) ccfg.temporal_strength = 0.0F;
+
+  if (diag) {
+    diag->resolved_strength = std::max(0.0F, ccfg.temporal_strength);
+    diag->temporal_eps = ccfg.temporal_eps;
+    diag->nr_eps = ccfg.nr_eps;
+  }
+
   const bool has_temporal =
       ccfg.temporal_strength > 0.0F && ccfg.cg_iterations > 0;
+
+  // decode_field semantics when the temporal terms are off: ONE pass, no
+  // anchor. (The reference only runs passes/anchor inside decode_sequence,
+  // i.e. WITH temporal terms; letting the anchor blend fields in "2D" both
+  // diverged from the reference and made the supposedly-decoupled fields
+  // couple through SynthReference — a data race under the stride-1
+  // parallel sweep, and a semantics bug before it was a threading one.)
+  const int n_passes = has_temporal ? std::max(1, ccfg.passes) : 1;
 
   std::mutex mcache_mu;  // guards the shared fast-mode cache during the
                          // colored parallel sweep (see below)
@@ -562,6 +648,95 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
 
       // ---- neighbour equations -------------------------------------------
       std::vector<NeighborTerm> neighbors;
+      // Half-line validity envelope for ODD offsets (opposite parity).
+      // An opposite-parity neighbour samples the scene BETWEEN this
+      // field's lines: after the integer warp its equation claims the
+      // content at y +/- 0.5 lines is the content at y. Wherever the
+      // current field has vertical structure that claim is wrong by
+      // ~0.5*|dS/dline| — and, crucially, on detail thinner than the
+      // frame-line pitch (a 1-frame-line coloured ledge, thin blinds) the
+      // opposite parity genuinely does not SEE the feature, so its
+      // equation votes "background" with a SMALL residual that the
+      // robust weight never gates: measured, 3D made 1-frame-line chroma
+      // detail WORSE than 2D (5.2 vs 3.5 IRE chi error) through exactly
+      // this hole. The bias is known geometry, so gate it
+      // deterministically: wt *= eps^2 / (eps^2 + (0.5*dS/dline)^2),
+      // horizontally smoothed. Even offsets are aligned and untouched.
+      Plane vgrad;
+      if (has_temporal) {
+        bool any_odd = false;
+        for (int o : offs) {
+          const int k = j + o;
+          if (k >= 0 && k < nf && ((o & 1) != 0)) any_odd = true;
+        }
+        if (any_odd) {
+          // BASEBAND vertical envelope — NOT the composite's: within a
+          // field, consecutive lines are consecutive in SCAN TIME, so the
+          // carrier flips 180 deg per FIELD line and the composite of a
+          // flat saturated colour alternates sign line-to-line (|dS| ~
+          // 2|chi|) — a composite-based gate reads "vertical detail"
+          // everywhere chroma is strong and strangles the odd equations
+          // globally, chroma-correlated (measured: -8.6 dB on the
+          // reference's saturated SMPTE scene). The decoded baseband
+          // state (Ys, chis) measures the actual scene structure the
+          // opposite parity cannot see. One-sided max diff (a central
+          // diff is exactly zero ON a one-row feature), local RMS via
+          // blurred squares.
+          const int hh = S.height();
+          const int ww = S.width();
+          Plane gmag(hh, ww);
+          for (int y = 0; y < hh; ++y) {
+            const int ym = std::max(0, y - 1);
+            const int yp = std::min(hh - 1, y + 1);
+            for (int x = 0; x < ww; ++x) {
+              const float dyu = Ys[j].at(y, x) - Ys[j].at(ym, x);
+              const float dyd = Ys[j].at(yp, x) - Ys[j].at(y, x);
+              const float dcu = std::abs(chis[j].at(y, x) - chis[j].at(ym, x));
+              const float dcd = std::abs(chis[j].at(yp, x) - chis[j].at(y, x));
+              const float mu = dyu * dyu + dcu * dcu;
+              const float md = dyd * dyd + dcd * dcd;
+              gmag.at(y, x) = std::max(mu, md);
+            }
+          }
+          // HORIZONTAL-only smoothing          // HORIZONTAL-only smoothing: a 2D blur dilutes a one-row
+          // feature's vertical footprint by ~2.5x and weakens the gate on
+          // exactly the detail it protects; vertical coverage already
+          // comes free from the one-sided max (the feature row and both
+          // its neighbours each carry a full-amplitude diff).
+          vgrad = Plane(hh, ww);
+          for (int y = 0; y < hh; ++y) {
+            float acc = 0.0F;
+            for (int x = 0; x < std::min(5, ww); ++x) acc += gmag.at(y, x);
+            for (int x = 0; x < ww; ++x) {
+              const int lo = x - 2, hi = x + 2;
+              if (x > 0) {
+                if (hi < ww) acc += gmag.at(y, hi);
+                if (lo - 1 >= 0) acc -= gmag.at(y, lo - 1);
+              }
+              const int n_taps = std::min(hi, ww - 1) - std::max(lo, 0) + 1;
+              vgrad.at(y, x) = std::sqrt(acc / static_cast<float>(n_taps));
+            }
+          }
+          // Noise-floor the envelope: at pass 0 the state is the
+          // holographic INIT, whose vertical cross-colour/noise gives a
+          // non-zero envelope everywhere — ungated that read as "detail"
+          // and cost the reference chart 4 dB of 3D gain. The floor is
+          // self-calibrated as the MEDIAN envelope (background dominates
+          // by area): background -> gate ~ 1, true structure >> median
+          // -> gate bites.
+          {
+            std::vector<float> sample;
+            sample.reserve(vgrad.size() / 7 + 1);
+            for (size_t i = 0; i < vgrad.size(); i += 7)
+              sample.push_back(vgrad[i]);
+            const float med = MedianOf(std::move(sample));
+            const float fl2 = 2.25F * med * med;  // (1.5 * median)^2
+            for (size_t i = 0; i < vgrad.size(); ++i)
+              vgrad[i] = std::sqrt(
+                  std::max(0.0F, vgrad[i] * vgrad[i] - fl2));
+          }
+        }
+      }
       if (has_temporal) {
         for (int o : offs) {
           const int k = j + o;
@@ -628,6 +803,27 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
             const float a = ccfg.coherence_gate;
             for (size_t i = 0; i < mc.confidence.size(); ++i)
               mc.confidence[i] *= (1.0F - a) + a * gamma[i];
+          }
+          if ((o & 1) != 0 && !vgrad.empty()) {
+            // ENVELOPE gate, floored. The residual cannot do this job:
+            // at a chroma feature the odd equation's residual OSCILLATES
+            // with x (|dchi * cos|), so its robust weight gates the
+            // equation at some columns and lets confident wrong votes
+            // through at the cosine zeros — only the phase-independent
+            // ENVELOPE catches all of them (this is why the residual-
+            // dependent variant measured worse). The 0.25 floor keeps a
+            // quarter of the weight alive everywhere: on step-edge-heavy
+            // content (the reference's saturated chart) the odd
+            // equations are biased but informative and hard-gating them
+            // cost 4.4 dB of 3D gain; a floored gate keeps ~75% of the
+            // thin-detail protection while leaving the solve enough
+            // equation mass to keep absorbing edge bias.
+            const float e2 = ccfg.temporal_eps * ccfg.temporal_eps;
+            for (size_t i = 0; i < mc.confidence.size(); ++i) {
+              const float b = vgrad[i];
+              mc.confidence[i] *=
+                  std::max(0.35F, e2 / (e2 + b * b));
+            }
           }
           neighbors.push_back(
               NeighborTerm{std::move(mc.composite), std::move(mc.carrier),

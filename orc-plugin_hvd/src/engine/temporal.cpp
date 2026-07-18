@@ -168,45 +168,6 @@ Plane WarpBilinearTiles(const Plane& a, const PerPixelMotion& v,
   return out;
 }
 
-Envelope EnvelopeOf(const Plane& s, const ComplexPlane& carrier) {
-  const int h = s.height();
-  const int w = s.width();
-  const int ho = h - 1;
-
-  Envelope e;
-  e.luma = Plane(std::max(0, ho), w);
-  e.chroma = ComplexPlane(std::max(0, ho), w);
-  if (ho <= 0) return e;
-
-  Plane cb(ho, w);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-  for (int y = 0; y < ho; ++y) {
-    for (int x = 0; x < w; ++x) {
-      e.luma.at(y, x) = 0.5F * (s.at(y, x) + s.at(y + 1, x));
-      cb.at(y, x) = 0.5F * (s.at(y, x) - s.at(y + 1, x));
-    }
-  }
-
-  // Quadrature via a +/-1 sample x-shift (90 deg at 4fsc), WRAPPING around
-  // each line (matches the reference's np.roll(..., axis=1) exactly — a
-  // deliberate choice here, unlike the Neumann-boundary gradients used
-  // elsewhere in the engine).
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-  for (int y = 0; y < ho; ++y) {
-    for (int x = 0; x < w; ++x) {
-      const int x_minus = (x - 1 + w) % w;
-      const int x_plus = (x + 1) % w;
-      const float q = 0.5F * (cb.at(y, x_minus) - cb.at(y, x_plus));
-      const Complex cb_q(cb.at(y, x), q);
-      e.chroma.at(y, x) = cb_q * std::conj(carrier.at(y, x));
-    }
-  }
-  return e;
-}
 
 Plane ComplexCoherence(const ComplexPlane& z1, const ComplexPlane& z2, int r) {
   const int h = z1.height();
@@ -292,74 +253,7 @@ Plane UpsampleConfidenceFast(const Plane& conf, int tile, int out_h,
   return std::move(v.dy);
 }
 
-McWarpResult McWarp(const Plane& y_from, const Plane& y_to,
-                    const std::vector<Plane>& arrays, int tile, int search) {
-  const MotionField mf = EstimateMotion(y_from, y_to, tile, search);
-  McWarpResult r;
-  r.warped.reserve(arrays.size());
-  if (!arrays.empty()) {
-    // One VectorsPerPixel interpolation shared by every warped array
-    // (THEORY 9f, exact rewrite benefiting both modes).
-    const PerPixelMotion v = VectorsPerPixel(
-        mf.dy, mf.dx, tile, arrays.front().height(), arrays.front().width());
-    for (const Plane& a : arrays) r.warped.push_back(WarpByTiles(a, v));
-  }
-  r.confidence = UpsampleConfidence(mf.confidence, tile, y_from.height(), y_from.width());
-  return r;
-}
 
-MotionCompensatedResult MotionCompensateEnvelope(
-    const NeighborRawState& neighbor, const Plane& y_cur,
-    const ComplexPlane& carrier_cur, int parity_cur, int parity_nb, int tile,
-    int search, const MotionField* motion) {
-  MotionField local_motion;
-  const MotionField* mf = motion;
-  if (!mf) {
-    local_motion = EstimateMotion(neighbor.luma, y_cur, tile, search);
-    mf = &local_motion;
-  }
-
-  const Envelope env = EnvelopeOf(neighbor.composite, neighbor.carrier);
-  const float row_off =
-      (static_cast<float>(parity_cur) - static_cast<float>(parity_nb) - 1.0F) / 2.0F;
-  const int out_h = y_cur.height();
-  const int out_w = y_cur.width();
-
-  // One per-pixel vector interpolation shared by the luma + chroma-re +
-  // chroma-im warps (THEORY 9f, "once per warp trio instead of three times").
-  const PerPixelMotion vpix = VectorsPerPixel(mf->dy, mf->dx, tile, out_h, out_w);
-  const Plane yw = WarpBilinearTiles(env.luma, vpix, row_off, out_h, out_w);
-
-  // WarpBilinearTiles only takes real planes, so warp chi_b's real/imag
-  // parts separately (matches the reference's Cw = warp(.real) + 1j *
-  // warp(.imag) exactly).
-  Plane env_chi_re(env.chroma.height(), env.chroma.width());
-  Plane env_chi_im(env.chroma.height(), env.chroma.width());
-  for (size_t i = 0; i < env.chroma.size(); ++i) {
-    env_chi_re[i] = env.chroma[i].real();
-    env_chi_im[i] = env.chroma[i].imag();
-  }
-  const Plane cw_re = WarpBilinearTiles(env_chi_re, vpix, row_off, out_h, out_w);
-  const Plane cw_im = WarpBilinearTiles(env_chi_im, vpix, row_off, out_h, out_w);
-
-  MotionCompensatedResult result;
-  result.composite = Plane(out_h, out_w);
-  result.carrier = ComplexPlane(out_h, out_w);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-  for (long i = 0; i < static_cast<long>(result.composite.size()); ++i) {
-    const Complex cw(cw_re[i], cw_im[i]);
-    const Complex c_w = -carrier_cur[i];
-    result.carrier[i] = c_w;
-    result.composite[i] = yw[i] + (cw * c_w).real();
-  }
-  // Matches the reference: confidence upsampled at the NEIGHBOUR's shape
-  // (Y_nb.shape), not the current frame's — usually identical in practice.
-  result.confidence =
-      UpsampleConfidence(mf->confidence, tile, neighbor.luma.height(), neighbor.luma.width());
-  return result;
-}
 
 MotionCompensatedResult MotionCompensatePrev(
     const NeighborRawState& prev, const Plane& y_cur_init, int tile,

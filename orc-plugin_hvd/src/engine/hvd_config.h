@@ -14,6 +14,8 @@
 #ifndef ORC_PLUGIN_HVD_ENGINE_HVD_CONFIG_H_
 #define ORC_PLUGIN_HVD_ENGINE_HVD_CONFIG_H_
 
+#include <string>
+
 namespace hvd {
 
 struct HvdConfig {
@@ -22,9 +24,15 @@ struct HvdConfig {
   // smoother chroma / less rainbowing; lower = sharper chroma / less dot crawl
   // pushed into luma.
   float lambda_c = 1.0F;
-  // Chroma is broader horizontally than vertically: mu_h = chroma_aniso *
-  // lambda_c, mu_v = lambda_c.
-  float chroma_aniso = 0.5F;
+  // mu_h = chroma_aniso * lambda_c, mu_v = lambda_c. 0 = AUTO (default):
+  // the right split is a property of the content's chroma orientation —
+  // thin horizontal chroma bands / fsc-adjacent texture want the vertical
+  // prior weak (-> 1.0), sharp horizontal chroma transitions (colour
+  // bars) want the reference's 0.5; auto measures the init's p90 gradient
+  // ratio per solve and maps it into [0.5, 1.0] (ResolveChromaAniso in
+  // variational.cpp, with the measurements). Positive = forced fixed
+  // value (reference behaviour at 0.5).
+  float chroma_aniso = 0.0F;
   // Charbonnier edge-preservation scales (in IRE) for the luma and chroma
   // priors respectively.
   float charbonnier_eps = 0.5F;
@@ -160,37 +168,43 @@ struct HvdConfig {
   // vote with. 1/2 force the order manually (diagnosis: with the wrong
   // order, static horizontal edges serrate one line and motion combs even
   // through a player's deinterlacer).
+  // DIAGNOSTIC MAPS. When non-empty, the sequence export writes, per
+  // exported frame, a PGM map of the RESIDUAL CARRIER-BAND ENERGY in the
+  // decoded luma — i.e. the rainbow/dot-crawl the eye sees, measured
+  // (triangle-7 demod of Y by the field's own carrier, woven, 0..8 IRE
+  // mapped to 0..255) — plus a per-chunk diag.txt with the decoder's
+  // decisions (resolved adaptive strength, measured ambiguity, noise,
+  // gates, field-order vote). Exists because artifact reports that don't
+  // reproduce synthetically need the decoder's view of the USER's own
+  // content: send the map of a bad zone instead of describing it.
+  std::string debug_dir;
   int field_order = 0;  // 0 = auto (measured), 1 = field 1 top, 2 = field 1 bottom
-  // DECODE UNIT for the 2D path. false (reference default frame_decode=True):
-  // weave the two fields and decode at frame geometry — maximum vertical
-  // chroma resolution on STATIC content, but the woven frame mixes two
-  // instants 1/60 s apart, and the vertical chroma prior then smooths chi
-  // across lines from DIFFERENT times: on anything moving, chi is wrong
-  // along the serrated edges and the residual shows as uncancelled chroma
-  // carrier (dot-crawl/rainbow) in the fidelity luma Y = S - Re[chi c].
-  // THEORY section 5 calls weaving-before-decoding "a failure" for exactly
-  // this reason; the reference ships decode_field / --per-field as the
-  // remedy. true: decode each field independently (the sequence pipeline
-  // with no temporal terms — same math as the reference's decode_field),
-  // motion-clean at the cost of vertical chroma resolution on static
-  // detail. The 3D path is per-field always.
-  bool per_field = false;
+  // (There is no frame-decode option: the source is interlaced by
+  // definition, and weaving before decoding contaminates the separation
+  // across time — THEORY section 5 calls it "a failure". The composite
+  // pipeline is FIELD-granularity everywhere; the frame-weave core
+  // survives only as an internal last-resort fallback.)
   bool enable_temporal = false;
-  // Measured (synthetic pan + static scenes, harness in docs/PORTING.md
-  // section 8): at strength 1.0 the frame-level neighbour term LOWERS
-  // chroma PSNR by 3-5 dB even on static content — the |dc|^2 ~= 4 chroma
-  // leverage triples the effective data weight against lambda_c, lifting
-  // chroma noise; the Python reference's frame-level path behaves
-  // identically (its validated 3D gains come from decode_sequence, not
-  // from this term). 0.25 keeps the term subtle instead of harmful; the
-  // previous 1.0 default was a guess this project explicitly flagged as
-  // "a starting point to tune, not a verified-correct constant".
-  float temporal_strength = 0.25F;
+  // 0 = ADAPTIVE (default): the right strength is a property of the
+  // CONTENT, not a constant — measured repeatedly in this project: on
+  // Y/C-ambiguous content (luma energy at the subcarrier: fine detail,
+  // cross-colour) the neighbour equations resolve what 2D cannot and
+  // want to be strong; on unambiguous content they can only lift chroma
+  // noise (the |dc|^2 leverage rebalances data vs prior) and want to be
+  // weak. Auto measures the ambiguity per window from the phase physics
+  // itself: demodulate S by the carrier per field; between same-parity
+  // fields (carrier flipped 180 deg) true chroma is COHERENT while
+  // luma-leak flips sign, so (d_j - d_{j+2})/2 isolates the ambiguous
+  // energy (plus noise, subtracted via the same sigma the other gates
+  // use). Mapped to [0.15, 1.5] around the reference's --3d value (0.5).
+  // Any positive value forces that fixed strength (reference behaviour);
+  // enable_temporal remains the on/off switch either way.
+  float temporal_strength = 0.0F;
   bool bidirectional = true;       // declared for decode_sequence's richer
                                     // path; DecodeFrame only ever sees PAST
                                     // frames (a future frame isn't available
                                     // yet when decoding sequentially)
-  int passes = 1;                  // ditto — Gauss-Seidel passes, only
+  int passes = 2;  // reference CLI default: pass 2+ engages the anchor                  // ditto — Gauss-Seidel passes, only
                                     // meaningful for the chunked pipeline
   // 0 => auto-calibrate from the measured composite noise (clip(7*sigma,
   // 4, 20), same formula decode_sequence itself uses) via

@@ -100,20 +100,13 @@ public:
     // appendSourceFields()).
     // Safe to call from multiple threads concurrently PROVIDED every
     // thread passes its own HvdEngine and all threads share the same
-    // read_mutex — but if `prev_frame`/`out_state` are used to chain a
-    // temporal neighbour (see below), the caller must call this frame-by-
-    // frame IN ORDER on a SINGLE thread instead (there's no such thing as
-    // "parallel but sequential" — chaining state across frames is
-    // inherently serial). See export_now()'s two export modes.
-    //
-    // `prev_frame`/`out_state`: same meaning as DecodeFrameBuffer's own
-    // parameters of the same name (frame_bridge.h) — pass the immediately
-    // preceding frame's state to get a temporal neighbour term, and/or
-    // capture this frame's own state to chain into the next call.
+    // read_mutex protects source_ reads only; decoding runs outside it so
+    // parallel workers overlap. (The prev/out temporal-chain parameters
+    // are gone with the frame-level 3D path — the field pipeline carries
+    // its own temporal context.)
     bool decode_and_write_rgb24(FrameID id, ::hvd::HvdEngine& engine,
-                                std::mutex& read_mutex, std::ostream& out,
-                                const ::hvd::NeighborRawState* prev_frame = nullptr,
-                                ::hvd::NeighborRawState* out_state = nullptr) const;
+                                std::mutex& read_mutex,
+                                std::ostream& out) const;
 
     // Sequence (field-granularity 3D, engine/sequence.h) export of ONE
     // chunk: decodes frames [t0, t1] with config chunk_overlap frames of

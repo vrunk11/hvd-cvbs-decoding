@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 #include "engine/gradients.h"
 
@@ -116,13 +118,75 @@ double DotRealPlane(const Plane& a, const Plane& b) {
 
 }  // namespace
 
+// chroma_aniso == 0 => AUTO: resolve the horizontal/vertical chroma prior
+// split from the INIT's dominant chroma-detail orientation. Measured on
+// the two real-footage failure classes: thin HORIZONTAL chroma bands and
+// fsc-adjacent texture want the vertical prior weak (aniso -> 1.0: lines
+// ~15% better, curtain ~17%), while sharp HORIZONTAL chroma transitions
+// (colour bars, graphics) want the reference's 0.5 (a fixed 1.0 costs
+// the test chart 1.1 dB in 2D). High quantiles (p90) of |D chi0| carry
+// the structure — medians only see the flat background. Any positive
+// cfg value forces that fixed aniso (reference behaviour at 0.5).
+static float ResolveChromaAniso(const ComplexPlane& chi0,
+                                const HvdConfig& cfg) {
+  if (cfg.chroma_aniso > 0.0F) return cfg.chroma_aniso;
+  // Measure on LINE-PAIR AVERAGES, not raw chi0: the init's dominant
+  // vertical energy is cross-colour LEAK, which alternates sign every
+  // line (the carrier flips 180 deg per field line, so leaked luma
+  // enters chi0 with alternating polarity) — on a colour-bar chart that
+  // alternation made |Dy chi0| read as large as the bar transitions
+  // themselves (py ~ px measured) and auto wrongly picked ~1.0.
+  // Averaging adjacent line pairs cancels the alternating leak exactly
+  // while genuine chroma structure (slow vertically, and even a
+  // 1-frame-line feature at half amplitude) survives.
+  const int Hh = chi0.height() / 2;
+  const int Wc = chi0.width();
+  std::vector<float> gx;
+  std::vector<float> gy;
+  gx.reserve(static_cast<size_t>(Hh) * Wc / 9 + 1);
+  gy.reserve(gx.capacity());
+  auto pav = [&](int t, int x) {
+    return 0.5F * (chi0.at(2 * t, x) + chi0.at(2 * t + 1, x));
+  };
+  for (int t = 1; t < Hh; t += 2) {
+    for (int x = 1; x < Wc; x += 3) {
+      gx.push_back(std::abs(pav(t, x) - pav(t, x - 1)));
+      gy.push_back(std::abs(pav(t, x) - pav(t - 1, x)));
+    }
+  }
+  // p98, not p90: structure can be SPARSE — on a colour-bar chart the
+  // vertical transitions occupy ~4% of columns, invisible to a p90 (which
+  // then reads noise/noise ~ 1 and wrongly picks aniso ~ 1, costing the
+  // chart 1.1 dB); the top 2% still captures it, while line/stripe scenes
+  // put 20-30% of samples on structure and don't care which quantile.
+  auto p98 = [](std::vector<float>& v) {
+    if (v.empty()) return 0.0F;
+    const size_t k = v.size() - 1 - v.size() / 50;
+    std::nth_element(v.begin(), v.begin() + static_cast<long>(k), v.end());
+    return v[k];
+  };
+  const float px = p98(gx);
+  const float py = p98(gy);
+  const float r = py / std::max(px, 1e-6F);
+  if (std::getenv("HVD_DEBUG_ANISO")) {
+    std::fprintf(stderr, "aniso auto: px=%.2f py=%.2f r=%.2f\n", px, py, r);
+  }
+  // Map calibrated on measured ratios: the colour-bar chart (wants 0.5)
+  // reads r ~ 1.1 — its vertical p98 is init cross-colour leak, which
+  // pair-averaging only partly cancels (the Dubois init's leak is not a
+  // pure line-alternation) — while the thin-line/curtain scenes (want
+  // 1.0) read r ~ 1.6-1.9. The 1.3 knee sits between the two families.
+  return std::clamp(0.5F + 1.1F * (r - 1.3F), 0.5F, 1.0F);
+}
+
 RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
                                const ComplexPlane& chi0, const HvdConfig& cfg,
                                const std::vector<NeighborTerm>& neighbors) {
   const float eps = cfg.charbonnier_eps;
   const float eps_c = cfg.chroma_eps;
   const float eps_t = cfg.temporal_eps;
-  float mu_h = cfg.lambda_c * cfg.chroma_aniso;  // chroma broader in x
+  const float aniso = ResolveChromaAniso(chi0, cfg);
+  float mu_h = cfg.lambda_c * aniso;  // chroma broader in x
   float mu_v = cfg.lambda_c;
   // Oriented (+/-45 deg) chroma prior weight, distance-normalised by 1/2
   // (a diagonal step is sqrt(2) px). Renormalise so the TOTAL chroma prior
@@ -131,7 +195,7 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
   // increasing it. (THEORY 9e; exact port of the reference's block.)
   float mu_d = cfg.lambda_c * cfg.diag_prior * 0.5F;
   {
-    const float tot0 = cfg.lambda_c * (1.0F + cfg.chroma_aniso);
+    const float tot0 = cfg.lambda_c * (1.0F + aniso);
     const float scale = mu_d > 0.0F ? tot0 / (tot0 + 2.0F * mu_d) : 1.0F;
     mu_h *= scale;
     mu_v *= scale;
@@ -452,14 +516,15 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
   const float eps = cfg.charbonnier_eps;
   const float eps_c = cfg.chroma_eps;
   const float eps_t = cfg.temporal_eps;
-  float mu_h = cfg.lambda_c * cfg.chroma_aniso;
+  const float aniso = ResolveChromaAniso(chi0, cfg);
+  float mu_h = cfg.lambda_c * aniso;
   float mu_v = cfg.lambda_c;
   // Oriented prior weight + total-mass renormalisation, identical to the
   // pass-1 solver (and to the reference, which repeats the block verbatim
   // in both refiners).
   float mu_d = cfg.lambda_c * cfg.diag_prior * 0.5F;
   {
-    const float tot0 = cfg.lambda_c * (1.0F + cfg.chroma_aniso);
+    const float tot0 = cfg.lambda_c * (1.0F + aniso);
     const float scale = mu_d > 0.0F ? tot0 / (tot0 + 2.0F * mu_d) : 1.0F;
     mu_h *= scale;
     mu_v *= scale;

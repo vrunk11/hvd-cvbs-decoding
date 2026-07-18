@@ -87,8 +87,7 @@ class HvdEngine {
   // previous call's own FrameYc::luma/composite + the carrier used for
   // it); this engine has no memory of past frames itself.
   FrameYc DecodeFrame(const FieldInput& first, const FieldInput& second,
-                      const FieldGeometry& g, const HvdConfig& cfg,
-                      const std::vector<NeighborRawState>& prev_frames = {});
+                      const FieldGeometry& g, const HvdConfig& cfg);
 
   // For sources that are ALREADY Y/C separated at capture (has_separate_
   // channels() on the host side — S-Video-style captures, some hi-fi VHS
@@ -112,7 +111,7 @@ class HvdEngine {
   // inits. Thin wrapper so callers don't need access to the private Fft2d.
   std::vector<DecodedField> DecodeSequenceWindow(
       const std::vector<FieldObs>& fields, const FieldGeometry& g,
-      const HvdConfig& cfg);
+      const HvdConfig& cfg, SequenceDiagnostics* diag = nullptr);
 
   // Forwards to Fft2d::SetThreadCount — see its doc comment in fft2d.h.
   // Parallel-export workers (hvd_chroma_decoder_stage.cpp) MUST call this

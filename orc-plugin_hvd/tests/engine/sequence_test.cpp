@@ -146,8 +146,9 @@ void RunTests() {
   base.cg_iterations = 40;  // keep the test quick
 
   // --- per-field 2D baseline (temporal off) --------------------------------
+  // Driver convention: strength < 0 = OFF, 0 = ADAPTIVE, > 0 = fixed.
   HvdConfig c2d = base;
-  c2d.temporal_strength = 0.0F;
+  c2d.temporal_strength = -1.0F;
   const std::vector<DecodedField> dec2d =
       hvd::DecodeFieldWindowWithInits(sc.fields, sc.inits, g, c2d);
   CHECK(AllFinite(dec2d));
@@ -247,6 +248,123 @@ void RunTests() {
     const double psnr = 10.0 * std::log10(1e4 / (m / n));
     std::printf("  drizzle luma vs analytic fine truth: %.2f dB\n", psnr);
     CHECK(psnr > 24.0);  // super-resolved rows track the continuous scene
+  }
+
+  // --- adaptive temporal strength -------------------------------------------
+  // The right strength is a property of the content (measured repeatedly in
+  // this project): with temporal_strength = 0 (auto), the ambiguity metric
+  // must drive the AMBIGUOUS scene (carrier-frequency luma) to a strong 3D
+  // close to the fixed reference solve, and a CLEAN scene (no carrier luma)
+  // to the floor, where 3D can only lift chroma noise — i.e. adaptive stays
+  // close to whichever fixed extreme is right for each scene.
+  {
+    HvdConfig cauto = base;
+    cauto.temporal_strength = 0.0F;  // auto
+    const std::vector<DecodedField> da =
+        hvd::DecodeFieldWindowWithInits(sc.fields, sc.inits, g, cauto);
+    const double pa = ChromaPsnr(da, sc.chi_truth);
+    std::printf("  adaptive (ambiguous scene): %.2f dB (2D=%.2f, 3D@2=%.2f)\n",
+                pa, p2d, p3d);
+    CHECK(pa > p2d + 0.5);  // ambiguity detected -> real 3D engaged
+
+    // Clean scene: rebuild without the carrier-frequency luma term.
+    Scene clean = MakeStaticScene(/*noise_ire=*/0.8F, /*seed=*/9);
+    for (size_t j = 0; j < clean.fields.size(); ++j) {
+      const int parity = static_cast<int>(j) % 2;
+      for (int r = 0; r < clean.fields[j].s.height(); ++r) {
+        const float fy = 2.0F * r + parity;
+        for (int x = 0; x < clean.fields[j].s.width(); ++x) {
+          // subtract the ambiguity term the generator added
+          clean.fields[j].s.at(r, x) -=
+              14.0F * std::cos((kPi / 2.0F) * x + 0.4F * fy) *
+              std::sin(0.15F * fy);
+        }
+      }
+    }
+    const std::vector<DecodedField> d2c = hvd::DecodeFieldWindowWithInits(
+        clean.fields, clean.inits, g, c2d);
+    const std::vector<DecodedField> d3c = hvd::DecodeFieldWindowWithInits(
+        clean.fields, clean.inits, g, c3d);
+    const std::vector<DecodedField> dac = hvd::DecodeFieldWindowWithInits(
+        clean.fields, clean.inits, g, cauto);
+    const double q2 = ChromaPsnr(d2c, clean.chi_truth);
+    const double q3 = ChromaPsnr(d3c, clean.chi_truth);
+    const double qa = ChromaPsnr(dac, clean.chi_truth);
+    std::printf("  clean scene: 2D=%.2f  3D@2=%.2f  adaptive=%.2f dB\n",
+                q2, q3, qa);
+    CHECK(qa > q3);        // adaptive avoids the fixed-strong penalty...
+    CHECK(qa > q2 - 1.0);  // ...while staying near the 2D optimum
+  }
+
+  // --- odd-offset half-line gate (thin horizontal detail) -------------------
+  // A 1-frame-line chroma feature is INVISIBLE to the opposite parity;
+  // ungated, its neighbour equations vote the feature away with residuals
+  // that pass through the robust weight at the cosine zeros — measured, 3D
+  // made such detail WORSE than 2D. Locks the floored baseband-envelope
+  // gate: with 3D on, thin-line chi error must stay comparable to 2D (no
+  // destruction), and 2-frame-line bands must IMPROVE under 3D.
+  {
+    const int L2 = 60, W2 = 160, NF2 = 8;
+    std::mt19937 rng2(21);
+    std::normal_distribution<float> nz2(0.0F, 0.5F);
+    auto chiF = [&](int fy) {
+      Complex c{3.0F, 2.0F};
+      if (fy == 30) c = Complex{-10.0F, 8.0F};            // 1 frame line
+      if (fy >= 60 && fy < 62) c = Complex{-10.0F, 8.0F};  // 2 frame lines
+      return c;
+    };
+    std::vector<hvd::FieldObs> f2;
+    std::vector<DecodedField> in2;
+    for (int f = 0; f < NF2; ++f) {
+      hvd::FieldObs o;
+      o.parity = f % 2;
+      o.s = Plane(L2, W2);
+      o.carrier = ComplexPlane(L2, W2);
+      DecodedField in;
+      in.chroma = ComplexPlane(L2, W2);
+      for (int r = 0; r < L2; ++r) {
+        const int fy = 2 * r + o.parity;
+        for (int x = 0; x < W2; ++x) {
+          const float phi = (kPi / 2.0F) * x + kPi * r +
+                            static_cast<float>(f) * (3.0F * kPi / 2.0F);
+          const Complex c{std::cos(phi), std::sin(phi)};
+          o.carrier.at(r, x) = c;
+          o.s.at(r, x) = 30.0F + (chiF(fy) * c).real() + nz2(rng2);
+          in.chroma.at(r, x) = chiF(fy) + Complex{1.5F, -1.0F};
+        }
+      }
+      f2.push_back(std::move(o));
+      in2.push_back(std::move(in));
+    }
+    auto berr = [&](const std::vector<DecodedField>& d, int fy0, int fy1) {
+      double m = 0;
+      long n = 0;
+      for (size_t j = 0; j < d.size(); ++j) {
+        const int p = f2[j].parity;
+        for (int r = 1; r < L2 - 1; ++r) {
+          const int fy = 2 * r + p;
+          if (fy < fy0 || fy >= fy1) continue;
+          for (int x = 8; x < W2 - 8; ++x) {
+            m += std::norm(d[j].chroma.at(r, x) - chiF(fy));
+            ++n;
+          }
+        }
+      }
+      return std::sqrt(m / n);
+    };
+    HvdConfig cA = base;
+    cA.temporal_strength = -1.0F;  // pure 2D
+    HvdConfig cB = base;
+    cB.temporal_strength = 2.0F;
+    cB.passes = 1;
+    const auto dA = hvd::DecodeFieldWindowWithInits(f2, in2, g, cA);
+    const auto dB = hvd::DecodeFieldWindowWithInits(f2, in2, g, cB);
+    const double a1 = berr(dA, 28, 33), b1 = berr(dB, 28, 33);
+    const double a2 = berr(dA, 58, 65), b2 = berr(dB, 58, 65);
+    std::printf("  thin lines: 1L 2D=%.2f 3D=%.2f   2L 2D=%.2f 3D=%.2f\n",
+                a1, b1, a2, b2);
+    CHECK(b1 < a1 * 1.35);  // no destruction of sub-Nyquist detail
+    CHECK(b2 < a2);         // 2-frame-line bands must improve under 3D
   }
 
   // --- coherence-gate geometry (the reference row_offset bug) ---------------
