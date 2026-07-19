@@ -1805,7 +1805,7 @@ def decode_sequence(src: TbcSource, start: int, length: int,
 def decode_sequence_selective(src: TbcSource, start: int, length: int,
                               cfg: DecoderConfig,
                               first_active_line: int | None = None,
-                              max_area: float = 0.45, tile: int = 32,
+                              max_area: float = 0.6, tile: int = 32,
                               halo_px: int = 48, stats: dict | None = None):
     """Selective 3D: full-frame 2D decode everywhere + the COMPLETE
     field-based 3D machinery (decode_sequence, cropped via roi=) on the
@@ -1838,51 +1838,64 @@ def decode_sequence_selective(src: TbcSource, start: int, length: int,
     S, phi = prepare_frame(src, start, first_active_line)
     p = src.params
     Y0, chi0 = holographic_init(S, phi, p, cfg)
-    box = _ambiguous_bbox(Y0, chi0, tile=tile, max_area=max_area,
-                          halo_px=halo_px)
+    boxes = _ambiguous_boxes(Y0, chi0, tile=tile, max_area=max_area,
+                             halo_px=halo_px)
     if stats is not None:
-        stats["box"] = box
-    if box is None:
+        stats["boxes"] = boxes
+    if boxes == "full":
+        # ambiguity present but too widespread to crop profitably:
+        # fall back to FULL 3D, never to 2D. Selective mode's contract
+        # is "at least full-3D quality, cheaper when possible" -- the
+        # earlier 2D fallback here is exactly how real footage with a
+        # border stripe ended up with its artifact zones untreated.
+        yield from decode_sequence(src, start, length, cfg,
+                                   first_active_line)
+        return
+    if not boxes:
         for i in range(start, start + length):
             yield i, decode_frame(src, i, cfg,
                                   first_active_line=first_active_line)
         return
 
-    y0, y1, x0, x1 = box                      # frame coords, y even
-    roi = (y0 // 2, (y1 + 1) // 2, x0, x1)    # field coords
-    seq3d = decode_sequence(src, start, length, cfg, first_active_line,
-                            roi=roi)
-    m = None
+    seqs = []
+    for (y0, y1, x0, x1) in boxes:            # frame coords, y even
+        roi = (y0 // 2, (y1 + 1) // 2, x0, x1)
+        seqs.append(decode_sequence(src, start, length, cfg,
+                                    first_active_line, roi=roi))
+    masks = [None] * len(boxes)
     for i in range(start, start + length):
         rgb2d = decode_frame(src, i, cfg,
                              first_active_line=first_active_line)
-        _, crop3d = next(seq3d)
-        ch, cw = crop3d.shape[:2]
-        yy1 = min(y0 + ch, rgb2d.shape[0])
-        if m is None:
-            hh, ww = yy1 - y0, min(x1, rgb2d.shape[1]) - x0
-            hy = min(halo_px, hh // 3)
-            hx = min(halo_px, ww // 3)
-            ry = np.ones(hh)
-            ry[:hy] = np.linspace(0.0, 1.0, hy)
-            ry[hh - hy:] = np.linspace(1.0, 0.0, hy)
-            rx = np.ones(ww)
-            rx[:hx] = np.linspace(0.0, 1.0, hx)
-            rx[ww - hx:] = np.linspace(1.0, 0.0, hx)
-            m = np.outer(ry, rx)[..., None]
         out = rgb2d.astype(np.float64)
-        sl = (slice(y0, yy1), slice(x0, x0 + m.shape[1]))
-        out[sl] = (out[sl] * (1.0 - m)
-                   + crop3d[:m.shape[0], :m.shape[1]].astype(np.float64)
-                   * m)
+        for bi, (y0, y1, x0, x1) in enumerate(boxes):
+            _, crop3d = next(seqs[bi])
+            ch = crop3d.shape[0]
+            yy1 = min(y0 + ch, out.shape[0])
+            if masks[bi] is None:
+                hh = yy1 - y0
+                ww = min(x1, out.shape[1]) - x0
+                hy = min(halo_px, hh // 3)
+                hx = min(halo_px, ww // 3)
+                ry = np.ones(hh)
+                ry[:hy] = np.linspace(0.0, 1.0, hy)
+                ry[hh - hy:] = np.linspace(1.0, 0.0, hy)
+                rx = np.ones(ww)
+                rx[:hx] = np.linspace(0.0, 1.0, hx)
+                rx[ww - hx:] = np.linspace(1.0, 0.0, hx)
+                masks[bi] = np.outer(ry, rx)[..., None]
+            m = masks[bi]
+            sl = (slice(y0, y0 + m.shape[0]), slice(x0, x0 + m.shape[1]))
+            out[sl] = (out[sl] * (1.0 - m)
+                       + crop3d[:m.shape[0], :m.shape[1]].astype(np.float64)
+                       * m)
         yield i, np.clip(out + 0.5, 0, 65535).astype(np.uint16)
 
 
-def _ambiguous_bbox(Y0, chi0, tile=32, max_area=0.45, halo_px=48):
-    """Frame-coord bounding box (y0, y1, x0, x1) of the top-ambiguity
-    tiles, grown by halo_px, or None if even the top-quartile flagged
-    region inflates past max_area (diffuse ambiguity => selective mode
-    cannot pay for itself)."""
+def _ambiguity_flags(Y0, chi0, tile=32):
+    """Shared detector core: per-tile ambiguity score (sqrt(luma_HF x
+    chroma_HF), the §19-validated proxy), 4x-median threshold, >=2-of-8
+    neighbor density filter, border-normalised smoothing. Returns
+    (flagged tile map or None, h, w)."""
     h, w = Y0.shape
     th, tw = (h + tile - 1) // tile, (w + tile - 1) // tile
     ph, pw = th * tile, tw * tile
@@ -1896,12 +1909,9 @@ def _ambiguous_bbox(Y0, chi0, tile=32, max_area=0.45, halo_px=48):
     c = np.ones(k) / k
 
     def _box2d(a):
-        # separable box mean with COUNT-normalised borders: plain
-        # 'same' convolution zero-pads, under-estimating the local
-        # mean along row 0 / col 0 and manufacturing fake HF energy
-        # there -- measured: the entire left column and top row of
-        # tiles flagged on a flat scene, inflating the bbox to the
-        # whole frame.
+        # count-normalised borders: plain 'same' convolution zero-pads,
+        # manufacturing fake HF along row 0 / col 0 (measured: whole
+        # first row+column of tiles flagged on a flat scene).
         ones = np.ones(a.shape[0])
         ny = np.convolve(ones, c, mode="same")
         t1 = np.apply_along_axis(
@@ -1916,21 +1926,11 @@ def _ambiguous_bbox(Y0, chi0, tile=32, max_area=0.45, halo_px=48):
     lpC = _box2d(mag)
     score = np.sqrt(np.maximum(tmean((Y0 - lpY) ** 2), 0.0)
                     * np.maximum(tmean((mag - lpC) ** 2), 0.0))
-    # Threshold RELATIVE to the median tile, not a fixed quantile: a
-    # quantile always flags 25% of tiles even on content whose
-    # ambiguity is uniform noise, inflating the bbox until the
-    # max_area fallback fires on exactly the localized cases this mode
-    # exists for. 4x median measured to isolate a textured insert in a
-    # flat scene precisely (59/384 tiles, bbox == ground-truth insert).
-    thr = 4.0 * float(np.median(score))
+    med = float(np.median(score))
+    thr = 4.0 * med
     flagged = score >= thr
-    # density filter: keep a tile only if >= 2 of its 8 neighbors are
-    # also flagged. Genuinely ambiguous content (texture, gratings,
-    # crowds) flags dense clusters; noise at the threshold flags
-    # ISOLATED tiles, and a single stray anywhere inflates the single
-    # bounding box to the whole frame (measured: 89 flagged tiles on a
-    # flat+insert scene, strays included -> bbox area 1.0 -> pointless
-    # fallback on exactly the localized content this mode targets).
+    # density: keep tiles with >= 2 of 8 flagged neighbors (noise flags
+    # isolated tiles; real ambiguous content flags clusters)
     nb = np.zeros_like(score)
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
@@ -1946,15 +1946,134 @@ def _ambiguous_bbox(Y0, chi0, tile=32, max_area=0.45, halo_px=48):
             elif dx == 1:
                 sh[:, 0] = False
             nb += sh
-    flagged &= nb >= 2
-    ys, xs = np.nonzero(flagged)
-    if ys.size == 0:
+    flagged = flagged & (nb >= 2)
+    # exclude the outer 1-tile border ring: border tiles straddle the
+    # capture-mask transition (black pillars, head-switch area) and are
+    # never useful ROI targets themselves -- the boxes' halo still
+    # covers in-picture artifacts near the border. A flagged border
+    # stripe otherwise bridges or widens every band (measured on real
+    # capture: left pillar edge).
+    flagged[0, :] = False
+    flagged[-1, :] = False
+    flagged[:, 0] = False
+    flagged[:, -1] = False
+    if not flagged.any():
+        # No localized peaks. Disambiguate uniform-CLEAN from uniform-
+        # AMBIGUOUS with an absolute level: measured medians (IRE^2,
+        # tile 16, field geometry) -- SMPTE chart 0.62, flat noise
+        # sigma=2.5 1.00, real LD footage with frame-wide blinds 5.66,
+        # diffuse photo texture 8.87. Above 3.0 the frame is globally
+        # ambiguous and deserves FULL 3D, not the 2D fallback; a purely
+        # relative threshold cannot tell these two apart.
+        if med > 3.0:
+            return "uniform", h, w
+        return None, h, w
+    return flagged, h, w
+
+
+def _ambiguous_boxes(Y0, chi0, tile=32, max_area=0.6, halo_px=48,
+                     halo_y=32, max_boxes=4):
+    """Row-banded boxes: one per vertical band of flagged tile-rows,
+    instead of a single hull. The single-hull version silently fell
+    back to 2D on exactly the field-reported case it was built for --
+    thin horizontal artifact zones at the TOP, MIDDLE and BOTTOM of the
+    frame: their common hull is ~the whole frame, > max_area, box=None,
+    and "selective 3D" quietly became plain 2D while full 3D fixed the
+    zones. Bands merge to at most max_boxes; max_area limits the TOTAL
+    cropped area."""
+    flagged, h, w = _ambiguity_flags(Y0, chi0, tile)
+    if flagged is None:
         return None
-    y0 = max(0, int(ys.min()) * tile - halo_px)
-    y1 = min(h, (int(ys.max()) + 1) * tile + halo_px)
-    x0 = max(0, int(xs.min()) * tile - halo_px)
-    x1 = min(w, (int(xs.max()) + 1) * tile + halo_px)
-    if (y1 - y0) * (x1 - x0) > max_area * h * w:
+    if isinstance(flagged, str):     # "uniform": frame-wide ambiguity
+        return "full"
+    # A tile-row only counts as a band row with >= 2 flagged tiles: a
+    # one-tile-wide vertical stripe (measured on real capture: the hard
+    # edge of the black side pillar flags column 0 top to bottom)
+    # otherwise BRIDGES every artifact band into one giant one that
+    # overflows the area cap.
+    rows = np.nonzero(flagged.sum(axis=1) >= 2)[0]
+    if rows.size == 0:
         return None
-    y0 -= y0 % 2   # field-coord alignment
-    return y0, y1, x0, x1
+    bands = []
+    r0 = prev = rows[0]
+    for r in rows[1:]:
+        if r - prev <= 1:
+            prev = r
+            continue
+        bands.append((r0, prev))
+        r0 = prev = r
+    bands.append((r0, prev))
+    while len(bands) > max_boxes:
+        gaps = [bands[i + 1][0] - bands[i][1] for i in range(len(bands) - 1)]
+        i = int(np.argmin(gaps))
+        bands[i] = (bands[i][0], bands[i + 1][1])
+        del bands[i + 1]
+    boxes = []
+    total = 0
+    for (tr0, tr1) in bands:
+        cols = np.nonzero(flagged[tr0:tr1 + 1].any(axis=0))[0]
+        # One box PER contiguous column run (gap <= 2), single-tile runs
+        # dropped. History matters here: v18's min..max span let one
+        # stray tile widen a band to full width; the first fix kept only
+        # the LONGEST run, which on the real capture cut off the right
+        # half of the circled sill artifact (its band held runs at
+        # ~x256-576 and ~x560-720; only the first survived) -- the user-
+        # visible symptom was "selective precisely avoids my artifacts".
+        # Emitting every multi-tile run keeps all artifact clusters and
+        # still drops isolated strays.
+        runs = []
+        c0 = cprev = cols[0]
+        for cc in cols[1:]:
+            if cc - cprev <= 2:
+                cprev = cc
+                continue
+            runs.append((c0, cprev))
+            c0 = cprev = cc
+        runs.append((c0, cprev))
+        # vertical halo only needs to cover motion search (mc_search=16)
+        # plus margin: 48 tripled a one-tile band's height and pushed the
+        # dispersed three-band case past the area cap.
+        y0 = max(0, tr0 * tile - halo_y)
+        y1 = min(h, (tr1 + 1) * tile + halo_y)
+        y0 -= y0 % 2
+        band_boxes = []
+        for (c0, c1) in runs:
+            if c1 - c0 < 1:      # single-tile run: stray, skip
+                continue
+            x0 = max(0, c0 * tile - halo_px)
+            x1 = min(w, (c1 + 1) * tile + halo_px)
+            # halo expansion can make neighbouring runs overlap; merge
+            # so the blend isn't applied twice over the same pixels
+            if band_boxes and x0 <= band_boxes[-1][3]:
+                band_boxes[-1] = (y0, y1, band_boxes[-1][2], x1)
+            else:
+                band_boxes.append((y0, y1, x0, x1))
+        for b in band_boxes:
+            boxes.append(b)
+            total += (b[1] - b[0]) * (b[3] - b[2])
+    if not boxes:
+        return None
+    while len(boxes) > 2 * max_boxes:
+        # merge the horizontally-nearest pair within the same band
+        best = None
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                if boxes[i][0] != boxes[j][0]:
+                    continue
+                gap = max(boxes[j][2] - boxes[i][3],
+                          boxes[i][2] - boxes[j][3])
+                if best is None or gap < best[0]:
+                    best = (gap, i, j)
+        if best is None:
+            break
+        _, i, j = best
+        bi, bj = boxes[i], boxes[j]
+        merged = (bi[0], bi[1], min(bi[2], bj[2]), max(bi[3], bj[3]))
+        total += ((merged[1] - merged[0]) * (merged[3] - merged[2])
+                  - (bi[1] - bi[0]) * (bi[3] - bi[2])
+                  - (bj[1] - bj[0]) * (bj[3] - bj[2]))
+        boxes[i] = merged
+        del boxes[j]
+    if total > max_area * h * w:
+        return "full"
+    return boxes

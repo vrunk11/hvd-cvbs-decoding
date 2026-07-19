@@ -3,6 +3,12 @@
 #include "frame_bridge.h"
 
 #include <algorithm>
+#include <climits>
+#include <thread>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <cmath>
 
 #include "engine/engine.h"
@@ -331,6 +337,343 @@ YcFrameS16 DecodeYcFrameBuffer(const int16_t* luma, const int16_t* chroma,
   return DecodeYcFrameBuffer(luma, chroma, fp, cfg, engine);
 }
 
+namespace {
+
+// ---- Selective 3D (reference decode_sequence_selective, PORTING.md §21) ---
+
+struct SelBox {
+  int fy0 = 0, fy1 = 0, x0 = 0, x1 = 0;  // FIELD coordinates
+  bool valid = false;
+};
+
+// Bounding box of the most Y/C-ambiguous tiles of one decoded 2D field.
+// Faithful port of _ambiguous_bbox: score = sqrt(luma_HF x chroma_HF)
+// per tile (the §19 proxy, r=0.60 against measured per-tile 3D gain);
+// threshold 4x median (fixed quantiles flag noise on uniform content);
+// >=2-of-8-neighbor density filter (one stray tile inflates the single
+// bbox to the whole frame); count-normalised box smoothing (zero-padded
+// smoothing manufactures HF along the first row/column and flags it).
+// Field geometry, so tile = 16 rows (~ the reference's 32 frame rows).
+std::vector<SelBox> AmbiguousBoxes(const Plane& Y, const ComplexPlane& chi,
+                                   float max_area) {
+  constexpr int kTile = 16;
+  constexpr int kHaloX = 48;
+  // vertical halo only needs to cover motion search (mc_search 16) plus
+  // margin — field geometry, so 16 field rows ~ 32 frame rows.
+  constexpr int kHaloY = 16;
+  const int h = Y.height();
+  const int w = Y.width();
+  const int th = (h + kTile - 1) / kTile;
+  const int tw = (w + kTile - 1) / kTile;
+  const int k = kTile / 2;
+
+  // Count-normalised separable box mean.
+  auto box2d = [&](const std::vector<float>& a, std::vector<float>* out) {
+    std::vector<float> tmp(static_cast<size_t>(h) * w, 0.0F);
+    for (int x = 0; x < w; ++x) {
+      for (int y = 0; y < h; ++y) {
+        float acc = 0.0F;
+        int n = 0;
+        for (int d = -k / 2; d < k - k / 2; ++d) {
+          const int yy = y + d;
+          if (yy < 0 || yy >= h) continue;
+          acc += a[static_cast<size_t>(yy) * w + x];
+          ++n;
+        }
+        tmp[static_cast<size_t>(y) * w + x] = acc / std::max(n, 1);
+      }
+    }
+    out->assign(static_cast<size_t>(h) * w, 0.0F);
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        float acc = 0.0F;
+        int n = 0;
+        for (int d = -k / 2; d < k - k / 2; ++d) {
+          const int xx = x + d;
+          if (xx < 0 || xx >= w) continue;
+          acc += tmp[static_cast<size_t>(y) * w + xx];
+          ++n;
+        }
+        (*out)[static_cast<size_t>(y) * w + x] = acc / std::max(n, 1);
+      }
+    }
+  };
+
+  std::vector<float> ya(static_cast<size_t>(h) * w);
+  std::vector<float> ca(static_cast<size_t>(h) * w);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      ya[static_cast<size_t>(y) * w + x] = Y.at(y, x);
+      ca[static_cast<size_t>(y) * w + x] = std::abs(chi.at(y, x));
+    }
+  std::vector<float> lpY;
+  std::vector<float> lpC;
+  box2d(ya, &lpY);
+  box2d(ca, &lpC);
+
+  std::vector<double> texY(static_cast<size_t>(th) * tw, 0.0);
+  std::vector<double> texC(static_cast<size_t>(th) * tw, 0.0);
+  std::vector<int> cnt(static_cast<size_t>(th) * tw, 0);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const size_t i = static_cast<size_t>(y) * w + x;
+      const size_t t =
+          static_cast<size_t>(y / kTile) * tw + (x / kTile);
+      const double dy = ya[i] - lpY[i];
+      const double dc = ca[i] - lpC[i];
+      texY[t] += dy * dy;
+      texC[t] += dc * dc;
+      ++cnt[t];
+    }
+  std::vector<float> score(static_cast<size_t>(th) * tw, 0.0F);
+  for (size_t t = 0; t < score.size(); ++t)
+    score[t] = static_cast<float>(
+        std::sqrt((texY[t] / std::max(cnt[t], 1)) *
+                  (texC[t] / std::max(cnt[t], 1))));
+
+  std::vector<float> sorted = score;
+  const size_t mid = sorted.size() / 2;
+  std::nth_element(sorted.begin(), sorted.begin() + mid, sorted.end());
+  const float med = sorted[mid];
+  const float thr = 4.0F * med;
+
+  std::vector<char> flagged(score.size(), 0);
+  for (size_t t = 0; t < score.size(); ++t) flagged[t] = score[t] >= thr;
+  // density filter: >= 2 of 8 flagged neighbors
+  std::vector<char> dense(score.size(), 0);
+  for (int ty = 0; ty < th; ++ty)
+    for (int tx = 0; tx < tw; ++tx) {
+      if (!flagged[static_cast<size_t>(ty) * tw + tx]) continue;
+      int nb = 0;
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+          if (dy == 0 && dx == 0) continue;
+          const int yy = ty + dy;
+          const int xx = tx + dx;
+          if (yy < 0 || yy >= th || xx < 0 || xx >= tw) continue;
+          nb += flagged[static_cast<size_t>(yy) * tw + xx];
+        }
+      // outer 1-tile border ring excluded: border tiles straddle the
+      // capture-mask transition (black pillars, head-switch area) and
+      // are never useful ROI targets; a flagged border stripe otherwise
+      // bridges or widens every band (measured on real capture).
+      const bool border =
+          ty == 0 || ty == th - 1 || tx == 0 || tx == tw - 1;
+      dense[static_cast<size_t>(ty) * tw + tx] = !border && nb >= 2;
+    }
+  // Row-banded boxes, one per vertical band of flagged tile-rows,
+  // NOT a single hull: the field-reported case is thin horizontal
+  // artifact zones at the TOP, MIDDLE and BOTTOM of the frame, whose
+  // common hull is ~the whole frame -> silent 2D fallback while full
+  // 3D fixes the zones. max_area caps the TOTAL area of all bands.
+  std::vector<SelBox> boxes;
+  std::vector<std::pair<int, int>> bands;
+  int band_start = -1, band_prev = -1;
+  for (int ty = 0; ty < th; ++ty) {
+    // >= 2 flagged tiles to count as a band row: a one-tile-wide
+    // vertical stripe (real capture: the black side-pillar edge flags
+    // column 0 top to bottom) otherwise bridges every artifact band
+    // into one giant one that overflows the area cap.
+    int row_n = 0;
+    for (int tx = 0; tx < tw; ++tx)
+      row_n += dense[static_cast<size_t>(ty) * tw + tx];
+    const bool any = row_n >= 2;
+    if (any) {
+      if (band_start < 0) band_start = ty;
+      else if (ty - band_prev > 1) {
+        bands.push_back({band_start, band_prev});
+        band_start = ty;
+      }
+      band_prev = ty;
+    }
+  }
+  if (band_start >= 0) bands.push_back({band_start, band_prev});
+  if (bands.empty()) {
+    // No localized peaks: disambiguate uniform-CLEAN from uniform-
+    // AMBIGUOUS with an absolute level. Measured medians (IRE^2, tile
+    // 16, field geometry): SMPTE chart 0.62, flat noise sigma=2.5 1.00,
+    // real LD footage with frame-wide blinds 5.66, diffuse photo
+    // texture 8.87. Above 3.0 the frame is globally ambiguous and
+    // deserves FULL 3D, not the 2D fallback; a purely relative
+    // threshold cannot tell these two apart.
+    if (med > 3.0F) boxes.push_back(SelBox{});  // sentinel: full 3D
+    return boxes;
+  }
+  constexpr size_t kMaxBoxes = 4;
+  while (bands.size() > kMaxBoxes) {
+    size_t bi = 0;
+    int best = INT_MAX;
+    for (size_t i = 0; i + 1 < bands.size(); ++i) {
+      const int gap = bands[i + 1].first - bands[i].second;
+      if (gap < best) { best = gap; bi = i; }
+    }
+    bands[bi].second = bands[bi + 1].second;
+    bands.erase(bands.begin() + bi + 1);
+  }
+  double total = 0.0;
+  for (const auto& [tr0, tr1] : bands) {
+    // One box PER contiguous column run (gap <= 2), single-tile runs
+    // dropped, overlapping halo-expanded runs merged. History: v18's
+    // min..max span let one stray tile widen a band to full width; the
+    // first fix kept only the LONGEST run, which on the real capture
+    // cut off the right half of the circled sill artifact (its band
+    // held runs at ~x256-576 and ~x560-720; only the first survived) --
+    // user-visible symptom: "selective precisely avoids my artifacts".
+    std::vector<char> colf(static_cast<size_t>(tw), 0);
+    for (int ty = tr0; ty <= tr1; ++ty)
+      for (int tx = 0; tx < tw; ++tx)
+        colf[tx] |= dense[static_cast<size_t>(ty) * tw + tx];
+    const int y0raw = std::max(0, tr0 * kTile - kHaloY);
+    const int y0 = y0raw - (y0raw % 2);
+    const int y1 = std::min(h, (tr1 + 1) * kTile + kHaloY);
+    std::vector<std::pair<int, int>> runs;
+    int r0 = -1, rprev = -1;
+    for (int tx = 0; tx < tw; ++tx) {
+      if (!colf[tx]) continue;
+      if (r0 < 0) { r0 = rprev = tx; continue; }
+      if (tx - rprev <= 2) { rprev = tx; continue; }
+      runs.push_back({r0, rprev});
+      r0 = rprev = tx;
+    }
+    if (r0 >= 0) runs.push_back({r0, rprev});
+    size_t band_first = boxes.size();
+    for (const auto& [c0, c1] : runs) {
+      if (c1 - c0 < 1) continue;  // single-tile stray
+      const int x0 = std::max(0, c0 * kTile - kHaloX);
+      const int x1 = std::min(w, (c1 + 1) * kTile + kHaloX);
+      if (boxes.size() > band_first && x0 <= boxes.back().x1) {
+        boxes.back().x1 = x1;     // merge halo-overlapping runs
+      } else {
+        SelBox b;
+        b.fy0 = y0;
+        b.fy1 = y1;
+        b.x0 = x0;
+        b.x1 = x1;
+        b.valid = true;
+        boxes.push_back(b);
+      }
+    }
+  }
+  total = 0.0;
+  for (const auto& b : boxes)
+    total += static_cast<double>(b.fy1 - b.fy0) * (b.x1 - b.x0);
+  if (total > static_cast<double>(max_area) * h * w) {
+    // overflow sentinel: one INVALID box = "ambiguity everywhere, run
+    // full 3D" (distinct from empty = "clean, stay 2D").
+    boxes.clear();
+    boxes.push_back(SelBox{});
+  }
+  return boxes;
+}
+
+FieldObs CropObs(const FieldObs& f, const SelBox& b) {
+  FieldObs c;
+  c.parity = f.parity;
+  c.s = Plane(b.fy1 - b.fy0, b.x1 - b.x0);
+  c.carrier = ComplexPlane(b.fy1 - b.fy0, b.x1 - b.x0);
+  for (int y = b.fy0; y < b.fy1; ++y)
+    for (int x = b.x0; x < b.x1; ++x) {
+      c.s.at(y - b.fy0, x - b.x0) = f.s.at(y, x);
+      c.carrier.at(y - b.fy0, x - b.x0) = f.carrier.at(y, x);
+    }
+  return c;
+}
+
+// Full-window 2D + cropped full-3D, feather-blended at field level.
+std::vector<DecodedField> DecodeWindowSelective(
+    const std::vector<FieldObs>& fields, const FieldGeometry& g,
+    const HvdConfig& cfg, HvdEngine& engine, SequenceDiagnostics* diag) {
+  // 2D base: strength < 0 is the driver's explicit "3D OFF" convention
+  // (0 would mean adaptive), which also short-circuits passes/anchor and
+  // the whole motion machinery — this is the cheap full-frame decode.
+  HvdConfig c2d = cfg;
+  c2d.temporal_strength = -1.0F;
+  std::vector<DecodedField> dec =
+      engine.DecodeSequenceWindow(fields, g, c2d, diag);
+  if (fields.empty()) return dec;
+
+  const std::vector<SelBox> boxes =
+      AmbiguousBoxes(dec[0].luma, dec[0].chroma, cfg.selective_max_area);
+  if (boxes.empty()) return dec;  // nothing flagged: clean, stay 2D
+  if (!boxes[0].valid) {
+    // ambiguity present but too widespread to crop profitably: full 3D,
+    // never 2D. Selective's contract is "at least full-3D quality,
+    // cheaper when possible" -- the earlier 2D fallback here is exactly
+    // how real footage with a border stripe ended up with its artifact
+    // zones untreated.
+    return engine.DecodeSequenceWindow(fields, g, cfg, nullptr);
+  }
+
+  // Boxes are independent, so process them concurrently rather than one
+  // at a time. NOT naive thread-per-box: the engine already parallelises
+  // internally per pixel row (OpenMP, holographic_init.cpp/motion.cpp/
+  // sequence.cpp) — stacking a second, unbounded layer of threads on top
+  // would oversubscribe the machine and could easily come out SLOWER, not
+  // faster. Instead each box's OWN OpenMP team is capped to hardware
+  // concurrency / box count, so the total thread count across all
+  // concurrently-running boxes stays bounded to what the machine has. A
+  // plain std::thread (not an OpenMP thread) is free to set its own
+  // omp_set_num_threads default, so this needs no change to the engine
+  // itself. Genuine win specifically when a box's row count is too small
+  // to keep the full core count busy on its own (the common case here:
+  // artifact bands are a handful of tile-rows tall) — the machine was
+  // otherwise sitting partly idle during every single-box call.
+  const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+  const int per_box_threads =
+      std::max(1, static_cast<int>(hw) / std::max<int>(1, boxes.size()));
+  std::vector<std::vector<DecodedField>> dec3_all(boxes.size());
+  {
+    std::vector<std::thread> workers;
+    workers.reserve(boxes.size());
+    for (size_t bi = 0; bi < boxes.size(); ++bi) {
+      workers.emplace_back([&, bi]() {
+#ifdef _OPENMP
+        omp_set_num_threads(per_box_threads);
+#endif
+        std::vector<FieldObs> crop;
+        crop.reserve(fields.size());
+        for (const FieldObs& f : fields) crop.push_back(CropObs(f, boxes[bi]));
+        dec3_all[bi] = engine.DecodeSequenceWindow(crop, g, cfg, nullptr);
+      });
+    }
+    for (auto& t : workers) t.join();
+  }
+
+  for (size_t bi = 0; bi < boxes.size(); ++bi) {
+    const SelBox& box = boxes[bi];
+    const std::vector<DecodedField>& dec3 = dec3_all[bi];
+
+    const int bh = box.fy1 - box.fy0;
+    const int bw = box.x1 - box.x0;
+    const int hy = std::min(16, bh / 3);
+    const int hx = std::min(48, bw / 3);
+    for (size_t j = 0; j < dec.size(); ++j) {
+      for (int y = 0; y < bh; ++y) {
+        float ry = 1.0F;
+        if (y < hy)
+          ry = static_cast<float>(y) / hy;
+        else if (y >= bh - hy)
+          ry = static_cast<float>(bh - 1 - y) / hy;
+        for (int x = 0; x < bw; ++x) {
+          float rx = 1.0F;
+          if (x < hx)
+            rx = static_cast<float>(x) / hx;
+          else if (x >= bw - hx)
+            rx = static_cast<float>(bw - 1 - x) / hx;
+          const float m = ry * rx;
+          float& Yd = dec[j].luma.at(box.fy0 + y, box.x0 + x);
+          Complex& Cd = dec[j].chroma.at(box.fy0 + y, box.x0 + x);
+          Yd = Yd * (1.0F - m) + dec3[j].luma.at(y, x) * m;
+          Cd = Cd * (1.0F - m) + dec3[j].chroma.at(y, x) * m;
+        }
+      }
+    }
+  }
+  return dec;
+}
+
+}  // namespace
+
 std::vector<YcFrameS16> DecodeFrameSequenceWindow(
     const std::vector<const int16_t*>& frames, int core_begin, int core_end,
     const FrameParams& fp, const HvdConfig& cfg, HvdEngine& engine,
@@ -397,8 +740,13 @@ std::vector<YcFrameS16> DecodeFrameSequenceWindow(
 
   // --- The pipeline itself -------------------------------------------------
   SequenceDiagnostics diag;
-  const std::vector<DecodedField> dec =
-      engine.DecodeSequenceWindow(fields, g, cfg, &diag);
+  std::vector<DecodedField> dec;
+  if (cfg.selective_3d && cfg.cg_iterations > 0 &&
+      cfg.temporal_strength >= 0.0F) {
+    dec = DecodeWindowSelective(fields, g, cfg, engine, &diag);
+  } else {
+    dec = engine.DecodeSequenceWindow(fields, g, cfg, &diag);
+  }
 
   // ---- diagnostic maps (cfg.debug_dir non-empty) ---------------------------
   if (!cfg.debug_dir.empty()) {

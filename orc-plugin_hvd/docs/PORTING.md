@@ -680,3 +680,222 @@ box=None and the mode degrades to plain 2D (measured) -- by design,
 per the Sec. 19 measurement that diffuse content puts ~half the 3D
 gain outside any 30% crop. The floor cost is one full 2D decode per
 frame; content that is ALL texture should just run full 3D.
+
+## 21b. Selective 3D — C++ port
+
+Ported to the plugin: `selective_3d` / `selective_max_area` in
+HvdConfig, driver logic in frame_bridge.cpp's DecodeFrameSequenceWindow
+(2D base via the driver's own strength<0 = 3D-OFF convention, which
+also short-circuits passes/anchor/motion; AmbiguousBbox on the first
+decoded 2D field; CropObs on the already-prepared FieldObs, so the
+cropped window rides the untouched DecodeSequenceWindow; field-level
+feather blend before the existing weave, which therefore needs no
+changes), and a "Selective 3D" GUI toggle (default off).
+
+Port verification honestly stated: this container has no FFTW
+single-float and no network, so the full engine could not be BUILT
+here. What was verified: (1) frame_bridge.cpp, sequence.cpp,
+variational.cpp compile clean standalone (-fsyntax-only, gcc 13,
+-Wall); (2) AmbiguousBbox — the port's only nontrivial algorithmic
+code — extracted VERBATIM into a standalone harness and functionally
+tested: localized textured insert -> box (0,120,352,752) covering the
+ground-truth insert (20..90 x 400..700) exactly per the halo/tile
+arithmetic at 26% area; uniform-noise field -> no box. (3) The crop
+path relies only on shape-agnostic code: DecodeFieldWindowWithInits
+ignores geometry ((void)g), HolographicInit derives its frequency axis
+from the plane width, and the weave reads d.luma dimensions. First
+compile + a run of tests/engine on a real build machine is still owed
+before trusting it on footage.
+
+## 22. Adaptive-3D gate: full-field RMS silently disabled 3D on the
+      thin-bar/logo artifact class — root cause and fix
+
+Field report (annotated screenshot, real LD capture): the circled
+problem zones — thin bright horizontal bars, a small logo, a bright
+sill — were NOT improved by adaptive 3D, while these are precisely the
+Sec. 17 "thin lines" class. Reproduced synthetically (dark scene,
+moving subject, static 1-3 px bright bars + text at noise 2.0):
+
+Root cause chain, measured:
+1. The anchored pass is what fixes this class (bars 2.0% chroma error
+   -> 0.17-0.24% with anchor; plain neighbor-3D only ~0.6-1.0%), and
+   it only runs when n_passes >= 2 — which has_temporal gates on
+   temporal_strength > 0.
+2. The adaptive gate measured ambiguity as a FULL-FIELD RMS. Six
+   ambiguous lines out of 242 dilute to near the noise floor: repro
+   measured 0.93 IRE global -> strength 0.4 (engaged, barely) and it
+   takes little more dilution or noise to cross into ~0 — at which
+   point n_passes=1 and adaptive 3D IS 2D, exactly the user's symptom.
+3. Strength MAGNITUDE barely matters above zero (0.42 vs 0.77: bar
+   error within 0.04%); the off-vs-on threshold is everything.
+
+Fix: aggregate the same demod-difference energy per horizontal band
+(8 decimated rows ~ 24 field lines) and take the 95th-percentile band
+instead of the full-field mean. Measured on the numpy mirror of the
+exact C++ arithmetic: localized repro 0.93 -> 2.06 IRE (strength 0.42
+-> 0.98, comfortably engaged); flat noise 0.60 -> 0.62 (0.25 -> 0.26,
+no false engagement — on uniform content p95-of-bands measures the
+same thing as the RMS); clean chart saturated at 1.5 either way, so
+the documented no-floor property (clean scenes must resolve OFF) is
+preserved. New regression test in sequence_test.cpp: localized-band
+scene must resolve strength > 0.05.
+
+Same build caveat as Sec. 21b: verified by numpy arithmetic mirror +
+syntax-only compile; first real build runs the new test.
+
+## 21c. Selective 3D: single-hull bbox replaced by row-banded
+       multi-boxes — the field-reported failure and its fix
+
+Field report resolved: "full 3D fixes my circled zones, selective 3D
+does not." Root cause was structural, not the detector: the artifact
+zones sit at the TOP, MIDDLE and BOTTOM of the frame; the detector's
+flag map was verified PERFECT on a synthetic reproduction (three clean
+bands exactly on the zones), but the single bounding-box hull of three
+dispersed bands is ~the whole frame, > max_area, and the mode silently
+fell back to plain 2D — the user-visible symptom exactly. A second
+compounding bug: the 48 px vertical halo tripled a one-tile band's
+height, pushing even the banded total past the cap.
+
+Fix (both codebases): one box PER VERTICAL BAND of flagged tile-rows
+(merged to at most 4, nearest-gap first), vertical halo reduced to
+what motion search needs (32 frame px / 16 field rows), max_area now
+capping the TOTAL banded area, default raised to 0.6 (at 60% area the
+mode still costs well under full 3D). Measured on the three-dispersed-
+zones repro (noise 2.0, anchored config, 3 frames):
+
+    2D          3.5 s   zones 1.63 / 1.63 / 1.64 % chroma error
+    selective   8.9 s   zones 0.35 / 0.35 / 0.24 %   (3 boxes found)
+    full 3D    16.0 s   zones 0.26 / 0.27 / 0.12 %
+
+i.e. the zones are actually fixed now (previously: identical to 2D),
+at ~55% of full-3D wall time. C++ AmbiguousBoxes verified by verbatim
+extraction: 3 boxes covering all three ground-truth zones at 42% total
+area on the dispersed case, none on uniform noise. Same standing
+caveat: full engine build + tests still owed on a real machine.
+
+Post-mortem note for the record: before this root cause was found, a
+2-field consistency measurement on the user's real frame was read as
+"the artifact is chroma-consistent, unfixable by separation." That
+reading was WRONG — the user's empirical report (full 3D fixes it)
+falsified it, and the measurement itself was unsound on thin bars:
+opposite-parity fields sample content half a line apart, so on 1-3
+line structures the "same field row" comparison compares different
+content. Single-frame parity discrimination is unreliable below ~4
+lines of structure height; do not reuse that shortcut.
+
+## 21d. Selective 3D vs the real frame: three more failure modes,
+       found by finally running the detector on the actual capture
+
+Field report continued ("selective still doesn't do its job"). This
+round was debugged ON the user's real frame (raw split fields
+re-imported through a synthetic .tbc), which is what should have been
+done for 21c; each fix below was invisible on synthetic repros.
+
+1. Border stripe bridges bands. The capture's black side pillar puts a
+   hard edge + chroma noise down tile column 0; those tiles pass the
+   density filter (vertical neighbors) and BRIDGED the three true
+   artifact bands into one frame-tall band -> area overflow -> silent
+   2D fallback, again. Fixes: (a) a tile-row needs >= 2 flagged tiles
+   to count as a band row, (b) the outer 1-tile border ring is
+   excluded from flagging (border tiles straddle the capture mask and
+   are never useful ROI targets; box halos still cover near-border
+   artifacts), (c) per band, columns span the LONGEST contiguous run
+   (gap <= 2) instead of min..max -- a surviving stripe tile otherwise
+   widened every band to full width (real frame: total area 0.71 with
+   min..max vs 0.29 with runs).
+
+2. Fallback direction. Overflow now falls back to FULL 3D, never 2D.
+   Selective's contract is "at least full-3D quality, cheaper when
+   possible"; the 2D fallback was exactly how the real footage ended
+   up with its artifact zones untreated while the user watched full 3D
+   fix them.
+
+3. Uniform ambiguity is invisible to a relative threshold. When the
+   whole frame is ambiguous (this footage: venetian blinds across the
+   entire background), 4x-median flags nothing -- indistinguishable
+   from a clean frame -- and the old code picked 2D. Absolute
+   disambiguation added, calibrated on measured medians (IRE^2, tile
+   16, field geometry): SMPTE chart 0.62, flat noise sigma 2.5 -> 1.00,
+   this real frame 5.66, diffuse photo 8.87. Empty flags + median > 3.0
+   -> full 3D; empty flags + median <= 3.0 -> 2D. Localized boxes,
+   when found, take precedence (crops carry the fix at lower cost).
+
+End state on the real frame: 3 boxes at 29% total area, one per
+circled artifact zone (logo y 0-128 x 464-720, mid bar y 128-224
+x 384-720, sill y 352-484 x 256-576, frame coords). Standalone C++
+detector tests extended: border-stripe (3 boxes, stripe trimmed),
+uniform noise (2D), widespread bands (full-3D sentinel). Python
+regression green. Build + engine tests on a real machine still owed.
+
+## 21e. "Selective precisely avoids my artifacts": longest-run trim
+       was deleting real artifact clusters
+
+Field report: after 21d, "selective seems to precisely avoid my
+artifacts." Score audit on the real frame first, to check the detector
+itself: circled zones score 21-32 (mean, tile units) vs threshold 22.6,
+peaks 60-80; non-circled textured areas (hair, fan grille) score 7-8.
+The detector SEES the artifacts and rejects lookalike texture -- the
+loss was downstream: 21d's "keep only the longest column run" (the
+border-stripe guard) was discarding every OTHER run in a band. On the
+real frame the bottom band holds runs at ~x256-576 AND ~x560-720 (the
+right half of the circled sill) plus the SANTANA title at the left;
+only x256-576 survived, so the crops landed beside the artifacts the
+user was looking at. Precisely-avoiding behaviour explained.
+
+Fix (both codebases): one box per multi-tile column run (single-tile
+runs are the strays the guard existed for), halo-overlapping runs
+merged so the blend never applies twice. Real-frame end state, frame
+coords: logo y0-128 x464-720, bar y128-224 x384-720, title y352-484
+x0-128, full sill y352-484 x256-760 -- every circled zone covered,
+total area 0.40. Standalone C++ detector tests re-pass (border stripe
+3 boxes / uniform 2D / widespread full-3D sentinel); Python
+regression green.
+
+## 23. nr_anchor exposed; selective 3D box loop parallelized
+
+Two items from a speed follow-up on Sec. 21/22.
+
+**nr_anchor was missing from the GUI.** "Chroma smoothness" in the GUI
+is `lambda_c` (a different, already-exposed knob: chroma-vs-luma
+arbitration). `nr_anchor` -- the WEIGHT of the decode->NR->re-encode
+anchor once `passes >= 2` engages it -- had no property at all and
+silently sat at its 1.0 default. Added: "Anchor strength", 0-3,
+default 1.0, next to the existing "3D passes" descriptor.
+
+**Selective 3D: why it measured closer to full 3D than to 2D, and the
+fix.** Measured two candidate explanations on the real capture before
+touching code:
+
+- Box COUNT is not the cost driver -- disproven directly: 4 small
+  boxes covering the same total area as 1 big one ran slightly FASTER
+  (5.6s vs 6.7s, 3-frame window), so merging boxes for speed is not a
+  lever worth pulling.
+- The anchored config (passes=2, nr_anchor=1) costs 1.68x a plain
+  temporal config (temporal_strength=2, passes=1) on the SAME crop.
+  Combined with the real capture's boxes covering ~40-60% of the
+  frame (a near-frame-wide venetian-blind background, Sec. 21d), that
+  multiplier applied over half the picture is why selective landed
+  near full-3D time rather than near 2D time -- expected given the
+  measurement, not a bug.
+
+Real, implementable lever found: the box loop ran boxes ONE AT A TIME,
+even though they are independent. Parallelized (frame_bridge.cpp,
+DecodeWindowSelective) with one std::thread per box, each box's OWN
+OpenMP team capped to hardware_concurrency() / box_count so the total
+thread count across concurrently-running boxes stays bounded --
+stacking a second, unbounded threading layer on top of the engine's
+existing per-pixel-row OpenMP parallelism (holographic_init.cpp,
+motion.cpp, sequence.cpp) would oversubscribe the machine and could
+plausibly come out SLOWER. This specifically helps when a box's row
+count is too small to keep the full core count busy on its own -- the
+common case here: artifact bands are a handful of tile-rows tall, so
+a single-box call was leaving cores idle while other boxes waited.
+
+Verified: omp_set_num_threads() called from a plain (non-OpenMP)
+std::thread sets that thread's OWN team-size default only, confirmed
+with a standalone 3-thread/2-threads-each probe (each reported team
+size 2, independently). frame_bridge.cpp still compiles standalone
+(-fsyntax-only); hvd_chroma_decoder_stage.cpp still needs the orc SDK
+to build, unchanged limitation from every prior round. Actual
+wall-clock win on real footage still owed to a real build machine --
+the physical core count there is what determines how much this helps.

@@ -296,6 +296,42 @@ void RunTests() {
     CHECK(qa > q2 - 1.0);  // ...while staying near the 2D optimum
   }
 
+  // --- adaptive strength: LOCALIZED ambiguity (thin bars / small text) ------
+  // The failure this guards against (PORTING.md Sec. 22): the artifact class
+  // the gate exists for often occupies a few LINES of an otherwise ordinary
+  // frame (window-frame bars, logos). A full-field RMS diluted 6 ambiguous
+  // lines out of 242 to ~the noise floor and resolved strength ~0 — which
+  // does not merely weaken 3D: strength 0 forces n_passes = 1, so the
+  // anchored pass (the thing that actually fixes thin lines, Sec. 17) never
+  // ran, and "adaptive 3D" silently became plain 2D on exactly the content
+  // that needed it. The p95-of-bands aggregation must keep 3D engaged here.
+  {
+    Scene loc = MakeStaticScene(/*noise_ire=*/0.8F, /*seed=*/23);
+    // Strip the frame-wide carrier-luma term (as the clean-scene test does),
+    // then re-add it in ONE narrow horizontal band (8 of 96 frame lines).
+    for (size_t j = 0; j < loc.fields.size(); ++j) {
+      const int parity = static_cast<int>(j) % 2;
+      for (int r = 0; r < loc.fields[j].s.height(); ++r) {
+        const float fy = 2.0F * r + parity;
+        const bool in_band = fy >= 40.0F && fy < 48.0F;
+        for (int x = 0; x < loc.fields[j].s.width(); ++x) {
+          const float amb = 14.0F * std::cos((kPi / 2.0F) * x + 0.4F * fy) *
+                            std::sin(0.15F * fy);
+          if (!in_band) loc.fields[j].s.at(r, x) -= amb;
+        }
+      }
+    }
+    HvdConfig cauto = base;
+    cauto.temporal_strength = 0.0F;  // auto
+    hvd::SequenceDiagnostics dg;
+    const std::vector<DecodedField> dl = hvd::DecodeFieldWindowWithInits(
+        loc.fields, loc.inits, g, cauto, &dg);
+    (void)dl;
+    std::printf("  localized ambiguity: resolved strength=%.2f\n",
+                dg.resolved_strength);
+    CHECK(dg.resolved_strength > 0.05F);  // 3D (and the anchor) must engage
+  }
+
   // --- odd-offset half-line gate (thin horizontal detail) -------------------
   // A 1-frame-line chroma feature is INVISIBLE to the opposite parity;
   // ungated, its neighbour equations vote the feature away with residuals

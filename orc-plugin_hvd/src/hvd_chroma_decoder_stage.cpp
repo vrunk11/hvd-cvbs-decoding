@@ -35,6 +35,7 @@ constexpr const char* kCgIterations = "cg_iterations";
 constexpr const char* kFast = "fast";
 constexpr const char* kCgTol = "cg_tol";
 constexpr const char* kBidirectional = "bidirectional";
+constexpr const char* kSelective3d = "selective_3d";
 constexpr const char* kDiagPrior = "diag_prior";
 constexpr const char* kPasses = "passes";
 constexpr const char* kChunkFrames = "chunk_frames";
@@ -50,6 +51,7 @@ constexpr const char* kEnableTemporal = "enable_temporal";
 constexpr const char* kTemporalStrength = "temporal_strength";
 constexpr const char* kMcTile = "mc_tile";
 constexpr const char* kMcSearch = "mc_search";
+constexpr const char* kNrAnchor = "nr_anchor";
 constexpr const char* kOutputPath = "output_path";
 
 // BT.601-ish YUV -> RGB, same matrix as engine/colour.cpp's YuvToRgb16 but
@@ -807,6 +809,17 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "break at most one side. Only worth it when speed matters more "
             "than the last dB, e.g. previewing.",
             ParameterType::BOOL, boolean(true)},
+        ParameterDescriptor{kSelective3d, "Selective 3D",
+            "Full-window 2D decode plus the complete 3D machinery re-run "
+            "only on the crop of the most Y/C-ambiguous tiles, blended in. "
+            "Pays off on LOCALIZED ambiguity (fan grilles, blinds, one "
+            "textured area in a flat scene). Handles up to 4 separate "
+            "horizontal artifact bands per frame (top+middle+bottom zones "
+            "measured: zones fixed to within ~0.1% of full 3D at ~55% of "
+            "its wall time). On diffuse content the detector finds no "
+            "worthwhile crop and the window stays plain 2D by design "
+            "(PORTING.md Sec. 21/21c). Ignored when 3D is off.",
+            ParameterType::BOOL, boolean(false)},
         ParameterDescriptor{kDiagPrior, "Diagonal chroma prior",
             "Oriented +/-45 deg chroma prior weight (reference's "
             "--diag-prior), renormalised so total prior mass is unchanged. "
@@ -862,6 +875,15 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "where the raw data contradicts it. 2 is the reference's "
             "anchored-mode value.",
             ParameterType::INT32, integer(1, 4, 1)},
+        ParameterDescriptor{kNrAnchor, "Anchor strength",
+            "Weight of the decode->NR->re-encode anchor once it engages "
+            "(passes >= 2, above) -- how strongly the temporally-denoised "
+            "reference pulls the solve versus the raw per-field data. "
+            "This was previously silently fixed at 1.0 (the reference "
+            "default) with no GUI control. 0 disables the anchor's pull "
+            "even with passes >= 2 (Gauss-Seidel iteration continues, "
+            "just without the NR reference).",
+            ParameterType::DOUBLE, real(0.0, 3.0, 1.0)},
         ParameterDescriptor{kDebugDir, "Diagnostics directory",
             "When set, the export also writes, per frame, a PGM map of the "
             "RESIDUAL CARRIER-BAND ENERGY in the decoded luma — i.e. the "
@@ -929,8 +951,10 @@ HvdChromaDecoderStage::get_parameters() const
         {kStructureCoupling, static_cast<double>(config_.structure_coupling)},
         {kCgIterations, static_cast<int32_t>(config_.cg_iterations)},
         {kFast, config_.fast},
+        {kNrAnchor, static_cast<double>(config_.nr_anchor)},
         {kCgTol, static_cast<double>(config_.cg_tol)},
         {kBidirectional, config_.bidirectional},
+        {kSelective3d, config_.selective_3d},
         {kPasses, static_cast<int32_t>(config_.passes)},
         {kChunkFrames, static_cast<int32_t>(config_.chunk_frames)},
         {kFieldOrder, static_cast<int32_t>(config_.field_order)},
@@ -982,8 +1006,10 @@ bool HvdChromaDecoderStage::set_parameters(
     get_double(kStructureCoupling, config_.structure_coupling);
     get_int(kCgIterations, config_.cg_iterations);
     get_bool(kFast, config_.fast);
+    get_double(kNrAnchor, config_.nr_anchor);
     get_double(kCgTol, config_.cg_tol);
     get_bool(kBidirectional, config_.bidirectional);
+    get_bool(kSelective3d, config_.selective_3d);
     get_int(kPasses, config_.passes);
     get_int(kChunkFrames, config_.chunk_frames);
     get_int(kFieldOrder, config_.field_order);

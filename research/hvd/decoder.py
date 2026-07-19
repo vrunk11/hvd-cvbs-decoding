@@ -78,7 +78,15 @@ class DecoderConfig:
     symmetry_variant: bool = False # Transform-style spectral-symmetry
                                    # certified-chroma init variant
     lambda_c: float = 1.0      # chroma-smoothness vs luma-plausibility arbitration
-    chroma_aniso: float = 0.5  # mu_h = aniso * lambda_c (chroma is broader
+    # mu_h = aniso * lambda_c. 0 = AUTO (default): the right split is a
+    # property of the content's chroma orientation — thin horizontal
+    # chroma bands / fsc-adjacent texture want the vertical prior weak
+    # (-> 1.0: lines ~15% better, curtain ~17%), sharp horizontal chroma
+    # transitions (colour bars) want 0.5 (a fixed 1.0 costs the chart
+    # 1.1 dB in 2D). Auto measures the init's p90 |D chi0| gradient ratio
+    # per solve and maps it into [0.5, 1.0] (_resolve_chroma_aniso).
+    # Positive = forced fixed value (pre-auto reference behaviour at 0.5).
+    chroma_aniso: float = 0.0  # (chroma is broader
                                # horizontally). NOTE: tuned pre-field-pipeline
                                # when 'vertical' meant frame lines; field
                                # lines are 2x coarser — re-swept in the
@@ -587,41 +595,11 @@ def warp_by_tiles(a, mdy, mdx, tile=32):
     return a[sy, sx]
 
 
-# NOTE (audit): mc_warp / envelope_of / motion_compensate_envelope are
-# call-site dead — the envelope-resampled neighbour variant was tried and
-# REJECTED (its 1-line comb leaks vertical luma gradients into chroma; see
-# the raw-warp comment in decode_sequence). Kept deliberately: the code is
-# the record of the negative result, and the C++ port carries tested
-# equivalents for the same reason.
-def mc_warp(Y_from, Y_to, arrays, tile=32, search=16):
-    """Estimate motion from Y_from toward Y_to, warp every array in
-    `arrays` accordingly. Returns (warped_list, per-pixel confidence)."""
-    mdy, mdx, conf = estimate_motion(Y_from, Y_to, tile=tile, search=search)
-    h, w = Y_from.shape
-    yy, xx = np.mgrid[0:h, 0:w]
-    ty = np.minimum(yy // tile, conf.shape[0] - 1)
-    tx = np.minimum(xx // tile, conf.shape[1] - 1)
-    conf_px = _box_blur(conf[ty, tx] ** 2, r=8)  # squared: crush weak matches
-    return [warp_by_tiles(a, mdy, mdx, tile) for a in arrays], conf_px
-
-
-def envelope_of(S, phi):
-    """Line-pair comb separation of a raw field into baseband envelope
-    samples on the HALF-LINE grid (between lines m and m+1):
-        Yb  = (S[m] + S[m+1]) / 2      (adjacent lines are 180 deg of
-                                        carrier apart: chroma cancels)
-        Cb  = (S[m] - S[m+1]) / 2 = Re[chi c_m]
-    plus the quadrature from the +/-1 sample x-shift (90 deg at 4fsc):
-        chi_b = (Cb + i (Cb(x-1) - Cb(x+1))/2) * conj(c_m)
-    A fixed, local, linear transform of raw measurements — nothing is
-    estimated. Being baseband, (Yb, chi_b) can be resampled at
-    arbitrary sub-pixel positions and re-encoded at ANY carrier phase.
-    """
-    Yb = 0.5 * (S[:-1] + S[1:])
-    Cb = 0.5 * (S[:-1] - S[1:])
-    q = 0.5 * (np.roll(Cb, 1, axis=1) - np.roll(Cb, -1, axis=1))
-    chi_b = (Cb + 1j * q) * np.exp(-1j * phi[:-1])
-    return Yb.astype(np.float32), chi_b.astype(np.complex64)
+# (mc_warp / envelope_of / motion_compensate_envelope removed in the
+# cleanup pass: the envelope-resampled neighbour variant they implemented
+# was tried and REJECTED — its 1-line comb leaks vertical luma gradients
+# into chroma; see the raw-warp comment in decode_sequence and THEORY 9g.
+# The negative result is recorded in prose; the bodies are gone.)
 
 
 def _warp_bilinear_tiles(a, dyf, dxf, tile, row_offset=0.0, out_shape=None,
@@ -647,49 +625,6 @@ def _warp_bilinear_tiles(a, dyf, dxf, tile, row_offset=0.0, out_shape=None,
     v = (a[y0, x0] * (1 - fy) * (1 - fx) + a[y0 + 1, x0] * fy * (1 - fx)
          + a[y0, x0 + 1] * (1 - fy) * fx + a[y0 + 1, x0 + 1] * fy * fx)
     return v
-
-
-def motion_compensate_envelope(nb_state, Y_cur, phi_cur, parity_cur,
-                               parity_nb, tile=32, search=16, motion=None):
-    """Envelope-domain neighbor resampling (points 3+4 unified).
-
-    The neighbor's raw field is comb-separated into baseband
-    (Yb, chi_b) on its half-line grid, motion-warped with SUB-PIXEL
-    bilinear interpolation (legal in baseband, forbidden on the raw
-    carrier), then RE-ENCODED at the current field's own phase + 180
-    deg. Consequences:
-      * the half-line parity offset between opposite fields vanishes
-        by construction (the comb's half-grid IS the other parity's
-        grid);
-      * sub-pixel motion is honoured (parabolic half-pel vectors);
-      * |dc| = 2 for every neighbor — maximal chroma leverage — where
-        the raw adjacent-field pairing only reached sqrt(2).
-    Grid algebra (frame lines): target field line m sits at
-    2m + p_cur; neighbor half-sample i sits at 2i + p_nb + 1; matching
-    measures dy in field lines, so the source half-grid row is
-    m - dy + (p_cur - p_nb - 1)/2.
-    """
-    Y_nb, S_nb, phi_nb = nb_state
-    if motion is None:
-        motion = estimate_motion(Y_nb, Y_cur, tile=tile, search=search)
-    mdy, mdx, conf = motion
-    Yb, chib = envelope_of(S_nb, phi_nb)
-    row_off = (parity_cur - parity_nb - 1) / 2.0
-    out = Y_cur.shape
-    Yw = _warp_bilinear_tiles(Yb, mdy, mdx, tile, row_offset=row_off,
-                              out_shape=out)
-    Cw = (_warp_bilinear_tiles(chib.real, mdy, mdx, tile,
-                               row_offset=row_off, out_shape=out)
-          + 1j * _warp_bilinear_tiles(chib.imag, mdy, mdx, tile,
-                                      row_offset=row_off, out_shape=out))
-    c_w = -np.exp(1j * phi_cur)
-    S_w = Yw + np.real(Cw * c_w)
-    h, w = Y_nb.shape
-    yy, xx = np.mgrid[0:h, 0:w]
-    ty = np.minimum(yy // tile, conf.shape[0] - 1)
-    tx = np.minimum(xx // tile, conf.shape[1] - 1)
-    conf_px = _box_blur(conf[ty, tx] ** 2, r=8)
-    return S_w.astype(np.float32), c_w, conf_px
 
 
 def complex_coherence(z1, z2, r=6):
@@ -877,6 +812,37 @@ def _dyT(a):
     return d
 
 
+def _resolve_chroma_aniso(chi0, cfg):
+    """chroma_aniso == 0 => AUTO: dominant chroma-detail orientation of
+    the init, via p98 one-step gradients (medians only see the flat
+    background), mapped into [0.5, 1.0]. See HvdConfig.chroma_aniso for
+    the measurements behind the map."""
+    if cfg.chroma_aniso > 0.0:
+        return cfg.chroma_aniso
+    # Line-pair averages, not raw chi0: the init's dominant vertical
+    # energy is cross-colour LEAK, alternating sign every line (carrier
+    # flips 180 deg per field line) — on the colour-bar chart it made
+    # |Dy chi0| read as large as the bar transitions (auto wrongly
+    # picked ~1.0). Pair-averaging cancels the alternating leak exactly;
+    # genuine chroma structure survives.
+    _h2 = (chi0.shape[0] // 2) * 2
+    _pav = 0.5 * (chi0[0:_h2:2] + chi0[1:_h2:2])
+    gx = np.abs(np.diff(_pav[::2, ::3], axis=1)).ravel()
+    gy = np.abs(np.diff(_pav[::2, 1::3], axis=0)).ravel()
+    if gx.size == 0 or gy.size == 0:
+        return 0.5
+    # p98, not p90: structure can be SPARSE (colour-bar transitions are
+    # ~4% of columns — a p90 reads noise/noise ~ 1 there and wrongly
+    # picks aniso ~ 1, costing the chart 1.1 dB in 2D).
+    px = float(np.percentile(gx, 98))
+    py = float(np.percentile(gy, 98))
+    r = py / max(px, 1e-6)
+    import os as _os
+    if _os.environ.get("HVD_DEBUG_ANISO"):
+        print(f"    aniso auto: px={px:.2f} py={py:.2f} r={r:.2f} "
+              f"-> {float(np.clip(0.5 + 1.1 * (r - 1.3), 0.5, 1.0)):.2f}")
+    return float(np.clip(0.5 + 1.1 * (r - 1.3), 0.5, 1.0))
+
 def variational_refine(S, phi, Y0, chi0, cfg: DecoderConfig,
                        irls_outer: int = 4, neighbors=None):
     """Refine chroma by arbitration, with luma eliminated.
@@ -919,13 +885,14 @@ def variational_refine(S, phi, Y0, chi0, cfg: DecoderConfig,
     eps = cfg.charbonnier_eps
     eps_c = cfg.chroma_eps
     eps_t = cfg.temporal_eps
-    mu_h = cfg.lambda_c * cfg.chroma_aniso   # chroma is broader horizontally
+    _aniso = _resolve_chroma_aniso(chi0, cfg)
+    mu_h = cfg.lambda_c * _aniso   # chroma is broader horizontally
     mu_v = cfg.lambda_c
     mu_d = cfg.lambda_c * cfg.diag_prior * 0.5
     # renormalise so the TOTAL chroma prior mass is unchanged by the
     # oriented terms: they redistribute smoothing across directions
     # (isotropy against diagonal cross-colour) without increasing it
-    _tot0 = cfg.lambda_c * (1.0 + cfg.chroma_aniso)
+    _tot0 = cfg.lambda_c * (1.0 + _aniso)
     _scale = _tot0 / (_tot0 + 2.0 * mu_d) if mu_d > 0 else 1.0
     mu_h, mu_v, mu_d = mu_h * _scale, mu_v * _scale, mu_d * _scale
     neighbors = neighbors or []
@@ -1060,13 +1027,14 @@ def variational_refine_joint(S, phi, Y0, chi0, cfg: DecoderConfig,
     eps = cfg.charbonnier_eps
     eps_c = cfg.chroma_eps
     eps_t = cfg.temporal_eps
-    mu_h = cfg.lambda_c * cfg.chroma_aniso
+    _aniso = _resolve_chroma_aniso(chi0, cfg)
+    mu_h = cfg.lambda_c * _aniso
     mu_v = cfg.lambda_c
     mu_d = cfg.lambda_c * cfg.diag_prior * 0.5
     # renormalise so the TOTAL chroma prior mass is unchanged by the
     # oriented terms: they redistribute smoothing across directions
     # (isotropy against diagonal cross-colour) without increasing it
-    _tot0 = cfg.lambda_c * (1.0 + cfg.chroma_aniso)
+    _tot0 = cfg.lambda_c * (1.0 + _aniso)
     _scale = _tot0 / (_tot0 + 2.0 * mu_d) if mu_d > 0 else 1.0
     mu_h, mu_v, mu_d = mu_h * _scale, mu_v * _scale, mu_d * _scale
     neighbors = neighbors or []
@@ -1473,7 +1441,8 @@ def prepare_frame(src: TbcSource, frame_index: int,
 
 
 def decode_sequence(src: TbcSource, start: int, length: int,
-                    cfg: DecoderConfig, first_active_line: int | None = None):
+                    cfg: DecoderConfig, first_active_line: int | None = None,
+                    roi=None):
     """Generator decoding frames [start, start+length).
 
     3D mode (cfg.temporal_strength > 0): every frame receives extra,
@@ -1541,6 +1510,16 @@ def decode_sequence(src: TbcSource, start: int, length: int,
         w1 = min(start + length, t1 + OV)
         fidx = list(range(2 * w0, 2 * w1))
         SP = [prepare_field(src, f, first_active_line) for f in fidx]
+        if roi is not None:
+            # selective-3D support: run the ENTIRE field-based machinery
+            # (motion, gates, solver, weave) on a rectangular crop, in
+            # FIELD coordinates (fy0, fy1, x0, x1). Every downstream
+            # step is shape-agnostic, so nothing else changes; emitted
+            # frames are cropped to (2*(fy1-fy0), x1-x0).
+            fy0, fy1, rx0, rx1 = roi
+            SP = [(np.ascontiguousarray(S[fy0:fy1, rx0:rx1]),
+                   np.ascontiguousarray(phi[fy0:fy1, rx0:rx1]))
+                  for (S, phi) in SP]
         # self-calibration: measure the source's noise, scale the
         # robust gates accordingly (a fixed IRE gate is 5 sigma on a
         # clean disc but 1.4 sigma on a noisy one => over-gating
@@ -1661,6 +1640,44 @@ def decode_sequence(src: TbcSource, start: int, length: int,
                                           np.where(ok, px, mdx), cf)
 
                 neighbors = []
+                # Half-line validity envelope for ODD offsets (opposite
+                # parity) — closes a hole the C++ port measured (THEORY
+                # 9h): on detail at/beyond the opposite parity's vertical
+                # Nyquist (a 1-frame-line coloured ledge, thin blinds) the
+                # feature is INVISIBLE to that parity, whose equations
+                # then vote "background"; their residual OSCILLATES with x
+                # (|dchi*cos|), so the robust weight lets confident wrong
+                # votes through at the cosine zeros — measured, 3D made
+                # 1-frame-line chroma detail WORSE than 2D. Only the
+                # phase-independent BASEBAND envelope catches all the
+                # votes (a composite-based envelope is unusable: within a
+                # field the carrier flips 180 deg per line, so |dS/dline|
+                # ~ 2|chi| on flat saturated colour — measured -8.6 dB on
+                # the chart). One-sided max diff (a central diff is
+                # exactly zero ON a one-row feature), horizontal-only
+                # smoothing (a 2D blur dilutes a one-row footprint ~2.5x),
+                # and a 0.25 FLOOR: on step-edge-heavy content the odd
+                # equations are biased but informative and hard-gating
+                # them cost 4.4 dB of 3D gain on the chart.
+                _dyu = np.abs(np.diff(Ys[j], axis=0, prepend=Ys[j][:1]))
+                _dyd = np.abs(np.diff(Ys[j], axis=0, append=Ys[j][-1:]))
+                _dcu = np.abs(np.diff(chis[j], axis=0,
+                                      prepend=chis[j][:1]))
+                _dcd = np.abs(np.diff(chis[j], axis=0,
+                                      append=chis[j][-1:]))
+                _m = np.maximum(_dyu ** 2 + _dcu ** 2,
+                                _dyd ** 2 + _dcd ** 2)
+                _hh, _ww = _m.shape
+                _c = np.zeros((_hh, _ww + 1))
+                np.cumsum(_m, axis=1, out=_c[:, 1:])
+                _x0 = np.clip(np.arange(_ww) - 2, 0, _ww)
+                _x1 = np.clip(np.arange(_ww) + 3, 0, _ww)
+                _vg = np.sqrt((_c[:, _x1] - _c[:, _x0])
+                              / np.maximum(_x1 - _x0, 1))
+                _og = np.maximum(
+                    0.35,
+                    ccfg.temporal_eps ** 2
+                    / (ccfg.temporal_eps ** 2 + _vg * _vg))
                 for o in offs:
                     k = j + o
                     if not (0 <= k < len(fidx)):
@@ -1716,6 +1733,8 @@ def decode_sequence(src: TbcSource, start: int, length: int,
                         g = complex_coherence(chis[j], Cw)
                         a = ccfg.coherence_gate
                         conf_n = conf_n * ((1.0 - a) + a * g)
+                    if (o % 2) != 0:
+                        conf_n = conf_n * _og
                     neighbors.append((S_w, c_w, conf_n))
                 if (_pass == 0 and ccfg.psi_init and neighbors):
                     chis[j] = psi_closed_form(S, phi, neighbors, chis[j])
@@ -1766,8 +1785,9 @@ def decode_sequence(src: TbcSource, start: int, length: int,
                                       np.real(Cd) * g, black_ire=black)
                 continue
             lines = Yout[j0].shape[0]
-            Yf = np.zeros((2 * lines, p.active_width))
-            Cf = np.zeros((2 * lines, p.active_width), complex)
+            wcols = Yout[j0].shape[1]   # = active_width, or roi width
+            Yf = np.zeros((2 * lines, wcols))
+            Cf = np.zeros((2 * lines, wcols), complex)
             p0, p1 = parities[j0], parities[j1]
             if p0 == p1:   # metadata anomaly: fall back to index order
                 p0, p1 = 0, 1
@@ -1780,3 +1800,280 @@ def decode_sequence(src: TbcSource, start: int, length: int,
             U = -np.imag(Cf) * g
             yield t, yuv_to_rgb16(Yf, U, V, black_ire=black)
         t0 = t1
+
+
+def decode_sequence_selective(src: TbcSource, start: int, length: int,
+                              cfg: DecoderConfig,
+                              first_active_line: int | None = None,
+                              max_area: float = 0.6, tile: int = 32,
+                              halo_px: int = 48, stats: dict | None = None):
+    """Selective 3D: full-frame 2D decode everywhere + the COMPLETE
+    field-based 3D machinery (decode_sequence, cropped via roi=) on the
+    single bounding box covering the most Y/C-ambiguous tiles, feather-
+    blended in. Falls back to plain 2D when the flagged area exceeds
+    max_area (a crop that big saves nothing) or to full 3D when
+    max_area >= 1.
+
+    The ambiguity score is the one validated against measured per-tile
+    2D-vs-3D gain on real photo content (PORTING.md Sec. 19):
+    sqrt(luma_HF_energy * chroma_HF_energy) of the holographic init,
+    r=0.60 with true gain. The same measurement showed the gain is
+    DIFFUSE (top 30% of tiles carry ~48% of it), so this mode is an
+    explicit speed/quality dial, not a free lunch: expect roughly half
+    the 3D improvement at a fraction of the 3D cost inside the budget
+    you give it via max_area. Halo must cover mc_search + one tile so
+    motion estimation inside the crop sees the same evidence it would
+    full-frame."""
+    if cfg.temporal_strength <= 0.0 or cfg.cg_iterations <= 0:
+        for i in range(start, start + length):
+            yield i, decode_frame(src, i, cfg,
+                                  first_active_line=first_active_line)
+        return
+    if max_area >= 1.0:
+        yield from decode_sequence(src, start, length, cfg,
+                                   first_active_line)
+        return
+
+    # ---- ambiguity from the first frame's init (cheap, no solve) ----
+    S, phi = prepare_frame(src, start, first_active_line)
+    p = src.params
+    Y0, chi0 = holographic_init(S, phi, p, cfg)
+    boxes = _ambiguous_boxes(Y0, chi0, tile=tile, max_area=max_area,
+                             halo_px=halo_px)
+    if stats is not None:
+        stats["boxes"] = boxes
+    if boxes == "full":
+        # ambiguity present but too widespread to crop profitably:
+        # fall back to FULL 3D, never to 2D. Selective mode's contract
+        # is "at least full-3D quality, cheaper when possible" -- the
+        # earlier 2D fallback here is exactly how real footage with a
+        # border stripe ended up with its artifact zones untreated.
+        yield from decode_sequence(src, start, length, cfg,
+                                   first_active_line)
+        return
+    if not boxes:
+        for i in range(start, start + length):
+            yield i, decode_frame(src, i, cfg,
+                                  first_active_line=first_active_line)
+        return
+
+    seqs = []
+    for (y0, y1, x0, x1) in boxes:            # frame coords, y even
+        roi = (y0 // 2, (y1 + 1) // 2, x0, x1)
+        seqs.append(decode_sequence(src, start, length, cfg,
+                                    first_active_line, roi=roi))
+    masks = [None] * len(boxes)
+    for i in range(start, start + length):
+        rgb2d = decode_frame(src, i, cfg,
+                             first_active_line=first_active_line)
+        out = rgb2d.astype(np.float64)
+        for bi, (y0, y1, x0, x1) in enumerate(boxes):
+            _, crop3d = next(seqs[bi])
+            ch = crop3d.shape[0]
+            yy1 = min(y0 + ch, out.shape[0])
+            if masks[bi] is None:
+                hh = yy1 - y0
+                ww = min(x1, out.shape[1]) - x0
+                hy = min(halo_px, hh // 3)
+                hx = min(halo_px, ww // 3)
+                ry = np.ones(hh)
+                ry[:hy] = np.linspace(0.0, 1.0, hy)
+                ry[hh - hy:] = np.linspace(1.0, 0.0, hy)
+                rx = np.ones(ww)
+                rx[:hx] = np.linspace(0.0, 1.0, hx)
+                rx[ww - hx:] = np.linspace(1.0, 0.0, hx)
+                masks[bi] = np.outer(ry, rx)[..., None]
+            m = masks[bi]
+            sl = (slice(y0, y0 + m.shape[0]), slice(x0, x0 + m.shape[1]))
+            out[sl] = (out[sl] * (1.0 - m)
+                       + crop3d[:m.shape[0], :m.shape[1]].astype(np.float64)
+                       * m)
+        yield i, np.clip(out + 0.5, 0, 65535).astype(np.uint16)
+
+
+def _ambiguity_flags(Y0, chi0, tile=32):
+    """Shared detector core: per-tile ambiguity score (sqrt(luma_HF x
+    chroma_HF), the §19-validated proxy), 4x-median threshold, >=2-of-8
+    neighbor density filter, border-normalised smoothing. Returns
+    (flagged tile map or None, h, w)."""
+    h, w = Y0.shape
+    th, tw = (h + tile - 1) // tile, (w + tile - 1) // tile
+    ph, pw = th * tile, tw * tile
+
+    def tmean(a):
+        ap = np.zeros((ph, pw))
+        ap[:h, :w] = a
+        return ap.reshape(th, tile, tw, tile).mean(axis=(1, 3))
+
+    k = max(3, tile // 2)
+    c = np.ones(k) / k
+
+    def _box2d(a):
+        # count-normalised borders: plain 'same' convolution zero-pads,
+        # manufacturing fake HF along row 0 / col 0 (measured: whole
+        # first row+column of tiles flagged on a flat scene).
+        ones = np.ones(a.shape[0])
+        ny = np.convolve(ones, c, mode="same")
+        t1 = np.apply_along_axis(
+            lambda r: np.convolve(r, c, mode="same"), 0, a) / ny[:, None]
+        ones = np.ones(a.shape[1])
+        nx = np.convolve(ones, c, mode="same")
+        return np.apply_along_axis(
+            lambda r: np.convolve(r, c, mode="same"), 1, t1) / nx[None, :]
+
+    lpY = _box2d(Y0)
+    mag = np.abs(chi0).astype(np.float64)
+    lpC = _box2d(mag)
+    score = np.sqrt(np.maximum(tmean((Y0 - lpY) ** 2), 0.0)
+                    * np.maximum(tmean((mag - lpC) ** 2), 0.0))
+    med = float(np.median(score))
+    thr = 4.0 * med
+    flagged = score >= thr
+    # density: keep tiles with >= 2 of 8 flagged neighbors (noise flags
+    # isolated tiles; real ambiguous content flags clusters)
+    nb = np.zeros_like(score)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            sh = np.roll(np.roll(flagged, dy, axis=0), dx, axis=1)
+            if dy == -1:
+                sh[-1, :] = False
+            elif dy == 1:
+                sh[0, :] = False
+            if dx == -1:
+                sh[:, -1] = False
+            elif dx == 1:
+                sh[:, 0] = False
+            nb += sh
+    flagged = flagged & (nb >= 2)
+    # exclude the outer 1-tile border ring: border tiles straddle the
+    # capture-mask transition (black pillars, head-switch area) and are
+    # never useful ROI targets themselves -- the boxes' halo still
+    # covers in-picture artifacts near the border. A flagged border
+    # stripe otherwise bridges or widens every band (measured on real
+    # capture: left pillar edge).
+    flagged[0, :] = False
+    flagged[-1, :] = False
+    flagged[:, 0] = False
+    flagged[:, -1] = False
+    if not flagged.any():
+        # No localized peaks. Disambiguate uniform-CLEAN from uniform-
+        # AMBIGUOUS with an absolute level: measured medians (IRE^2,
+        # tile 16, field geometry) -- SMPTE chart 0.62, flat noise
+        # sigma=2.5 1.00, real LD footage with frame-wide blinds 5.66,
+        # diffuse photo texture 8.87. Above 3.0 the frame is globally
+        # ambiguous and deserves FULL 3D, not the 2D fallback; a purely
+        # relative threshold cannot tell these two apart.
+        if med > 3.0:
+            return "uniform", h, w
+        return None, h, w
+    return flagged, h, w
+
+
+def _ambiguous_boxes(Y0, chi0, tile=32, max_area=0.6, halo_px=48,
+                     halo_y=32, max_boxes=4):
+    """Row-banded boxes: one per vertical band of flagged tile-rows,
+    instead of a single hull. The single-hull version silently fell
+    back to 2D on exactly the field-reported case it was built for --
+    thin horizontal artifact zones at the TOP, MIDDLE and BOTTOM of the
+    frame: their common hull is ~the whole frame, > max_area, box=None,
+    and "selective 3D" quietly became plain 2D while full 3D fixed the
+    zones. Bands merge to at most max_boxes; max_area limits the TOTAL
+    cropped area."""
+    flagged, h, w = _ambiguity_flags(Y0, chi0, tile)
+    if flagged is None:
+        return None
+    if isinstance(flagged, str):     # "uniform": frame-wide ambiguity
+        return "full"
+    # A tile-row only counts as a band row with >= 2 flagged tiles: a
+    # one-tile-wide vertical stripe (measured on real capture: the hard
+    # edge of the black side pillar flags column 0 top to bottom)
+    # otherwise BRIDGES every artifact band into one giant one that
+    # overflows the area cap.
+    rows = np.nonzero(flagged.sum(axis=1) >= 2)[0]
+    if rows.size == 0:
+        return None
+    bands = []
+    r0 = prev = rows[0]
+    for r in rows[1:]:
+        if r - prev <= 1:
+            prev = r
+            continue
+        bands.append((r0, prev))
+        r0 = prev = r
+    bands.append((r0, prev))
+    while len(bands) > max_boxes:
+        gaps = [bands[i + 1][0] - bands[i][1] for i in range(len(bands) - 1)]
+        i = int(np.argmin(gaps))
+        bands[i] = (bands[i][0], bands[i + 1][1])
+        del bands[i + 1]
+    boxes = []
+    total = 0
+    for (tr0, tr1) in bands:
+        cols = np.nonzero(flagged[tr0:tr1 + 1].any(axis=0))[0]
+        # One box PER contiguous column run (gap <= 2), single-tile runs
+        # dropped. History matters here: v18's min..max span let one
+        # stray tile widen a band to full width; the first fix kept only
+        # the LONGEST run, which on the real capture cut off the right
+        # half of the circled sill artifact (its band held runs at
+        # ~x256-576 and ~x560-720; only the first survived) -- the user-
+        # visible symptom was "selective precisely avoids my artifacts".
+        # Emitting every multi-tile run keeps all artifact clusters and
+        # still drops isolated strays.
+        runs = []
+        c0 = cprev = cols[0]
+        for cc in cols[1:]:
+            if cc - cprev <= 2:
+                cprev = cc
+                continue
+            runs.append((c0, cprev))
+            c0 = cprev = cc
+        runs.append((c0, cprev))
+        # vertical halo only needs to cover motion search (mc_search=16)
+        # plus margin: 48 tripled a one-tile band's height and pushed the
+        # dispersed three-band case past the area cap.
+        y0 = max(0, tr0 * tile - halo_y)
+        y1 = min(h, (tr1 + 1) * tile + halo_y)
+        y0 -= y0 % 2
+        band_boxes = []
+        for (c0, c1) in runs:
+            if c1 - c0 < 1:      # single-tile run: stray, skip
+                continue
+            x0 = max(0, c0 * tile - halo_px)
+            x1 = min(w, (c1 + 1) * tile + halo_px)
+            # halo expansion can make neighbouring runs overlap; merge
+            # so the blend isn't applied twice over the same pixels
+            if band_boxes and x0 <= band_boxes[-1][3]:
+                band_boxes[-1] = (y0, y1, band_boxes[-1][2], x1)
+            else:
+                band_boxes.append((y0, y1, x0, x1))
+        for b in band_boxes:
+            boxes.append(b)
+            total += (b[1] - b[0]) * (b[3] - b[2])
+    if not boxes:
+        return None
+    while len(boxes) > 2 * max_boxes:
+        # merge the horizontally-nearest pair within the same band
+        best = None
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                if boxes[i][0] != boxes[j][0]:
+                    continue
+                gap = max(boxes[j][2] - boxes[i][3],
+                          boxes[i][2] - boxes[j][3])
+                if best is None or gap < best[0]:
+                    best = (gap, i, j)
+        if best is None:
+            break
+        _, i, j = best
+        bi, bj = boxes[i], boxes[j]
+        merged = (bi[0], bi[1], min(bi[2], bj[2]), max(bi[3], bj[3]))
+        total += ((merged[1] - merged[0]) * (merged[3] - merged[2])
+                  - (bi[1] - bi[0]) * (bi[3] - bi[2])
+                  - (bj[1] - bj[0]) * (bj[3] - bj[2]))
+        boxes[i] = merged
+        del boxes[j]
+    if total > max_area * h * w:
+        return "full"
+    return boxes

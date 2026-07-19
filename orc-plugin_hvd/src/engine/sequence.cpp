@@ -473,9 +473,31 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
       const int hh = Sj.height();
       const int ww = Sj.width();
       // Crude demod, decimated: this is a scalar calibration, not a decode.
+      // Accumulated PER HORIZONTAL BAND (8 decimated rows ~ 24 field
+      // lines), aggregated as the 95th-percentile band instead of the
+      // full-field RMS. Rationale, measured (PORTING.md §22): the
+      // artifact class this gate exists for — thin bright horizontal
+      // bars, small text, blinds — occupies a few LINES of an otherwise
+      // ordinary frame; a full-field RMS dilutes 6 ambiguous lines out
+      // of 242 to near the noise floor and resolves strength ~0, which
+      // does not merely weaken 3D: strength 0 forces n_passes=1, so the
+      // ANCHORED pass (the thing that actually fixes thin lines, §17)
+      // never runs and "adaptive 3D" silently becomes plain 2D on
+      // exactly the content that needed it. p95-of-bands responds to
+      // localized ambiguity while measuring the SAME value as the RMS
+      // on uniform content (repro: 0.93 -> 1.64 IRE localized; flat
+      // noise 0.60 -> 0.62; clean chart unchanged at saturation).
+      std::vector<double> band_acc;
+      std::vector<long> band_n;
+      int yi = 0;
       double acc = 0.0;
       long n = 0;
-      for (int y = 2; y < hh - 2; y += 3) {
+      for (int y = 2; y < hh - 2; y += 3, ++yi) {
+        const int band = yi / 8;
+        if (band >= static_cast<int>(band_acc.size())) {
+          band_acc.push_back(0.0);
+          band_n.push_back(0);
+        }
         for (int x = 4; x + 7 < ww; x += 4) {
           // Triangle-7 (= box4 convolved with box4): a DOUBLE null at the
           // carrier frequency (pi/2 rad/px at 4fsc). The demod shifts
@@ -495,11 +517,29 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
           };
           const Complex dj = demod(Sj, fields[j].carrier);
           const Complex dk = demod(Sk, fields[j + 2].carrier);
-          acc += 0.25 * std::norm(dj - dk);
+          const double e = 0.25 * std::norm(dj - dk);
+          acc += e;
           ++n;
+          band_acc[band] += e;
+          ++band_n[band];
         }
       }
-      if (n > 0) ambs.push_back(std::sqrt(static_cast<float>(acc / n)));
+      if (n > 0) {
+        std::vector<float> brms;
+        brms.reserve(band_acc.size());
+        for (size_t b = 0; b < band_acc.size(); ++b)
+          if (band_n[b] > 0)
+            brms.push_back(static_cast<float>(band_acc[b] / band_n[b]));
+        if (!brms.empty()) {
+          const size_t k95 =
+              std::min(brms.size() - 1,
+                       static_cast<size_t>(0.95 * brms.size()));
+          std::nth_element(brms.begin(), brms.begin() + k95, brms.end());
+          ambs.push_back(std::sqrt(brms[k95]));
+        } else {
+          ambs.push_back(std::sqrt(static_cast<float>(acc / n)));
+        }
+      }
     }
     float amb = MedianOf(std::move(ambs));
     // Remove the noise contribution: the triangle-7 demod carries

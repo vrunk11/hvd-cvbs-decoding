@@ -242,6 +242,18 @@ struct HvdConfig {
   float coherence_gate = 0.6F;
   int chunk_frames = 6;
   int chunk_overlap = 2;
+  // Selective 3D (reference: decode_sequence_selective, PORTING.md §21):
+  // full-window 2D decode + the complete 3D machinery re-run on a crop of
+  // the most Y/C-ambiguous tiles only, feather-blended in. Pays off on
+  // LOCALIZED ambiguity (fan grilles, blinds, one textured region in a
+  // flat scene): ~87% of the 3D rainbow fix at ~69% of full-3D time in
+  // the reference measurement — and better global PSNR than full 3D
+  // there, because the flat majority keeps the 2D solve. On diffuse
+  // content the detector finds no worthwhile box and the window degrades
+  // to plain 2D by design (the §19 measurement: no 30% crop captures
+  // more than ~half the gain on diffuse scenes). Off by default.
+  bool selective_3d = false;
+  float selective_max_area = 0.45F;  // fall back to 2D above this fraction
   bool output_fidelity = true;
   bool psi_init = false;
 };
