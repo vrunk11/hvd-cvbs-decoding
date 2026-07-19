@@ -424,6 +424,7 @@ smoothed (a 2D blur dilutes a one-row footprint ~2.5x), floored at
 and their biased-but-informative equations must keep enough mass for
 the joint solve to absorb (hard-gating them cost 4.4 dB of 3D gain on
 the chart). Measured: the reference chart is bit-restored (43.47 /
+40.74 dB), 2-frame-line chroma bands improve ~2-3x under 3D instead of
 degrading, and the visible rainbow metric halves on every band.
 
 ## 10. Deferred items, with reasons
