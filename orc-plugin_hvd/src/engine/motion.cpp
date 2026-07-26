@@ -257,7 +257,32 @@ Plane MotionConfidence(const Plane& A, const Plane& best, int tile) {
   const int th = best.height();
   const int tw = best.width();
 
+  // PARTIAL EDGE TILES. The image is not generally a whole number of tiles
+  // (NTSC active picture: 760 x 242 with tile 32 -> the last tile column is
+  // 24 px wide and the last tile ROW only 18 lines). Both the reference and
+  // this port used to divide every tile's sums by tile*tile regardless, which
+  // is an implicit ZERO-PAD of the missing pixels — and zero-padding a tile
+  // whose content sits at some DC level manufactures variance out of that DC:
+  //   tvar_padded ~ f*E[x^2] - f^2*mean^2, f = n/(tile*tile)
+  // On a flat bright edge tile (E[x^2] ~ mean^2) that is ~f(1-f)*mean^2 of
+  // pure fiction. Measured on this project's own NTSC geometry: the bottom
+  // tile row's `energy` came out 4.1x too large (worst tile 10.6x) while its
+  // SSD `best`, correctly accumulated over real pixels only, was 0.56x — so
+  // best/energy landed ~7x too small and conf = clip(1 - best/energy)
+  // saturated toward 1. The right-hand tile column is milder but the same
+  // sign (~1.2x conf).
+  //
+  // conf feeds NOTHING but the temporal equation weights, which is why this
+  // is invisible in 2D and shows up as over-trusted neighbour equations —
+  // heavy chroma error — along the right and bottom edges in 3D only.
+  //
+  // Fix: normalise by the tile's ACTUAL pixel count, consistently for the
+  // variance and for the best/median ratios (`best` is already a sum over
+  // exactly those pixels). Full interior tiles are bit-identical to before;
+  // only the edge tiles change. NOTE: this is a deliberate divergence from
+  // reference/hvd/decoder.py's _motion_conf, which carries the same bug.
   Plane tmean(th, tw, 0.0F), tvar(th, tw, 0.0F);
+  Plane npix(th, tw, 0.0F);
   {
     Plane sum(th, tw, 0.0F), sum2(th, tw, 0.0F);
     for (int y = 0; y < h; ++y) {
@@ -267,23 +292,24 @@ Plane MotionConfidence(const Plane& A, const Plane& best, int tile) {
         const float v = A.at(y, x);
         sum.at(ty, tx) += v;
         sum2.at(ty, tx) += v * v;
+        npix.at(ty, tx) += 1.0F;
       }
     }
-    const float norm = 1.0F / static_cast<float>(tile * tile);
     for (int i = 0; i < th * tw; ++i) {
+      const float norm = 1.0F / std::max(1.0F, npix[i]);
       tmean[i] = sum[i] * norm;
       tvar[i] = sum2[i] * norm - tmean[i] * tmean[i];
     }
   }
   Plane conf(th, tw);
   for (int i = 0; i < th * tw; ++i) {
-    const float energy = (tvar[i] + 1.0F) * static_cast<float>(tile * tile);
+    const float energy = (tvar[i] + 1.0F) * std::max(1.0F, npix[i]);
     conf[i] = std::clamp(1.0F - best[i] / energy, 0.0F, 1.0F);
   }
 
   std::vector<float> ratios(static_cast<size_t>(th) * tw);
   for (int i = 0; i < th * tw; ++i)
-    ratios[i] = best[i] / static_cast<float>(tile * tile);
+    ratios[i] = best[i] / std::max(1.0F, npix[i]);
   const float med = Median(ratios);
   for (int i = 0; i < th * tw; ++i) {
     const float excess = std::max(0.0F, ratios[i] - med);

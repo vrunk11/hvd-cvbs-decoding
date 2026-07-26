@@ -554,6 +554,31 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
           band_n.push_back(0);
         }
         for (int x = 4; x + 7 < ww; x += 4) {
+          // STATIC MASK (motion robustness). The (d_j - d_{j+2})/2
+          // discriminator below is only valid where the scene is STATIC
+          // between the pair: under motion, true chroma decorrelates
+          // between the fields and the whole moving region reads as
+          // "ambiguity" — measured on real moving content (music video,
+          // frames 5902-5906 of the report that motivated this): the
+          // unmasked measure saturated the strength at 1.5 while a
+          // strength sweep showed every step DOWN from there brought the
+          // moving fine-detail zones back toward the (better) 2D result.
+          // The doc's old claim that "motion only biases the estimate
+          // upward, where the per-pixel gates already protect the result"
+          // did not hold there: at saturated strength the robust gates
+          // demonstrably did not protect (3D measurably worse than 2D
+          // across the frame). Gate the measurement to pixels whose
+          // carrier-free (box-4) means agree within ~3 sigma; the
+          // threshold reuses the just-calibrated nr_eps (= clip(3*sigma))
+          // so a forced nr_eps stays consistent with the gates it feeds.
+          {
+            float mj = 0.0F, mk = 0.0F;
+            for (int k4 = 0; k4 < 4; ++k4) {
+              mj += Sj.at(y, x + k4);
+              mk += Sk.at(y, x + k4);
+            }
+            if (std::fabs(mj - mk) * 0.25F > ccfg.nr_eps) continue;
+          }
           // Triangle-7 (= box4 convolved with box4): a DOUBLE null at the
           // carrier frequency (pi/2 rad/px at 4fsc). The demod shifts
           // ordinary luma to ~pi/2; a single 4-tap null is exact only ON
@@ -583,7 +608,8 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
         std::vector<float> brms;
         brms.reserve(band_acc.size());
         for (size_t b = 0; b < band_acc.size(); ++b)
-          if (band_n[b] > 0)
+          if (band_n[b] >= 8)  // a mostly-masked (moving) band's few
+                               // surviving taps are not a measurement
             brms.push_back(static_cast<float>(band_acc[b] / band_n[b]));
         if (!brms.empty()) {
           const size_t k95 =
@@ -758,6 +784,7 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
       // deterministically: wt *= eps^2 / (eps^2 + (0.5*dS/dline)^2),
       // horizontally smoothed. Even offsets are aligned and untouched.
       Plane vgrad;
+      Plane lapsm;  // per-pixel multiplier on the odd-offset gate floor
       if (has_temporal) {
         bool any_odd = false;
         for (int o : offs) {
@@ -780,6 +807,7 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
           const int hh = S.height();
           const int ww = S.width();
           Plane gmag(hh, ww);
+          Plane lapmag(hh, ww);  // vertical SECOND difference (see below)
           for (int y = 0; y < hh; ++y) {
             const int ym = std::max(0, y - 1);
             const int yp = std::min(hh - 1, y + 1);
@@ -791,27 +819,66 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
               const float mu = dyu * dyu + dcu * dcu;
               const float md = dyd * dyd + dcd * dcd;
               gmag.at(y, x) = std::max(mu, md);
+              // SECOND difference: separates the two things a large vertical
+              // gradient can mean, which the magnitude-only envelope above
+              // conflates (it takes max(mu, md) and discards the SIGNS).
+              //   monotonic ramp/edge -> both fields sample the same
+              //     transition, half a line apart: the odd equation is
+              //     BIASED but informative, and the reference measured 4.4 dB
+              //     of 3-D gain lost by hard-gating it. Laplacian ~ 0.
+              //   single-field-line EXTREMUM -> a feature one frame line
+              //     wide that THIS parity happens to sample and the opposite
+              //     parity samples straight past: the odd equation is not
+              //     biased, it is answering about content it never saw, and
+              //     it does so with a small (hence ungated) residual.
+              //     Laplacian ~ the gradient itself.
+              const float ly = Ys[j].at(y, x) -
+                               0.5F * (Ys[j].at(ym, x) + Ys[j].at(yp, x));
+              const float lc = std::abs(chis[j].at(y, x) -
+                                        0.5F * (chis[j].at(ym, x) +
+                                                chis[j].at(yp, x)));
+              lapmag.at(y, x) = ly * ly + lc * lc;
             }
           }
-          // HORIZONTAL-only smoothing          // HORIZONTAL-only smoothing: a 2D blur dilutes a one-row
+          // HORIZONTAL-only smoothing: a 2D blur dilutes a one-row
           // feature's vertical footprint by ~2.5x and weakens the gate on
           // exactly the detail it protects; vertical coverage already
           // comes free from the one-sided max (the feature row and both
           // its neighbours each carry a full-amplitude diff).
-          vgrad = Plane(hh, ww);
-          for (int y = 0; y < hh; ++y) {
-            float acc = 0.0F;
-            for (int x = 0; x < std::min(5, ww); ++x) acc += gmag.at(y, x);
-            for (int x = 0; x < ww; ++x) {
-              const int lo = x - 2, hi = x + 2;
-              if (x > 0) {
-                if (hi < ww) acc += gmag.at(y, hi);
-                if (lo - 1 >= 0) acc -= gmag.at(y, lo - 1);
+          // Shared sliding-window row smoother, applied to BOTH the
+          // gradient envelope and the second-difference map so their ratio
+          // below is taken on consistently filtered quantities.
+          auto smooth_rows = [&](const Plane& src) {
+            Plane out(hh, ww);
+            for (int y = 0; y < hh; ++y) {
+              // Sliding sum over [x-2, x+2] clipped to the row. The prologue
+              // must prime `acc` with EXACTLY the x = 0 window, i.e. taps
+              // [0, 2] = 3 of them; the loop then adds src[x + 2] once per
+              // step. Priming with 5 taps (as this did) put taps 3 and 4 in
+              // the sum before their steps, and the x = 1 / x = 2 steps then
+              // added them AGAIN — leaving a constant excess of
+              // (src[y][3] + src[y][4]) on the window sum for the WHOLE row,
+              // never subtracted out, so the gate on every column of a line
+              // was inflated by whatever sat at the far LEFT of the active
+              // picture. Measured against the reference's cumsum
+              // formulation: +17% on random content, unbounded when the left
+              // edge carries a strong horizontal transition.
+              float acc = 0.0F;
+              for (int x = 0; x < std::min(3, ww); ++x) acc += src.at(y, x);
+              for (int x = 0; x < ww; ++x) {
+                const int lo = x - 2, hi = x + 2;
+                if (x > 0) {
+                  if (hi < ww) acc += src.at(y, hi);
+                  if (lo - 1 >= 0) acc -= src.at(y, lo - 1);
+                }
+                const int n_taps =
+                    std::min(hi, ww - 1) - std::max(lo, 0) + 1;
+                out.at(y, x) = std::sqrt(acc / static_cast<float>(n_taps));
               }
-              const int n_taps = std::min(hi, ww - 1) - std::max(lo, 0) + 1;
-              vgrad.at(y, x) = std::sqrt(acc / static_cast<float>(n_taps));
             }
-          }
+            return out;
+          };
+          vgrad = smooth_rows(gmag);
           // Noise-floor the envelope: at pass 0 the state is the
           // holographic INIT, whose vertical cross-colour/noise gives a
           // non-zero envelope everywhere — ungated that read as "detail"
@@ -829,6 +896,28 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
             for (size_t i = 0; i < vgrad.size(); ++i)
               vgrad[i] = std::sqrt(
                   std::max(0.0F, vgrad[i] * vgrad[i] - fl2));
+          }
+          // Per-pixel EXTREMUM factor, replacing the fixed floor below.
+          // t = |second difference| / |gradient| is scale-free and separates
+          // the two regimes exactly: a monotonic ramp gives t -> 0 (the
+          // second difference of a straight line vanishes), a one-field-line
+          // spike gives t -> 1 (there the second difference IS the
+          // gradient), and a step edge lands in between at ~0.5. Squaring
+          // keeps step edges close to the reference's behaviour (0.5^2 =
+          // 0.25, so they keep ~75% of the floor and the 4.4 dB the
+          // reference measured there is largely preserved) while driving the
+          // floor to 0 only on true spikes — the case where the opposite
+          // parity never sampled the feature at all and its equation is not
+          // biased but simply uninformed.
+          lapsm = Plane(hh, ww);
+          {
+            Plane t_raw = smooth_rows(lapmag);
+            for (size_t i = 0; i < lapsm.size(); ++i) {
+              const float g = vgrad[i];
+              const float t = g > 1e-6F ? std::clamp(t_raw[i] / g, 0.0F, 1.0F)
+                                        : 0.0F;
+              lapsm[i] = 1.0F - t * t;  // multiplies the floor
+            }
           }
         }
       }
@@ -914,10 +1003,16 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
             // thin-detail protection while leaving the solve enough
             // equation mass to keep absorbing edge bias.
             const float e2 = ccfg.temporal_eps * ccfg.temporal_eps;
+            const float floor_max = std::clamp(ccfg.odd_gate_floor, 0.0F, 1.0F);
             for (size_t i = 0; i < mc.confidence.size(); ++i) {
               const float b = vgrad[i];
+              // Floor is now PER PIXEL: the ceiling from config, scaled by
+              // how much this pixel looks like a monotonic edge (keep the
+              // floor) rather than a one-field-line extremum (drop it).
+              const float floor_i =
+                  floor_max * (lapsm.empty() ? 1.0F : lapsm[i]);
               mc.confidence[i] *=
-                  std::max(0.35F, e2 / (e2 + b * b));
+                  std::max(floor_i, e2 / (e2 + b * b));
             }
           }
           neighbors.push_back(

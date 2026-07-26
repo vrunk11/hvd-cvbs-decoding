@@ -243,6 +243,7 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
   // is unchanged; only the memory traffic is.
   Plane wx(H, W), wy(H, W), wcx(H, W), wcy(H, W);
   Plane wd1(H, W), wd2(H, W);  // oriented-prior diffusivities (mu_d > 0 only)
+  Plane prior_scale(H, W, 1.0F);  // data/prior rebalancing factor (3-D only)
   Plane yc(H, W), tmpr1(H, W), tmpr2(H, W), img(H, W);
   Plane gxY(H, W), gyY(H, W), magx(H, W), magy(H, W);
   ComplexPlane tmpc1(H, W), tmpc2(H, W), tmpc3(H, W), cprior(H, W);
@@ -483,6 +484,60 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
         for (long i = 0; i < n; ++i)
           wt[i] = conf[i] * et2 / (rt[i] * rt[i] + et2);
       }
+
+      // ---- PRIOR RENORMALISATION (data/prior balance) --------------------
+      // Turning 3-D on adds equations to the DATA side of the objective
+      // while the spatial priors keep fixed weights, so it silently
+      // WEAKENS the priors relative to the data — the effective chroma
+      // smoothness drops even where the neighbours contribute nothing
+      // useful. That is not a second-order effect: with Y eliminated, a
+      // pixel's 2-D curvature in chi is |dC|^2/2 (|carrier| = 1), and each
+      // neighbour adds nu*wt_k*|dc_k|^2/2, with |dc_k|^2 = 4 on even
+      // offsets (carrier flipped 180 deg) and 2 on odd ones. Six
+      // neighbours at typical robust weights therefore multiply the data
+      // mass by ~4 — matching the measurement that motivated this: on
+      // moving fine texture (hair strands near f_sc, where the chroma
+      // prior is doing all the work of suppressing cross-colour), 3-D had
+      // to be run with lambda_c ~ 4 just to draw LEVEL with 2-D at
+      // lambda_c = 1. The user was compensating this by hand.
+      //
+      // So scale the prior diffusivities by the same per-pixel factor the
+      // data side just gained:
+      //     k[i] = 1 + nu * sum_j wt_j[i] * |dc_j[i]|^2
+      // Where the robust weights have gated the neighbours off (motion,
+      // occlusion, mismatch) k -> 1 and this is exactly the 2-D solve, so
+      // the graceful per-pixel fallback to 2-D that the robust weights are
+      // supposed to give is now actually TRUE — previously that fallback
+      // still ran with under-weighted priors. Where the neighbours are
+      // trusted, the priors scale up with them and 3-D adds information
+      // without trading away smoothness for it.
+      //
+      // NOTE: deliberate divergence from reference/hvd/decoder.py, which
+      // has no such renormalisation.
+      for (long i = 0; i < n; ++i) prior_scale[i] = 1.0F;
+      for (size_t j = 0; j < n_nbr; ++j) {
+        const Plane& wt = wts[j];
+        const ComplexPlane& dc = dcs[j];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (long i = 0; i < n; ++i)
+          prior_scale[i] += nu * wt[i] * std::norm(dc[i]);
+      }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) {
+        const float k_i = prior_scale[i];
+        wx[i] *= k_i;
+        wy[i] *= k_i;
+        wcx[i] *= k_i;
+        wcy[i] *= k_i;
+        if (mu_d > 0.0F) {
+          wd1[i] *= k_i;
+          wd2[i] *= k_i;
+        }
+      }
     }
 
     // Conjugate gradient on the fixed-weight quadratic.
@@ -566,6 +621,7 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
   // ---- Workspace, allocated once (same rationale as VariationalRefine) ----
   Plane wx(H, W), wy(H, W), wcx(H, W), wcy(H, W);
   Plane wd1(H, W), wd2(H, W);  // oriented-prior diffusivities (mu_d > 0 only)
+  Plane prior_scale(H, W, 1.0F);  // data/prior rebalancing factor (3-D only)
   Plane gxY(H, W), gyY(H, W), magx(H, W), magy(H, W);
   Plane tmpr1(H, W), tmpr2(H, W);
   ComplexPlane tmpc1(H, W), tmpc2(H, W), tmpc3(H, W), cprior(H, W);
@@ -799,6 +855,37 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
         for (long i = 0; i < n; ++i) {
           const float rkv = nbr.composite[i] - Y[i] - (chi[i] * nbr.carrier[i]).real();
           wt[i] = nbr.confidence[i] * et2 / (rkv * rkv + et2);
+        }
+      }
+
+      // ---- PRIOR RENORMALISATION (see VariationalRefine for the full
+      // rationale and the measurement). Same imbalance, different base:
+      // here Y is a FREE unknown, so the base data term r0 = S - Y -
+      // Re[chi*carrier] carries unit weight explicitly and each neighbour
+      // adds nu*wt_k of the same shape (its carrier is a unit phasor, so
+      // the leverage on (Y, chi) is the same as the base term's — no
+      // |dc|^2 factor here, unlike the Y-eliminated solver). The anchor is
+      // NOT counted: it is itself a prior, not data.
+      for (long i = 0; i < n; ++i) prior_scale[i] = 1.0F;
+      for (size_t j = 0; j < n_nbr; ++j) {
+        const Plane& wt = wts[j];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (long i = 0; i < n; ++i) prior_scale[i] += nu * wt[i];
+      }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long i = 0; i < n; ++i) {
+        const float k_i = prior_scale[i];
+        wx[i] *= k_i;
+        wy[i] *= k_i;
+        wcx[i] *= k_i;
+        wcy[i] *= k_i;
+        if (mu_d > 0.0F) {
+          wd1[i] *= k_i;
+          wd2[i] *= k_i;
         }
       }
     }

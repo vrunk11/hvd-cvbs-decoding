@@ -256,6 +256,21 @@ struct HvdConfig {
   bool trajectory_fit = true;
   bool extended_temporal = true;  // decode_sequence: also use fields f±3
   float coherence_gate = 0.6F;
+  // Floor of the half-line envelope gate on ODD (opposite-parity) temporal
+  // offsets. The gate is wt *= max(odd_gate_floor, eps_t^2/(eps_t^2 + b^2)),
+  // so this is the fraction of an equation's weight that survives even where
+  // the envelope says the opposite-parity field CANNOT see the feature.
+  // 0.35 is the reference's compromise: hard-gating cost it 4.4 dB of 3-D
+  // gain on step-edge-heavy content (saturated charts), where the odd
+  // equations are biased but still informative. That compromise inverts on
+  // content made ENTIRELY of sub-frame-line detail — hair, fur, fine fabric,
+  // blinds — where every odd equation is voting on a feature its own field
+  // never sampled, and the surviving 35% is 35% of a known-wrong answer with
+  // a small (hence ungated) residual. Lower it toward 0 for such material;
+  // 0 disables the odd offsets wherever vertical structure is present, which
+  // costs 3-D gain on flat/edge content but removes the failure mode
+  // outright. Content-dependent by nature — hence a dial, not a constant.
+  float odd_gate_floor = 0.35F;
   int chunk_frames = 6;
   int chunk_overlap = 2;
   // Selective 3D (reference: decode_sequence_selective, PORTING.md §21):

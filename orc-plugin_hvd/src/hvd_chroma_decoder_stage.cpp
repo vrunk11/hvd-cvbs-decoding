@@ -55,6 +55,8 @@ constexpr const char* kTemporalStrength = "temporal_strength";
 constexpr const char* kMcTile = "mc_tile";
 constexpr const char* kMcSearch = "mc_search";
 constexpr const char* kNrAnchor = "nr_anchor";
+constexpr const char* kOddGateFloor = "odd_gate_floor";
+constexpr const char* kCoherenceGate = "coherence_gate";
 constexpr const char* kOutputPath = "output_path";
 
 // BT.601-ish YUV -> RGB, same matrix as engine/colour.cpp's YuvToRgb16 but
@@ -884,6 +886,20 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
     };
 
     return {
+        ParameterDescriptor{kOddGateFloor, "Odd-offset gate floor",
+            "Weight kept on opposite-parity (odd) neighbour equations where "
+            "the half-line envelope says that field cannot see the feature. "
+            "CEILING of an automatic per-pixel floor: the value is scaled "
+            "down where the field's vertical profile is a one-line EXTREMUM "
+            "(hair, fur, fine fabric — the opposite parity never sampled the "
+            "feature, so its equation is uninformed) and kept where it is a "
+            "monotonic edge (both fields see it; the equation is biased but "
+            "informative). Leave at 0.35 unless diagnosing.",
+            ParameterType::DOUBLE, real(0.0, 1.0, 0.35)},
+        ParameterDescriptor{kCoherenceGate, "Coherence gate",
+            "InSAR-style complex-coherence gating of the temporal equations. "
+            "0 disables it; higher trusts the coherence measurement more.",
+            ParameterType::DOUBLE, real(0.0, 1.0, 0.6)},
         ParameterDescriptor{kLambdaC, "Chroma smoothness",
             "Arbitration prior. Higher = smoother chroma (less rainbowing); "
             "lower = sharper chroma.",
@@ -1085,6 +1101,8 @@ HvdChromaDecoderStage::get_parameters() const
         {kCgIterations, static_cast<int32_t>(config_.cg_iterations)},
         {kFast, config_.fast},
         {kNrAnchor, static_cast<double>(config_.nr_anchor)},
+        {kOddGateFloor, static_cast<double>(config_.odd_gate_floor)},
+        {kCoherenceGate, static_cast<double>(config_.coherence_gate)},
         {kCgTol, static_cast<double>(config_.cg_tol)},
         {kBidirectional, config_.bidirectional},
         {kSelective3d, config_.selective_3d},
@@ -1142,6 +1160,8 @@ bool HvdChromaDecoderStage::set_parameters(
     get_int(kCgIterations, config_.cg_iterations);
     get_bool(kFast, config_.fast);
     get_double(kNrAnchor, config_.nr_anchor);
+    get_double(kOddGateFloor, config_.odd_gate_floor);
+    get_double(kCoherenceGate, config_.coherence_gate);
     get_double(kCgTol, config_.cg_tol);
     get_bool(kBidirectional, config_.bidirectional);
     get_bool(kSelective3d, config_.selective_3d);
