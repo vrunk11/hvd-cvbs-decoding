@@ -30,6 +30,8 @@ constexpr float kIreWhite = 100.0F;
 // 20 IRE burst. `median_burst_amplitude_ire` is the measured value (see
 // BurstAmplitudeIre). Clamped to [0.5, 2.0], matching the reference.
 float AccGain(float median_burst_amplitude_ire);
+// Standard-aware overload: PAL nominal burst is 21.43 IRE, NTSC 20.
+float AccGain(float median_burst_amplitude_ire, float nominal_ire);
 
 // Convert one pixel of IRE-domain (Y, U, V) to 16-bit RGB. `black_ire` is 7.5
 // for NTSC-M or 0.0 for NTSC-J. Values are clipped to [0, 1] then scaled.

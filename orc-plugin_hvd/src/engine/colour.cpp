@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace hvd {
 
@@ -17,8 +18,12 @@ constexpr float kYuvToRgb[3][3] = {
 }  // namespace
 
 float AccGain(float median_burst_amplitude_ire) {
+  return AccGain(median_burst_amplitude_ire, 20.0F);
+}
+
+float AccGain(float median_burst_amplitude_ire, float nominal_ire) {
   const float denom = std::max(median_burst_amplitude_ire, 1.0F);
-  return std::clamp(20.0F / denom, 0.5F, 2.0F);
+  return std::clamp(nominal_ire / denom, 0.5F, 2.0F);
 }
 
 std::array<uint16_t, 3> YuvToRgb16(float y, float u, float v, float black_ire) {

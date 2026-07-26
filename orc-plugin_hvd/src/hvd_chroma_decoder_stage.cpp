@@ -7,6 +7,7 @@
 
 #include "hvd_chroma_decoder_stage.h"
 
+#include <cstdint>
 #include <orc/stage/cvbs_signal_constants.h>
 
 #include <algorithm>
@@ -47,6 +48,8 @@ constexpr const char* kMonochrome = "monochrome";
 constexpr const char* kSymmetryVariant = "symmetry_variant";
 constexpr const char* kChromaPhaseDeg = "chroma_phase_deg";
 constexpr const char* kFftThreads = "fft_threads";
+constexpr const char* kPreviewFullRaster = "preview_full_raster";
+constexpr const char* kPreviewFieldView = "preview_field_view";
 constexpr const char* kEnableTemporal = "enable_temporal";
 constexpr const char* kTemporalStrength = "temporal_strength";
 constexpr const char* kMcTile = "mc_tile";
@@ -121,6 +124,12 @@ HvdDecodedRepresentation::HvdDecodedRepresentation(
                        ? static_cast<float>(sp.chroma_dc_offset)
                        : static_cast<float>(sp.blanking_level);
     fp.sample_rate = sample_rate_from_system(sp.system);
+    // 625-line PAL family only (see FrameParams::is_pal). PAL_M stays on
+    // the NTSC path deliberately — it carries PAL-type chroma on NTSC
+    // line geometry and needs its own carrier derivation before the
+    // engine can claim it (the effective-carrier machinery is ready; the
+    // line-advance and burst model are not derived for it yet).
+    fp.is_pal = (sp.system == VideoSystem::PAL);
     return fp;
 }
 
@@ -226,7 +235,8 @@ const ::hvd::YcFrameS16* HvdDecodedRepresentation::colour_planes(
 // fed by the cached decoded() or by a parallel-export worker's own decode.
 HvdDecodedRepresentation::WovenActivePicture
 HvdDecodedRepresentation::ReorderToWoven(const ::hvd::YcFrameS16& yc,
-                                         const ::hvd::FrameParams& fp)
+                                         const ::hvd::FrameParams& fp,
+                                         bool full_raster, int field)
 {
     WovenActivePicture out;
     if (yc.luma.empty()) return out;
@@ -244,12 +254,57 @@ HvdDecodedRepresentation::ReorderToWoven(const ::hvd::YcFrameS16& yc,
     // reading componentFrame->y(y)/u(y)/v(y) after Comb's own field weave).
     const int fw = fp.frame_width;
     const int f1 = fp.field1_lines;
-    const int a0 = std::max(0, fp.active_video_start);
-    const int a1 = fp.active_video_end > a0 ? fp.active_video_end : fw;
-    const int y0 = std::max(0, fp.first_active_frame_line);
-    const int y1 = fp.last_active_frame_line > y0 ? fp.last_active_frame_line
-                                                    : fp.frame_height;
+    // full_raster: no crop at all — the luma plane's margins carry the RAW
+    // composite (frame_bridge fills the whole plane with the source samples
+    // before overwriting the active region with decoded Y; chroma is zero
+    // there), so sync/burst/blanking render as monochrome signal. That is
+    // the point: an un-cropped view for judging geometry and burst.
+    const int a0 = full_raster ? 0 : std::max(0, fp.active_video_start);
+    const int a1 = full_raster
+                       ? fw
+                       : (fp.active_video_end > a0 ? fp.active_video_end : fw);
+    const int y0 = full_raster ? 0 : std::max(0, fp.first_active_frame_line);
+    const int y1 = full_raster ? fp.frame_height
+                               : (fp.last_active_frame_line > y0
+                                      ? fp.last_active_frame_line
+                                      : fp.frame_height);
     const uint32_t width = static_cast<uint32_t>(std::max(0, a1 - a0));
+
+    if (field == 0 || field == 1) {
+        // SINGLE-FIELD view: each output row is one field line, native
+        // height, no interpolation and no weave — per-field artefacts
+        // (dropouts, PAL V-switch/Hanover checks, weave errors) show
+        // exactly as the solver saw them. Frame line = 2*field_line+field;
+        // keep those inside [y0, y1).
+        std::vector<int> flats;
+        const int nfl = (field == 0) ? f1 : (fp.frame_height - f1);
+        for (int fl_line = 0; fl_line < nfl; ++fl_line) {
+            const int frame_line = 2 * fl_line + field;
+            if (frame_line < y0 || frame_line >= y1) continue;
+            flats.push_back(field == 0 ? fl_line : f1 + fl_line);
+        }
+        const uint32_t height = static_cast<uint32_t>(flats.size());
+        if (width == 0 || height == 0) return out;
+        out.width = width;
+        out.height = height;
+        out.y.assign(static_cast<size_t>(width) * height, 0.0);
+        out.u.assign(static_cast<size_t>(width) * height, 0.0);
+        out.v.assign(static_cast<size_t>(width) * height, 0.0);
+        for (uint32_t row = 0; row < height; ++row) {
+            const int flat_line = flats[row];
+            for (uint32_t col = 0; col < width; ++col) {
+                const int flat_col = a0 + static_cast<int>(col);
+                const size_t src =
+                    static_cast<size_t>(flat_line) * fw + flat_col;
+                const size_t dst = static_cast<size_t>(row) * width + col;
+                out.y[dst] = static_cast<double>(yc.luma[src]);
+                out.u[dst] = yc.u_plane[src];
+                out.v[dst] = yc.v_plane[src];
+            }
+        }
+        return out;
+    }
+
     const uint32_t height = static_cast<uint32_t>(std::max(0, y1 - y0));
     if (width == 0 || height == 0) return out;
 
@@ -287,12 +342,14 @@ HvdDecodedRepresentation::woven_active_picture(FrameID id) const
 }
 
 std::optional<ColourFrameCarrier> HvdDecodedRepresentation::build_colour_carrier(
-    FrameID id) const
+    FrameID id, bool full_raster, int field) const
 {
     const ::hvd::FrameParams fp = frame_params();
     if (fp.frame_width <= 0 || fp.frame_height <= 0) return std::nullopt;
 
-    const WovenActivePicture pic = woven_active_picture(id);
+    const ::hvd::YcFrameS16* yc = colour_planes(id);
+    if (!yc) return std::nullopt;
+    const WovenActivePicture pic = ReorderToWoven(*yc, fp, full_raster, field);
     if (pic.width == 0 || pic.height == 0) return std::nullopt;
 
     ColourFrameCarrier carrier;
@@ -300,6 +357,24 @@ std::optional<ColourFrameCarrier> HvdDecodedRepresentation::build_colour_carrier
     carrier.frame_index = id;
     carrier.width = pic.width;
     carrier.height = pic.height;
+    // Mark the WHOLE delivered image active, in every mode. The reason is
+    // an inconsistency between two host analysis tools, both verified:
+    //
+    //  * vectorscope_analysis.cpp treats active_x/y_start as ABSOLUTE plane
+    //    indices (sample_index = y * width + x, x from active_x_start);
+    //  * preview_view_registry.cpp's histogram documents the opposite —
+    //    plane[0] IS the first active pixel, only the DIFFERENCE is usable
+    //    — because the chroma sink always delivers pre-cropped planes.
+    //
+    // ColourFrameCarrier has no flag to say which convention a given
+    // carrier follows, so no single choice satisfies both. Marking the
+    // full delivered extent makes BOTH tools iterate the whole delivered
+    // image: in full-raster mode that means sync/blanking are included
+    // (luma distribution reads low), which is a graceful degradation.
+    // Marking the true active window instead would keep the vectorscope
+    // exact but make the histogram analyse a same-sized rectangle from the
+    // top-left corner — i.e. mostly sync — which is garbage, not
+    // degradation. Turn "Preview: full raster" OFF for measurement work.
     carrier.active_x_start = 0;
     carrier.active_x_end = pic.width;
     carrier.active_y_start = 0;
@@ -316,6 +391,46 @@ std::optional<ColourFrameCarrier> HvdDecodedRepresentation::build_colour_carrier
 }
 
 // static — pure RGB conversion + write, no cache/engine/source access.
+// Same conversion as WriteWovenAsRgb24, into an in-memory PreviewImage
+// instead of a stream — used by the IStageCustomPreviewRenderer views.
+PreviewImage HvdDecodedRepresentation::WovenToPreviewImage(
+    const WovenActivePicture& pic, const ::hvd::FrameParams& fp)
+{
+    PreviewImage img;
+    if (fp.white_level <= fp.black_level) return img;
+    if (pic.width == 0 || pic.height == 0) return img;
+
+    img.width = pic.width;
+    img.height = pic.height;
+    img.rgb_data.resize(static_cast<size_t>(pic.width) * pic.height * 3);
+
+    const double range = fp.white_level - fp.black_level;
+    for (uint32_t row = 0; row < pic.height; ++row) {
+        for (uint32_t col = 0; col < pic.width; ++col) {
+            const size_t i = static_cast<size_t>(row) * pic.width + col;
+            const double ny = (pic.y[i] - fp.black_level) / range;
+            const double nu = pic.u[i] / range;
+            const double nv = pic.v[i] / range;
+            const auto rgb = YuvToRgb8(ny, nu, nv);
+            const size_t o = i * 3;
+            img.rgb_data[o + 0] = rgb[0];
+            img.rgb_data[o + 1] = rgb[1];
+            img.rgb_data[o + 2] = rgb[2];
+        }
+    }
+    return img;
+}
+
+PreviewImage HvdDecodedRepresentation::render_custom_preview(
+    FrameID id, bool full_raster, int field) const
+{
+    const ::hvd::FrameParams fp = frame_params();
+    const ::hvd::YcFrameS16* yc = colour_planes(id);
+    if (!yc) return {};
+    const WovenActivePicture pic = ReorderToWoven(*yc, fp, full_raster, field);
+    return WovenToPreviewImage(pic, fp);
+}
+
 bool HvdDecodedRepresentation::WriteWovenAsRgb24(
     const WovenActivePicture& pic, const ::hvd::FrameParams& fp,
     std::ostream& out)
@@ -487,10 +602,10 @@ NodeTypeInfo HvdChromaDecoderStage::get_node_type_info() const
 {
     return NodeTypeInfo{
         NodeType::SINK, "hvd_chroma_decoder", "HVD Chroma Decoder",
-        "Holographic-variational NTSC Y/C separator (experimental). "
+        "Holographic-variational NTSC/PAL Y/C separator (experimental). "
         "Colour preview only — no downstream Y/C representation; use "
         "'Export' to write a raw RGB24 file directly.",
-        1, 1, 0, 0, VideoFormatCompatibility::NTSC_ONLY,
+        1, 1, 0, 0, VideoFormatCompatibility::ALL,  // NTSC + PAL (see plugin.h note)
         SinkCategory::THIRD_PARTY, "Chroma decode"};
 }
 
@@ -838,6 +953,24 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             ParameterType::DOUBLE, real(0.0, 10.0, 1.0)},
         ParameterDescriptor{kMonochrome, "Monochrome",
             "Zero the chroma channel.", ParameterType::BOOL, boolean(false)},
+        ParameterDescriptor{kPreviewFullRaster, "Preview: full raster",
+            "PREVIEW ONLY (never affects the exported/written frames, which "
+            "always honour the configured VideoParameters crop). ON: show "
+            "the whole stored raster — sync, blanking and the colour burst "
+            "appear as monochrome signal in the margins, decoded colour "
+            "stays confined to the active area. OFF: crop to the active "
+            "picture, matching the export. Turn OFF if you need the "
+            "histogram/vectorscope panels to read only the active picture.",
+            ParameterType::BOOL, boolean(true)},
+        ParameterDescriptor{kPreviewFieldView, "Preview: field view",
+            "PREVIEW ONLY. Navigate per FIELD instead of per woven frame: "
+            "each item is one field at native field height (one row per "
+            "field line, no interpolation). The honest view for per-field "
+            "artefacts — dropouts, weave/field-order errors, PAL "
+            "V-switch/Hanover checks — that the frame weave smears across "
+            "two fields. Item 2n is frame n's field 1, item 2n+1 its "
+            "field 2.",
+            ParameterType::BOOL, boolean(false)},
         ParameterDescriptor{kSymmetryVariant, "Spectral-symmetry init",
             "Add the Transform-NTSC certified-chroma init variant.",
             ParameterType::BOOL, boolean(false)},
@@ -963,6 +1096,8 @@ HvdChromaDecoderStage::get_parameters() const
         {kAcc, config_.acc},
         {kChromaGain, static_cast<double>(config_.chroma_gain)},
         {kMonochrome, config_.monochrome},
+        {kPreviewFullRaster, preview_full_raster_},
+        {kPreviewFieldView, preview_field_view_},
         {kSymmetryVariant, config_.symmetry_variant},
         {kChromaPhaseDeg, static_cast<double>(config_.chroma_phase_deg)},
         {kFftThreads, static_cast<int32_t>(config_.fft_threads)},
@@ -1018,6 +1153,8 @@ bool HvdChromaDecoderStage::set_parameters(
     get_bool(kAcc, config_.acc);
     get_double(kChromaGain, config_.chroma_gain);
     get_bool(kMonochrome, config_.monochrome);
+    get_bool(kPreviewFullRaster, preview_full_raster_);
+    get_bool(kPreviewFieldView, preview_field_view_);
     get_bool(kSymmetryVariant, config_.symmetry_variant);
     get_double(kChromaPhaseDeg, config_.chroma_phase_deg);
     get_int(kFftThreads, config_.fft_threads);
@@ -1027,7 +1164,18 @@ bool HvdChromaDecoderStage::set_parameters(
     get_int(kMcSearch, config_.mc_search);
     get_string(kOutputPath, output_path_);
 
-    cached_output_.reset();
+    // Preview view toggles change WHAT the preview shows, not what is
+    // decoded — dropping cached_output_ for them would re-run the whole
+    // (expensive) decode just to re-view the same frames.
+    bool preview_only = !params.empty();
+    for (const auto& [key, value] : params) {
+        (void)value;
+        if (key != kPreviewFullRaster && key != kPreviewFieldView) {
+            preview_only = false;
+            break;
+        }
+    }
+    if (!preview_only) cached_output_.reset();
     refresh_status();
     return true;
 }
@@ -1064,6 +1212,29 @@ StagePreviewCapability HvdChromaDecoderStage::get_preview_capability() const
         is_pal ? VideoDataType::ColourPAL : VideoDataType::ColourNTSC;
     capability.supported_data_types = {colour_type};
 
+    // GEOMETRY SEMANTICS — matched to the SDK's own reference stage
+    // (PreviewHelpers::make_signal_preview_capability), because getting
+    // these two wrong is what made the preview render at a visibly
+    // different aspect than tbc_source:
+    //
+    //  * geometry.active_* describes the ACTIVE PICTURE — metadata used
+    //    for aspect handling and export dimensions. It is NOT the size of
+    //    the image we deliver: the reference reports the active area
+    //    (e.g. 768x483) while DELIVERING the full frame (910x525). An
+    //    earlier revision reported the delivered full-raster size here,
+    //    so the GUI's "4:3 (Display)" mode was reasoning about a 1.73
+    //    picture instead of a 1.33 one.
+    //
+    //  * dar_correction_factor is the signal's PIXEL ASPECT RATIO, and
+    //    cvbs_signal_constants.h is explicit that it must NOT be derived
+    //    from a source's actual active-area values ("changing the active
+    //    window would rescale the whole preview instead of re-framing
+    //    it"). standard_dar_correction() is the canonical per-system
+    //    value; using it is also what keeps this stage's preview
+    //    dimensionally identical to tbc_source's.
+    //
+    // Both are therefore independent of the preview view toggles: those
+    // change which pixels are delivered, not the shape of a pixel.
     const auto active_width =
         params->active_video_end > params->active_video_start
             ? static_cast<uint32_t>(params->active_video_end - params->active_video_start)
@@ -1073,16 +1244,14 @@ StagePreviewCapability HvdChromaDecoderStage::get_preview_capability() const
             ? static_cast<uint32_t>(params->last_active_frame_line - params->first_active_frame_line)
             : static_cast<uint32_t>(params->frame_height);
 
-    double dar_correction = 1.0;
-    if (active_width > 0 && active_height > 0) {
-        const double active_ratio =
-            static_cast<double>(active_width) / static_cast<double>(active_height);
-        dar_correction = (4.0 / 3.0) / active_ratio;
-    }
+    const double dar_correction = standard_dar_correction(params->system);
 
-    capability.navigation_extent.item_count = cached_output_->frame_count();
+    capability.navigation_extent.item_count =
+        preview_field_view_ ? 2 * cached_output_->frame_count()
+                            : cached_output_->frame_count();
     capability.navigation_extent.granularity = 1;
-    capability.navigation_extent.item_label = "frame";
+    capability.navigation_extent.item_label =
+        preview_field_view_ ? "field" : "frame";
     capability.geometry.active_width = active_width;
     capability.geometry.active_height = active_height;
     capability.geometry.display_aspect_ratio = 4.0 / 3.0;
@@ -1096,7 +1265,99 @@ std::optional<ColourFrameCarrier> HvdChromaDecoderStage::get_colour_preview_carr
     (void)hint;
     auto repr = std::dynamic_pointer_cast<const HvdDecodedRepresentation>(cached_output_);
     if (!repr) return std::nullopt;
-    return repr->build_colour_carrier(static_cast<FrameID>(frame_index));
+    if (preview_field_view_) {
+        // Navigation items are FIELDS: item 2n is frame n's field 1, item
+        // 2n+1 its field 2 — temporal order, so stepping walks fields in
+        // time. This is the SDK's own documented use of navigation_extent
+        // ("Field 42 of 400" vs "Frame 21 of 200"), not an invention.
+        const FrameID frame = static_cast<FrameID>(frame_index / 2);
+        const int field = static_cast<int>(frame_index % 2);
+        return repr->build_colour_carrier(frame, preview_full_raster_, field);
+    }
+    return repr->build_colour_carrier(static_cast<FrameID>(frame_index),
+                                      preview_full_raster_, -1);
+}
+
+namespace {
+constexpr const char* kOptFrame = "frame";
+constexpr const char* kOptField1 = "field1";
+constexpr const char* kOptField2 = "field2";
+constexpr const char* kOptFullRaster = "full_raster";
+}  // namespace
+
+// IStageCustomPreviewRenderer. See the header's doc comment on why the
+// host's current dispatch does not reach this for a stage that also
+// implements IStagePreviewCapability (verified against
+// preview_renderer.cpp: get_available_outputs()'s "else if" on
+// IStageCustomPreviewRenderer is only tried when dynamic_cast to
+// IStagePreviewCapability fails, and this stage's capability path always
+// succeeds). Implemented in full anyway, matching the pattern
+// SourceAlignStage already uses (also currently unreachable there, for the
+// identical reason) — this is the SDK-documented way to add views, and
+// it's what a small, mechanical host-side merge of the two option lists
+// needs in order to work: nothing here needs to change when that lands.
+std::vector<PreviewOption> HvdChromaDecoderStage::get_preview_options() const
+{
+    std::vector<PreviewOption> options;
+    auto repr = std::dynamic_pointer_cast<const HvdDecodedRepresentation>(cached_output_);
+    if (!repr) return options;
+    const ::hvd::FrameParams fp = repr->frame_params_public();
+    if (fp.frame_width <= 0 || fp.frame_height <= 0 ||
+        !cached_output_ || cached_output_->frame_count() == 0) {
+        return options;
+    }
+    const uint64_t frames = cached_output_->frame_count();
+    const auto a0 = std::max(0, fp.active_video_start);
+    const auto a1 = fp.active_video_end > a0 ? fp.active_video_end : fp.frame_width;
+    const auto y0 = std::max(0, fp.first_active_frame_line);
+    const auto y1 = fp.last_active_frame_line > y0 ? fp.last_active_frame_line
+                                                    : fp.frame_height;
+    const uint32_t aw = static_cast<uint32_t>(std::max(0, a1 - a0));
+    const uint32_t ah = static_cast<uint32_t>(std::max(0, y1 - y0));
+
+    // NOTE: no "Frame" entry here. The carrier path already contributes
+    // exactly one output named "Frame" (get_capability_preview_outputs()
+    // hardcodes it), and after patches/0001 merges the two lists a second
+    // frame entry would just be a confusing duplicate. render_preview()
+    // still handles kOptFrame as its fallback, so nothing breaks if a
+    // caller asks for it explicitly.
+    //
+    // Single-field views, native field height, no interpolation — the
+    // honest view for per-field artefacts (dropouts, weave/field-order
+    // errors, PAL V-switch/Hanover checks) the frame weave smears across
+    // two fields.
+    // Canonical per-system pixel aspect, same source of truth as the
+    // capability path (see the geometry comment there).
+    const auto vp = cached_output_->get_video_parameters();
+    const double dar = standard_dar_correction(
+        vp.has_value() ? vp->system : VideoSystem::NTSC);
+    options.push_back({kOptField1, "Field 1", true, aw, (ah + 1) / 2, frames, dar});
+    options.push_back({kOptField2, "Field 2", true, aw, ah / 2, frames, dar});
+    // Full raster: sync/blanking/burst visible as monochrome signal in the
+    // margins (decoded colour stays confined to the active area) — for
+    // checking geometry and the burst window, not for measurement (see the
+    // README's note on vectorscope/histogram behaviour in this mode).
+    options.push_back({kOptFullRaster, "Frame (full raster)", true,
+                       static_cast<uint32_t>(fp.frame_width),
+                       static_cast<uint32_t>(fp.frame_height), frames, dar});
+    return options;
+}
+
+PreviewImage HvdChromaDecoderStage::render_preview(
+    const std::string& option_id, uint64_t index,
+    PreviewNavigationHint hint) const
+{
+    (void)hint;
+    auto repr = std::dynamic_pointer_cast<const HvdDecodedRepresentation>(cached_output_);
+    if (!repr) return {};
+    const FrameID id = static_cast<FrameID>(index);
+    if (option_id == kOptField1)
+        return repr->render_custom_preview(id, /*full_raster=*/false, 0);
+    if (option_id == kOptField2)
+        return repr->render_custom_preview(id, /*full_raster=*/false, 1);
+    if (option_id == kOptFullRaster)
+        return repr->render_custom_preview(id, /*full_raster=*/true, -1);
+    return repr->render_custom_preview(id, /*full_raster=*/false, -1);  // kOptFrame + fallback
 }
 
 }  // namespace orc::plugins::hvd

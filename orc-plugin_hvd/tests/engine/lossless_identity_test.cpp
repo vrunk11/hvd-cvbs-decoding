@@ -6,6 +6,7 @@
 // from a known (Y, chi), run the holographic init and the variational solver,
 // and check both stages preserve the identity.
 
+#include <algorithm>
 #include <cmath>
 #include <random>
 

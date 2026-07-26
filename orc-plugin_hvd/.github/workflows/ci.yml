@@ -11,7 +11,25 @@ permissions:
   contents: write
 
 jobs:
+  # Fast hermetic job: numerical core + engine tests only (no decode-orc
+  # SDK checkout, no Nix). Catches engine regressions — including the PAL
+  # lock-in / effective-carrier tests — in ~2 minutes, before the full
+  # matrix spends its time. Needs only cmake + g++ + fftw3f.
+  engine-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFTW (single precision) 
+        run: sudo apt-get update && sudo apt-get install -y libfftw3-dev cmake ninja-build
+      - name: Configure (engine only)
+        run: cmake -S . -B build-engine -G Ninja -DHVD_ENGINE_ONLY=ON -DBUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build-engine --parallel
+      - name: Test
+        run: ctest --test-dir build-engine --output-on-failure
+
   build-test-package:
+    needs: engine-tests
     runs-on: ${{ matrix.os }}
     env:
       ORC_SDK_DIR: ${{ github.workspace }}/decode-orc
@@ -81,10 +99,6 @@ jobs:
         run: |
           nix develop --accept-flake-config --command \
             cmake -S . -B build $ORC_CMAKE_ARGS
-
-      - name: Install fmt (Windows)
-        if: runner.os == 'Windows'
-        run: vcpkg install fmt:x64-windows
 
       - name: Configure (native)
         if: ${{ !matrix.use_nix }}

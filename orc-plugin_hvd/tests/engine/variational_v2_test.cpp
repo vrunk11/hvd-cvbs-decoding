@@ -11,6 +11,7 @@
 //     algorithm, cheaper logistics", so its result must stay close to the
 //     slow solve on the same input.
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 

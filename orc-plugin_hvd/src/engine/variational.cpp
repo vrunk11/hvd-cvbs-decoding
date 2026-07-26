@@ -130,23 +130,34 @@ double DotRealPlane(const Plane& a, const Plane& b) {
 static float ResolveChromaAniso(const ComplexPlane& chi0,
                                 const HvdConfig& cfg) {
   if (cfg.chroma_aniso > 0.0F) return cfg.chroma_aniso;
-  // Measure on LINE-PAIR AVERAGES, not raw chi0: the init's dominant
-  // vertical energy is cross-colour LEAK, which alternates sign every
-  // line (the carrier flips 180 deg per field line, so leaked luma
-  // enters chi0 with alternating polarity) — on a colour-bar chart that
-  // alternation made |Dy chi0| read as large as the bar transitions
-  // themselves (py ~ px measured) and auto wrongly picked ~1.0.
-  // Averaging adjacent line pairs cancels the alternating leak exactly
-  // while genuine chroma structure (slow vertically, and even a
-  // 1-frame-line feature at half amplitude) survives.
-  const int Hh = chi0.height() / 2;
+  // Measure on LINE-GROUP AVERAGES, not raw chi0: the init's dominant
+  // vertical energy is cross-colour LEAK, which alternates line to line
+  // — on a colour-bar chart that alternation made |Dy chi0| read as
+  // large as the bar transitions themselves (py ~ px measured) and auto
+  // wrongly picked ~1.0. Averaging cancels the leak while genuine chroma
+  // structure (slow vertically, and even a 1-frame-line feature at
+  // reduced amplitude) survives.
+  //
+  // The GROUP SIZE is standard-dependent, and this is not cosmetic:
+  //   NTSC: conj(c) alternates SIGN only (carrier flips 180 deg per
+  //         field line) -> a 2-line average cancels the leak exactly.
+  //   PAL : conj(c) alternates sign AND CONJUGATION (the V-switch is a
+  //         conjugated reference wave — reference-pal/THEORY-PAL.md
+  //         section 1), and the carrier walks 270 deg/line. A 2-line
+  //         average does NOT cancel it; a 4-line average does (the
+  //         conjugation pattern repeats over 2 lines, and 4 * 270 =
+  //         1080 = 0 mod 360 closes the carrier walk).
+  const int group = cfg.is_pal ? 4 : 2;
+  const int Hh = chi0.height() / group;
   const int Wc = chi0.width();
   std::vector<float> gx;
   std::vector<float> gy;
   gx.reserve(static_cast<size_t>(Hh) * Wc / 9 + 1);
   gy.reserve(gx.capacity());
   auto pav = [&](int t, int x) {
-    return 0.5F * (chi0.at(2 * t, x) + chi0.at(2 * t + 1, x));
+    Complex acc{0.0F, 0.0F};
+    for (int k = 0; k < group; ++k) acc += chi0.at(group * t + k, x);
+    return acc * (1.0F / static_cast<float>(group));
   };
   for (int t = 1; t < Hh; t += 2) {
     for (int x = 1; x < Wc; x += 3) {
@@ -176,6 +187,11 @@ static float ResolveChromaAniso(const ComplexPlane& chi0,
   // pair-averaging only partly cancels (the Dubois init's leak is not a
   // pure line-alternation) — while the thin-line/curtain scenes (want
   // 1.0) read r ~ 1.6-1.9. The 1.3 knee sits between the two families.
+  // PAL carries U and V at the same ~1.3 MHz (no NTSC I/Q axis
+  // asymmetry), so its floor sits nearer isotropy: the research maps
+  // into [0.55, 1.0] with a gentler slope (reference-pal/THEORY-PAL.md
+  // section 3). NTSC keeps the measured-on-real-footage 0.5 knee.
+  if (cfg.is_pal) return std::clamp(0.7F + 0.9F * (r - 1.3F), 0.55F, 1.0F);
   return std::clamp(0.5F + 1.1F * (r - 1.3F), 0.5F, 1.0F);
 }
 

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdint>
 #include <vector>
 
 namespace hvd {
@@ -170,6 +171,100 @@ float BurstAmplitudeIre(const Plane& field_ire, const FieldGeometry& g) {
   for (float v : pos)
     if (v > 0.25F * med_pos) good.push_back(v);
   return good.empty() ? 20.0F : MedianOf(good);
+}
+
+PalBurstLockin BurstLockinPhasePal(const Plane& field_ire,
+                                   const FieldGeometry& g) {
+  const int h = field_ire.height();
+  std::vector<Complex> z;
+  std::vector<float> amp;
+  BurstLockin(field_ire, g, &z, &amp);
+
+  PalBurstLockin out;
+  out.theta.assign(h, 0.0F);
+  out.vswitch.assign(h, 1);
+
+  const float adv = static_cast<float>(g.line_advance());  // 3*pi/2
+  constexpr float kQuarterPi = 0.78539816339744830962F;
+
+  const float amp_max =
+      amp.empty() ? 0.0F : *std::max_element(amp.begin(), amp.end());
+  const float good_thresh = amp_max > 0.0F ? amp_max * 0.2F : 1.0F;
+  std::vector<char> good(h, 0);
+  int first_good = -1;
+  for (int y = 0; y < h; ++y) {
+    good[y] = amp[y] > good_thresh ? 1 : 0;
+    if (good[y] && first_good < 0) first_good = y;
+  }
+  if (first_good < 0) {
+    // No burst anywhere: model phase, alternating parity by convention.
+    for (int y = 0; y < h; ++y) {
+      out.theta[y] = adv * static_cast<float>(y);
+      out.vswitch[y] = (y % 2 == 0) ? 1 : -1;
+    }
+    return out;
+  }
+
+  std::vector<float> a_meas(h);
+  for (int y = 0; y < h; ++y) a_meas[y] = std::arg(z[y]);
+
+  // Two parity hypotheses for the reference line, scored by how well the
+  // alternating +/-45 deg swing explains every good line.
+  float best_score = -1e30F;
+  std::vector<float> model(h);
+  std::vector<int8_t> s_best(h, 1);
+  for (int hyp = 0; hyp < 2; ++hyp) {
+    const float s_ref = hyp == 0 ? 1.0F : -1.0F;
+    const float theta_ref =
+        a_meas[first_good] - kHalfPi + s_ref * kQuarterPi;
+    std::vector<float> m(h);
+    std::vector<int8_t> s(h);
+    float score = 0.0F;
+    for (int y = 0; y < h; ++y) {
+      m[y] = theta_ref + adv * static_cast<float>(y - first_good);
+      const bool same = ((y - first_good) % 2) == 0;
+      const float sy = same ? s_ref : -s_ref;
+      s[y] = sy > 0 ? 1 : -1;
+      if (good[y]) {
+        const float dev = WrapPi(a_meas[y] - (m[y] + kHalfPi - sy * kQuarterPi));
+        score += std::cos(dev) * amp[y];
+      }
+    }
+    if (score > best_score) {
+      best_score = score;
+      model = m;
+      s_best = s;
+    }
+  }
+  out.vswitch = s_best;
+
+  // Per-line phase with the parity swing removed, then the same robust
+  // trajectory smoothing as the NTSC path (tridiag + one Huber IRLS).
+  std::vector<float> d(h);
+  for (int y = 0; y < h; ++y) {
+    const float sy = s_best[y] > 0 ? 1.0F : -1.0F;
+    const float theta_meas = a_meas[y] - kHalfPi + sy * kQuarterPi;
+    d[y] = WrapPi(theta_meas - model[y]);
+  }
+
+  std::vector<float> good_amp;
+  for (int y = 0; y < h; ++y)
+    if (good[y]) good_amp.push_back(amp[y]);
+  const float med_amp = MedianOf(good_amp) + 1e-9F;
+  std::vector<float> a(h, 0.0F);
+  for (int y = 0; y < h; ++y)
+    if (good[y]) a[y] = std::clamp(amp[y] / med_amp, 0.0F, 2.0F);
+
+  const float lam = 25.0F;
+  std::vector<float> xs = TridiagSmooth(d, a, lam);
+  std::vector<float> a2(h, 0.0F);
+  for (int y = 0; y < h; ++y) {
+    const float r = std::abs(d[y] - xs[y]);
+    a2[y] = a[y] * 0.15F / std::max(r, 0.15F);
+  }
+  xs = TridiagSmooth(d, a2, lam);
+  for (int y = 0; y < h; ++y) out.theta[y] = model[y] + xs[y];
+  return out;
 }
 
 }  // namespace hvd

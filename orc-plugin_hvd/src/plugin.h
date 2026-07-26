@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <orc/plugin/orc_plugin_sdk.h>
 
 #ifndef ORC_STAGE_PLUGIN_VERSION
@@ -31,8 +32,12 @@ inline constexpr uint32_t kStageMinOutputs = 0;
 inline constexpr uint32_t kStageMaxOutputs = 0;
 
 // NTSC-only, like the reference decoder.
+// NTSC + 625-line PAL. VERIFIED against orc/stage/node_type.h: the
+// both-standards value is ALL ("Works with any format (NTSC, PAL,
+// PAL-M, etc.)") — an earlier revision guessed ANY offline; ALL is the
+// real name.
 inline constexpr orc::VideoFormatCompatibility kStageCompatibleFormats =
-    VideoFormatCompatibility::NTSC_ONLY;
+    VideoFormatCompatibility::ALL;
 
 // External / third-party plugin.
 inline constexpr orc::SinkCategory kStageSinkCategory = SinkCategory::THIRD_PARTY;

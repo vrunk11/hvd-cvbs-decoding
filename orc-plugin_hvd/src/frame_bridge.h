@@ -38,7 +38,13 @@ namespace hvd {
 // Populated by the stage from the host's SourceParameters; kept SDK-free so the
 // bridge and engine stay unit-testable without the host.
 struct FrameParams {
-  int frame_width = 0;   // samples per line (910 NTSC)
+  bool is_pal = false;   // 625-line PAL family (B/G/I/D, fsc 4.43361875 MHz).
+                         // PAL-M / PAL-N (PAL chroma on other line/fsc
+                         // geometries) are NOT covered by this flag yet:
+                         // they need their own line_advance derivation
+                         // (90 deg and 90.43 deg per line respectively)
+                         // before the engine can accept them honestly.
+  int frame_width = 0;   // samples per line (910 NTSC / 1135 PAL)
   int frame_height = 0;  // total flat lines (525 NTSC)
   int field1_lines = 0;  // lines of field 1 in the flat buffer (263 NTSC)
   int active_video_start = 0;

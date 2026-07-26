@@ -10,6 +10,7 @@
 //     stays close to the slow decode
 //   * psi_init runs and does not degrade the static solve
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>

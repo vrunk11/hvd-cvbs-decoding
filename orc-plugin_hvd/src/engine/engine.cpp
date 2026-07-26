@@ -3,6 +3,7 @@
 #include "engine/engine.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -55,8 +56,24 @@ WovenFrame WeaveAndBuildCarrier(const FieldInput& first, const FieldInput& secon
   const FieldInput* bot = &second;
   if (!first.is_first_field && second.is_first_field) std::swap(top, bot);
 
-  const std::vector<float> theta_top = BurstLockinPhase(top->samples, g);
-  const std::vector<float> theta_bot = BurstLockinPhase(bot->samples, g);
+  // Standard dispatch happens HERE and only here: NTSC's plain lock-in
+  // vs PAL's joint phase+parity lock-in. Everything after the carrier is
+  // built is standard-agnostic (generic in the effective carrier c).
+  std::vector<float> theta_top;
+  std::vector<float> theta_bot;
+  std::vector<int8_t> sw_top;
+  std::vector<int8_t> sw_bot;
+  if (g.standard == VideoStandard::kPal) {
+    PalBurstLockin lt = BurstLockinPhasePal(top->samples, g);
+    PalBurstLockin lb = BurstLockinPhasePal(bot->samples, g);
+    theta_top = std::move(lt.theta);
+    theta_bot = std::move(lb.theta);
+    sw_top = std::move(lt.vswitch);
+    sw_bot = std::move(lb.vswitch);
+  } else {
+    theta_top = BurstLockinPhase(top->samples, g);
+    theta_bot = BurstLockinPhase(bot->samples, g);
+  }
 
   const Plane s_top = ActivePicture(top->samples, g);
   const Plane s_bot = ActivePicture(bot->samples, g);
@@ -70,6 +87,7 @@ WovenFrame WeaveAndBuildCarrier(const FieldInput& first, const FieldInput& secon
   w.bot = bot;
   w.s = Plane(2 * lines, width);
   std::vector<float> theta(2 * lines, 0.0F);
+  std::vector<int8_t> vswitch(2 * lines, 1);
   for (int y = 0; y < lines; ++y) {
     for (int x = 0; x < width; ++x) {
       w.s.at(2 * y, x) = s_top.at(y, x);
@@ -77,6 +95,10 @@ WovenFrame WeaveAndBuildCarrier(const FieldInput& first, const FieldInput& secon
     }
     theta[2 * y] = theta_top[fal + y];
     theta[2 * y + 1] = theta_bot[fal + y];
+    if (g.standard == VideoStandard::kPal) {
+      vswitch[2 * y] = sw_top[fal + y];
+      vswitch[2 * y + 1] = sw_bot[fal + y];
+    }
   }
 
   // Chroma phase correction: rotate the burst-locked reference itself
@@ -96,7 +118,9 @@ WovenFrame WeaveAndBuildCarrier(const FieldInput& first, const FieldInput& secon
     for (float& t : theta) t += offset;
   }
 
-  w.carrier = MakeCarrier(theta, g);
+  w.carrier = g.standard == VideoStandard::kPal
+                  ? MakeCarrierPal(theta, vswitch, g)
+                  : MakeCarrier(theta, g);
   return w;
 }
 
@@ -114,7 +138,14 @@ std::vector<DecodedField> HvdEngine::DecodeSequenceWindow(
 void HvdEngine::SetFftThreads(int n) { fft_->SetThreadCount(n); }
 
 FrameYc HvdEngine::DecodeFrame(const FieldInput& first, const FieldInput& second,
-                               const FieldGeometry& g, const HvdConfig& cfg) {
+                               const FieldGeometry& g, const HvdConfig& cfg_in) {
+  // Derive the engine-internal standard flag from the geometry so callers
+  // cannot forget it (HvdConfig::is_pal is NOT a user parameter — it
+  // selects the standard-correct leak cancellation in the AUTO
+  // chroma_aniso measurement; see hvd_config.h).
+  HvdConfig cfg = cfg_in;
+  cfg.is_pal = (g.standard == VideoStandard::kPal);
+
   const WovenFrame w = WeaveAndBuildCarrier(first, second, g, cfg);
   const Plane& s = w.s;
   const ComplexPlane& carrier = w.carrier;
@@ -157,7 +188,7 @@ FrameYc HvdEngine::DecodeFrame(const FieldInput& first, const FieldInput& second
   if (cfg.acc) {
     const float a_top = BurstAmplitudeIre(w.top->samples, g);
     const float a_bot = BurstAmplitudeIre(w.bot->samples, g);
-    out.acc_gain = AccGain(0.5F * (a_top + a_bot));
+    out.acc_gain = AccGain(0.5F * (a_top + a_bot), g.nominal_burst_ire());
   }
   return out;
 }
@@ -190,7 +221,7 @@ FrameYc HvdEngine::DecodeChromaOnly(const FieldInput& first,
   if (cfg.acc) {
     const float a_top = BurstAmplitudeIre(w.top->samples, g);
     const float a_bot = BurstAmplitudeIre(w.bot->samples, g);
-    out.acc_gain = AccGain(0.5F * (a_top + a_bot));
+    out.acc_gain = AccGain(0.5F * (a_top + a_bot), g.nominal_burst_ire());
   }
   return out;
 }

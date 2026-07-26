@@ -89,8 +89,10 @@ downstream colour render path; `engine/colour.*` ports them for that use.
   friends). `HvdConfig` keeps the fields declared; the solver's temporal
   neighbour terms are the marked seam in `engine/variational.*`.
 - **Dropout / RF-defect handling** beyond what the 2-D prior tolerates.
-- **PAL.** NTSC-only, like the reference; the stage advertises
-  `VideoFormatCompatibility::NTSC_ONLY`.
+- ~~**PAL.**~~ DONE — 625-line PAL is integrated via the effective-carrier
+  generalisation (the engine is generic in c; NTSC is c = exp(i*phi)).
+  See `docs/PAL.md` for the dispatch points, PAL-swept defaults, the
+  validation record, and the three seams to confirm at first host build.
 
 ## 5. Known gaps to finish
 

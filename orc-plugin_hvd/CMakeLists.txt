@@ -27,9 +27,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(BUILD_TESTS "Build plugin + engine tests" ON)
+# Engine-only mode: build hvd_core + the SDK-free engine tests WITHOUT any
+# decode-orc SDK checkout. This is what the fast CI job and quick local
+# numerical work use: it exercises the whole numerical core (including the
+# PAL lock-in/carrier tests) with only cmake + a C++17 compiler + fftw3f.
+option(HVD_ENGINE_ONLY "Build only hvd_core and engine tests (no SDK, no plugin)" OFF)
 
 # --- decode-orc plugin SDK: in-tree source tree OR installed package ---------
-if(DEFINED ORC_INTREE_SDK_DIR)
+if(HVD_ENGINE_ONLY)
+    # No SDK targets in engine-only mode.
+elseif(DEFINED ORC_INTREE_SDK_DIR)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DecodeOrcPluginSDKHelpers.cmake")
 
     add_library(orc-sdk-includes INTERFACE)
@@ -200,6 +207,7 @@ target_link_libraries(hvd_core PUBLIC Threads::Threads)
 set_target_properties(hvd_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # --- the plugin ---------------------------------------------------------------
+if(NOT HVD_ENGINE_ONLY)
 set(HVD_PLUGIN_TARGET "orc-stage-plugin-hvd-chroma-decoder")
 
 orc_add_stage_plugin(
@@ -216,6 +224,7 @@ orc_add_stage_plugin(
 target_include_directories(${HVD_PLUGIN_TARGET} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+endif()  # NOT HVD_ENGINE_ONLY
 
 if(BUILD_TESTS)
     enable_testing()

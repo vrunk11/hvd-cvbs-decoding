@@ -33,6 +33,22 @@ struct HvdConfig {
   // variational.cpp, with the measurements). Positive = forced fixed
   // value (reference behaviour at 0.5).
   float chroma_aniso = 0.0F;
+
+  // NOT a user parameter: set from the source geometry by the engine
+  // entry points (DecodeFrameBuffer / DecodeSequence set it from
+  // FieldGeometry::standard, so it cannot be forgotten). It exists
+  // because the AUTO chroma_aniso measurement above must cancel the
+  // init's cross-colour leak before measuring, and the leak's
+  // line-to-line structure DIFFERS between the standards:
+  //   NTSC: conj(c) alternates sign        -> a 2-line average cancels it
+  //   PAL : conj(c) alternates sign AND conjugation (the V-switch), and
+  //         the carrier walks 270 deg/line -> only a 4-LINE average
+  //         cancels it (the conjugation pattern repeats over 2 lines,
+  //         and 4 * 270 = 1080 = 0 mod 360 closes the carrier walk).
+  // Measuring PAL with the NTSC 2-line average leaves the leak in the
+  // vertical gradient and makes AUTO pick a wrong aniso. See
+  // reference-pal/THEORY-PAL.md section 3.
+  bool is_pal = false;
   // Charbonnier edge-preservation scales (in IRE) for the luma and chroma
   // priors respectively.
   float charbonnier_eps = 0.5F;

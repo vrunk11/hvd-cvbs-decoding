@@ -2,7 +2,9 @@
 # SDK-level tests (need the decode-orc SDK target): stage metadata + plugin
 # entrypoints. Mirror the skeleton's tests, adapted to HvdChromaDecoderStage.
 # ---------------------------------------------------------------------------
-if(DEFINED ORC_INTREE_SDK_DIR AND TARGET orc-plugin-sdk)
+if(HVD_ENGINE_ONLY)
+    set(HVD_TEST_SDK_TARGET "")
+elseif(DEFINED ORC_INTREE_SDK_DIR AND TARGET orc-plugin-sdk)
     set(HVD_TEST_SDK_TARGET orc-plugin-sdk)
 elseif(TARGET orc::plugin-sdk)
     set(HVD_TEST_SDK_TARGET orc::plugin-sdk)
@@ -12,6 +14,7 @@ else()
     message(FATAL_ERROR "Neither orc::plugin-sdk nor orc-plugin-sdk is available for tests")
 endif()
 
+if(NOT HVD_ENGINE_ONLY)
 add_executable(hvd_stage_smoke_test
     stage_smoke_test.cpp
     ../src/hvd_chroma_decoder_stage.cpp
@@ -28,6 +31,7 @@ add_executable(hvd_plugin_entrypoints_test
 target_link_libraries(hvd_plugin_entrypoints_test PRIVATE ${HVD_TEST_SDK_TARGET} hvd_core)
 target_include_directories(hvd_plugin_entrypoints_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_test(NAME hvd_plugin_entrypoints_test COMMAND hvd_plugin_entrypoints_test)
+endif()  # NOT HVD_ENGINE_ONLY
 
 # ---------------------------------------------------------------------------
 # Engine tests (SDK-free): link only hvd_core. These verify the numerical core
@@ -44,7 +48,10 @@ set(HVD_ENGINE_TESTS
     temporal_test
     sequence_test
     field_order_test
-    variational_v2_test)
+    variational_v2_test
+    pal_lockin_test
+    pal_aniso_group_test
+    preview_aspect_test)
 
 foreach(t ${HVD_ENGINE_TESTS})
     add_executable(${t} engine/${t}.cpp)

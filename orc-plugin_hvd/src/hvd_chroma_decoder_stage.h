@@ -10,6 +10,7 @@
 
 #include <orc/plugin/orc_plugin_sdk.h>
 #include <orc/stage/colour_preview_provider.h>
+#include <orc/stage/preview/stage_custom_preview_renderer.h>
 #include <orc/stage/triggerable_stage.h>
 
 #include <atomic>
@@ -68,8 +69,33 @@ public:
     // display line r, alternating fields, matching what the host's own
     // preview renderer expects (see build_colour_carrier() in the .cpp for
     // why the underlying YcFrameS16 planes can't be used as-is).
+    //
+    // `full_raster`: include the WHOLE stored raster, not just the active
+    // picture — the margins carry the RAW composite as luma (sync, burst,
+    // blanking; frame_bridge initialises the luma plane with the source
+    // samples before overwriting the active region with decoded Y, and
+    // chroma is zero there), which is exactly what you want when checking
+    // geometry, the burst window, or head-switch damage.
+    //
+    // `field` = -1 for the woven frame, 0/1 for a SINGLE field at native
+    // field height (each carrier row is one field line, no interpolation) —
+    // the honest view for judging per-field artefacts (V-switch/Hanover
+    // checks on PAL, per-field dropouts, interlace weave errors) that the
+    // weave visually smears across two fields.
     // std::nullopt if decode failed.
-    std::optional<ColourFrameCarrier> build_colour_carrier(FrameID id) const;
+    std::optional<ColourFrameCarrier> build_colour_carrier(
+        FrameID id, bool full_raster = false, int field = -1) const;
+
+    // Frame geometry, for IStageCustomPreviewRenderer::get_preview_options()
+    // (which needs sizes before any single frame is rendered).
+    ::hvd::FrameParams frame_params_public() const { return frame_params(); }
+
+    // Renders one PreviewImage for IStageCustomPreviewRenderer, sharing the
+    // same ReorderToWoven code path (and therefore the same geometry) as
+    // build_colour_carrier() and the file-export methods above — full_raster
+    // and field have the same meaning there.
+    PreviewImage render_custom_preview(FrameID id, bool full_raster,
+                                       int field) const;
 
     // Direct-to-file export, bypassing the host's Y/C sink pipeline
     // entirely. Writes one interleaved 8-bit RGB24 frame (active picture
@@ -135,8 +161,13 @@ private:
         std::vector<double> y, u, v;  // size width * height, or empty
     };
     // Pure: no cache/engine/source access, just the reorder math.
+    // full_raster=false crops to the active picture (the export contract);
+    // true keeps the whole stored raster. field=-1 weaves; 0/1 extracts a
+    // single field's rows at native field height.
     static WovenActivePicture ReorderToWoven(const ::hvd::YcFrameS16& yc,
-                                             const ::hvd::FrameParams& fp);
+                                             const ::hvd::FrameParams& fp,
+                                             bool full_raster = false,
+                                             int field = -1);
     // Cached path: decoded(id) (shared engine_) + ReorderToWoven.
     WovenActivePicture woven_active_picture(FrameID id) const;
 
@@ -145,6 +176,13 @@ private:
     static bool WriteWovenAsRgb24(const WovenActivePicture& pic,
                                   const ::hvd::FrameParams& fp,
                                   std::ostream& out);
+
+    // Same conversion, into an in-memory PreviewImage — used by
+    // render_custom_preview() (IStageCustomPreviewRenderer path). A private
+    // static member (rather than a free function) because it takes the
+    // private nested WovenActivePicture by reference.
+    static PreviewImage WovenToPreviewImage(const WovenActivePicture& pic,
+                                            const ::hvd::FrameParams& fp);
 
     ::hvd::HvdConfig config_;
 
@@ -175,6 +213,7 @@ class HvdChromaDecoderStage : public DAGStage,
                              public ParameterizedStage,
                              public IStagePreviewCapability,
                              public IColourPreviewProvider,
+                             public IStageCustomPreviewRenderer,
                              public TriggerableStage {
 public:
     HvdChromaDecoderStage();
@@ -218,6 +257,22 @@ public:
     std::optional<ColourFrameCarrier> get_colour_preview_carrier(
         uint64_t frame_index, PreviewNavigationHint hint) const override;
 
+    // IStageCustomPreviewRenderer — additional views the carrier path
+    // (above) cannot express: full stored raster and single-field. See
+    // this pair's .cpp doc comments for the verified reason the host does
+    // not currently route to them for a stage that ALSO implements
+    // IStagePreviewCapability (same reason SourceAlignStage's own
+    // get_preview_options() is unreachable today: preview_renderer.cpp
+    // dispatches capability stages first and returns before trying the
+    // custom-renderer branch). Implemented in full regardless — this is
+    // the SDK's documented "implement both, alongside each other" pattern
+    // (stage_custom_preview_renderer.h), and it is exactly what the host
+    // needs once its dispatch is fixed to merge rather than choose between
+    // the two option lists.
+    std::vector<PreviewOption> get_preview_options() const override;
+    PreviewImage render_preview(const std::string& option_id, uint64_t index,
+                               PreviewNavigationHint hint) const override;
+
     // TriggerableStage: this is the real "Export" button. Builds (or
     // reuses) the decoded representation from `inputs`, then runs the
     // parallel frame-level export to output_path_ — same worker-pool
@@ -238,6 +293,21 @@ public:
 
 private:
     void refresh_status();
+
+    // PREVIEW-ONLY view state. These exist as stage parameters — rather
+    // than as host view options — because on this decode-orc version the
+    // host's view-selector path is unreachable for this stage: verified in
+    // preview_renderer.cpp, get_available_outputs()/render_output() both
+    // dispatch "if (capability_stage) {...} else if (custom_renderer) {...}"
+    // and get_capability_preview_outputs() returns exactly one hardcoded
+    // output, so IStageCustomPreviewRenderer (implemented below, and ready)
+    // is dead code until patches/0001 is applied to the host. Parameters
+    // are the only mechanism that actually reaches the GUI today.
+    // Neither affects the decode or the export: every export path calls
+    // ReorderToWoven() with its default arguments, so written frames always
+    // honour the configured VideoParameters crop.
+    bool preview_full_raster_ = true;   // default: show the WHOLE raster
+    bool preview_field_view_ = false;
 
     ::hvd::HvdConfig config_;
     std::string output_path_;

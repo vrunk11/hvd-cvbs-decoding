@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -227,7 +228,15 @@ ComplexPlane PsiClosedForm(const Plane& S, const ComplexPlane& carrier,
 
 FieldObs PrepareFieldObs(const FieldInput& field, const FieldGeometry& g,
                          const HvdConfig& cfg, int parity) {
-  std::vector<float> theta = BurstLockinPhase(field.samples, g);
+  std::vector<float> theta;
+  std::vector<int8_t> vswitch;
+  if (g.standard == VideoStandard::kPal) {
+    PalBurstLockin l = BurstLockinPhasePal(field.samples, g);
+    theta = std::move(l.theta);
+    vswitch = std::move(l.vswitch);
+  } else {
+    theta = BurstLockinPhase(field.samples, g);
+  }
   // Chroma phase correction on the burst-locked reference itself, same as
   // the frame path (WeaveAndBuildCarrier in engine.cpp).
   if (cfg.chroma_phase_deg != 0.0F) {
@@ -249,7 +258,13 @@ FieldObs PrepareFieldObs(const FieldInput& field, const FieldGeometry& g,
       obs.s.at(y, x) = field.samples.at(fal + y, a0 + x);
   std::vector<float> theta_active(lines);
   for (int y = 0; y < lines; ++y) theta_active[y] = theta[fal + y];
-  obs.carrier = MakeCarrier(theta_active, g);
+  if (g.standard == VideoStandard::kPal) {
+    std::vector<int8_t> sw_active(lines);
+    for (int y = 0; y < lines; ++y) sw_active[y] = vswitch[fal + y];
+    obs.carrier = MakeCarrierPal(theta_active, sw_active, g);
+  } else {
+    obs.carrier = MakeCarrier(theta_active, g);
+  }
   return obs;
 }
 
@@ -323,6 +338,19 @@ DrizzleResult DrizzleFrame(int j0, const std::vector<Plane>& Ys,
           // Source sample (y, x) of field k lands, in target-frame fine
           // rows, at (2*(y + vy) + pk) * scale; linear split between the
           // two nearest fine rows ('pixfrac=1, linear kernel' drizzle).
+          // DEPOSIT GEOMETRY — COUPLED TO THE MOTION CONVENTION, do not
+          // change one without the other. This maps a source row to the
+          // fine grid as 2*(y + motion) + parity, which is correct ONLY
+          // because the vectors feeding it are INTEGER and margin-snapped:
+          // the zero-motion margin rule discards sub-line displacement, so
+          // `vy` never contains the half-line parity term h_k = (p_k-p_j)/2.
+          // If sub-pixel refinement is ever added here (it would let
+          // drizzle exploit half-line registration — see reference-pal/
+          // THEORY-PAL.md 5d, where the PAL research added exactly that),
+          // the vectors WILL contain h_k and this line must become
+          // 2*(y + vy - h_k) + pk, or static cross-parity content lands a
+          // full frame-line off. That derivation is why the research
+          // flagged this as a latent issue rather than a live bug.
           const float yf = (2.0F * (y + vy) + static_cast<float>(pk)) *
                            static_cast<float>(scale);
           const int xs = std::clamp(
@@ -406,6 +434,9 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
   // gates accordingly (a fixed IRE gate is 5 sigma on a clean disc but
   // 1.4 sigma on a noisy one => over-gating exactly where 3D helps most)
   HvdConfig ccfg = cfg_in;
+  // Standard flag from the geometry (see HvdConfig::is_pal): selects the
+  // 4-line (PAL) vs 2-line (NTSC) leak cancellation in AUTO chroma_aniso.
+  ccfg.is_pal = (g.standard == VideoStandard::kPal);
   {
     std::vector<float> sigmas;
     sigmas.reserve(fields.size());
@@ -419,12 +450,30 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
   }
 
   std::vector<int> offs;
+  const bool pal = g.standard == VideoStandard::kPal;
   if (ccfg.extended_temporal) {
-    offs = ccfg.bidirectional ? std::vector<int>{-3, -2, -1, 1, 2, 3}
-                              : std::vector<int>{-3, -2, -1};
+    // PAL's strongest equation (180 deg carrier relation, |dc| = 2) sits
+    // at f+/-4 — TWO frames — not NTSC's f+/-2; the 135 deg/field ladder
+    // makes every offset in +/-4 non-degenerate (THEORY-PAL 5, 5c). The
+    // odd offsets' oscillating |dc| and half-line bias are handled by the
+    // machinery below exactly as NTSC's odd offsets are (actual carrier
+    // arrays + the envelope gate), no special-casing.
+    offs = pal ? (ccfg.bidirectional
+                      ? std::vector<int>{-4, -3, -2, -1, 1, 2, 3, 4}
+                      : std::vector<int>{-4, -3, -2, -1})
+               : (ccfg.bidirectional ? std::vector<int>{-3, -2, -1, 1, 2, 3}
+                                     : std::vector<int>{-3, -2, -1});
   } else {
     offs = ccfg.bidirectional ? std::vector<int>{-2, -1, 1, 2}
                               : std::vector<int>{-2, -1};
+  }
+  // PAL-swept defaults (reference-pal THEORY 5b): full-weight coherence
+  // (1.0) with nu=0.5 measured strictly dominating; nr_radius 4 because
+  // the blend's leakage anti-correlation lives at f+/-4 on PAL. Applied
+  // only when the caller left the NTSC-tuned defaults in place.
+  if (pal) {
+    if (ccfg.coherence_gate == 0.6F) ccfg.coherence_gate = 1.0F;
+    if (ccfg.nr_radius == 2) ccfg.nr_radius = 4;
   }
 
   std::vector<Plane> Ys(nf);
@@ -465,11 +514,17 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
   // quadrature via the same sigma the robust gates calibrated from;
   // motion only biases the estimate upward, i.e. toward "more 3D", where
   // the per-pixel gates already protect the result.
-  if (ccfg.temporal_strength == 0.0F && ccfg.cg_iterations > 0 && nf > 2) {
+  // Same-parity 180-deg pair stride: 2 fields on NTSC, 4 on PAL (the
+  // 135 deg/field ladder reaches the flip at two frames — same
+  // discriminator, longer baseline; fields j and j+4 share V-switch
+  // parity so the chroma-coherent / leak-sign-flip logic transfers).
+  const int amb_stride = g.standard == VideoStandard::kPal ? 4 : 2;
+  if (ccfg.temporal_strength == 0.0F && ccfg.cg_iterations > 0 &&
+      nf > amb_stride) {
     std::vector<float> ambs;
-    for (int j = 0; j + 2 < nf; ++j) {
+    for (int j = 0; j + amb_stride < nf; ++j) {
       const Plane& Sj = fields[j].s;
-      const Plane& Sk = fields[j + 2].s;
+      const Plane& Sk = fields[j + amb_stride].s;
       const int hh = Sj.height();
       const int ww = Sj.width();
       // Crude demod, decimated: this is a scalar calibration, not a decode.
@@ -516,7 +571,7 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
             return d * (1.0F / 16.0F);
           };
           const Complex dj = demod(Sj, fields[j].carrier);
-          const Complex dk = demod(Sk, fields[j + 2].carrier);
+          const Complex dk = demod(Sk, fields[j + amb_stride].carrier);
           const double e = 0.25 * std::norm(dj - dk);
           acc += e;
           ++n;

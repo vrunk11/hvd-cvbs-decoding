@@ -1,0 +1,50 @@
+--- /tmp/preview_renderer.orig.cpp	2026-07-23 13:30:11.241225806 +0000
++++ orc/core/preview_renderer.cpp	2026-07-23 13:30:11.315135530 +0000
+@@ -334,7 +334,23 @@
+               dynamic_cast<const IColourPreviewProvider*>(node_it->stage.get());
+ 
+           if (has_colour_domain_type(capability) && colour_provider) {
+-            return get_capability_preview_outputs(capability);
++            // Merge the single hardcoded carrier output with any additional
++            // named views the stage exposes via IStageCustomPreviewRenderer.
++            // Previously this returned immediately, which silently dropped
++            // every stage's custom options whenever it ALSO implemented
++            // IStagePreviewCapability (e.g. SourceAlignStage, hvd-chroma-
++            // decoder) — the interfaces are documented to be used
++            // alongside each other (stage_custom_preview_renderer.h), so
++            // this was a dispatch bug, not a deliberate restriction.
++            auto outputs = get_capability_preview_outputs(capability);
++            if (auto* custom_opts =
++                    dynamic_cast<const IStageCustomPreviewRenderer*>(
++                        node_it->stage.get())) {
++              auto extra = build_outputs_from_options(
++                  node_id, *node_it, custom_opts->get_preview_options());
++              outputs.insert(outputs.end(), extra.begin(), extra.end());
++            }
++            return outputs;
+           }
+ 
+           // Signal-domain: render from the VFR produced by the DAG executor.
+@@ -437,6 +453,22 @@
+         if (capability.is_valid()) {
+           // Colour-domain stages use the carrier-backed rendering path.
+           if (has_colour_domain_type(capability)) {
++            // Route to the custom renderer when the requested option_id
++            // names one of ITS views (anything other than the carrier's
++            // own hardcoded "phase2_colour_carrier" id — see the matching
++            // merge in get_available_outputs() above). Falls through to
++            // the unchanged carrier path for the default/empty option_id,
++            // so existing single-view stages behave exactly as before.
++            if (auto* custom = dynamic_cast<const IStageCustomPreviewRenderer*>(
++                    node_it->stage.get())) {
++              if (!option_id.empty() && option_id != "phase2_colour_carrier") {
++                ensure_node_executed(node_id, true);
++                result.image = custom->render_preview(option_id, index, hint);
++                result.success = result.image.is_valid();
++                if (result.success) render_dropouts(result.image);
++                return result;
++              }
++            }
+             if (auto* colour_provider =
+                     dynamic_cast<const IColourPreviewProvider*>(
+                         node_it->stage.get())) {

@@ -14,6 +14,7 @@
 #ifndef ORC_PLUGIN_HVD_ENGINE_NTSC_GEOMETRY_H_
 #define ORC_PLUGIN_HVD_ENGINE_NTSC_GEOMETRY_H_
 
+#include <cstdint>
 #include <vector>
 
 #include "engine/plane.h"
@@ -23,6 +24,20 @@ namespace hvd {
 // NTSC 4fsc colour subcarrier and sample rate (Hz). fsc = 315e6 / 88.
 constexpr double kFscNtsc = 315.0e6 / 88.0;      // 3 579 545.45... Hz
 constexpr double kFs4Fsc = 4.0 * kFscNtsc;        // 14 318 181.8 Hz
+
+// PAL 4fsc: fsc = 4 433 618.75 Hz. On the stored 1135-sample grid the
+// subcarrier advances exactly 283.75 cycles/line => 270 deg/line; the
+// 25 Hz offset survives as a slow drift the lock-in MEASURES (the PAL
+// reference in reference-pal/, THEORY-PAL.md sections 1-2).
+constexpr double kFscPal = 4433618.75;
+constexpr double kFs4FscPal = 4.0 * kFscPal;      // 17 734 475 Hz
+
+// Which composite standard a field's carrier obeys. This is the ONLY
+// switch the numerical core dispatches on: everything downstream of the
+// carrier builder (init, arbitration, temporal equations, anchor loop)
+// is generic in the effective carrier c — NTSC is the special case
+// c = exp(i*phi); PAL folds the V-switch into c (see MakeCarrierPal).
+enum class VideoStandard { kNtsc, kPal };
 
 // Composite geometry needed by the engine, expressed in the sample domain of a
 // single field. Populated by the SDK layer from decode-orc SourceParameters (or
@@ -37,6 +52,19 @@ struct FieldGeometry {
   int first_active_field_line = 21;  // first active line within a field
   int last_active_field_line = 0;    // one past last active line; 0 => field_height
   double sample_rate = kFs4Fsc;   // Hz
+  VideoStandard standard = VideoStandard::kNtsc;
+
+  // Per-line carrier phase advance on the stored grid: 180 deg (NTSC,
+  // 227.5 cycles/line) or 270 deg (PAL, 283.75 cycles/line).
+  double line_advance() const {
+    return standard == VideoStandard::kPal ? 1.5 * 3.14159265358979323846
+                                           : 3.14159265358979323846;
+  }
+  // Nominal burst amplitude for ACC: 20 IRE (NTSC) / 21.43 IRE (PAL,
+  // +/-150 mV on the 700 mV white).
+  float nominal_burst_ire() const {
+    return standard == VideoStandard::kPal ? 21.43F : 20.0F;
+  }
 
   int active_width() const { return active_video_end - active_video_start; }
   int last_active_line() const {
@@ -69,6 +97,20 @@ inline float IreToSample(float ire, float black_level, float white_level) {
 // field geometry. Result has one row per entry in `theta` and `active_width()`
 // columns. Matches `phase_map(...)[:, a0:a1]` in the reference.
 ComplexPlane MakeCarrier(const std::vector<float>& theta, const FieldGeometry& g);
+
+// PAL EFFECTIVE CARRIER (the load-bearing result of the PAL port,
+// THEORY-PAL.md section 1). With one global chroma phasor chi = V - iU
+// and the V-switch parity s[line] (+1 unswitched / -1 switched),
+//
+//   S = Y + Re[chi * c],   c = +exp(+i*phi) where s = +1
+//                              -exp(-i*phi) where s = -1
+//
+// so the V-switch is a conjugated reference wave folded into a
+// unit-modulus per-pixel carrier, and every equation of this engine
+// applies unchanged. `vswitch` has one entry per row of `theta`.
+ComplexPlane MakeCarrierPal(const std::vector<float>& theta,
+                            const std::vector<int8_t>& vswitch,
+                            const FieldGeometry& g);
 
 // Robust per-field noise estimate (IRE), from the stride-4 horizontal second
 // difference. At 4fsc the carrier completes 360 deg over 4 samples, so

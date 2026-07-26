@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 namespace hvd {
@@ -68,4 +69,25 @@ float EstimateNoiseIre(const Plane& s) {
   return q / 0.3186F / std::sqrt(6.0F);
 }
 
+
+
+ComplexPlane MakeCarrierPal(const std::vector<float>& theta,
+                            const std::vector<int8_t>& vswitch,
+                            const FieldGeometry& g) {
+  const int lines = static_cast<int>(theta.size());
+  const int a0 = g.active_video_start;
+  const int width = g.active_width();
+  ComplexPlane carrier(lines, width);
+  constexpr float kHalfPi = 1.57079632679489661923F;
+  for (int y = 0; y < lines; ++y) {
+    const bool sw = vswitch[y] < 0;
+    for (int x = 0; x < width; ++x) {
+      const float phi = theta[y] + kHalfPi * static_cast<float>(a0 + x);
+      const Complex cpos = std::polar(1.0F, phi);
+      // s = -1 lines: -conj(exp(i*phi)) = -exp(-i*phi)
+      carrier.at(y, x) = sw ? Complex(-cpos.real(), cpos.imag()) : cpos;
+    }
+  }
+  return carrier;
+}
 }  // namespace hvd
