@@ -129,6 +129,54 @@ struct HvdConfig {
   // than assuming every source needs exactly 180.
   float chroma_phase_deg = 180.0F;
 
+  // --- Non-standard subcarrier -------------------------------------------
+  // Some composite sources are NTSC in every respect the host measures
+  // (line rate, sync, blanking, burst window, 4fsc-nominal sample grid)
+  // but carry the colour subcarrier somewhere other than fs/4. The sample
+  // RATE does not change; only the carrier riding on that grid moves.
+  // The motivating case is JVC VHD, whose subcarrier sits at 2556.8 kHz.
+  //
+  // custom_subcarrier is the on/off switch, subcarrier_khz the value, kept
+  // separate for the same reason enable_temporal and temporal_strength are:
+  // so a dialled-in frequency survives toggling the feature off and on.
+  //
+  // UNITS ARE kHz, NOT MHz, and that is not cosmetic: the host renders every
+  // DOUBLE parameter with a hardcoded 4 decimal places
+  // (stageparameterdialog.cpp, setDecimals(4)), which a plugin cannot
+  // override. In MHz that quantises the dial to 100 Hz steps — too coarse to
+  // land on a real subcarrier. In kHz the same 4 decimals give 0.1 Hz.
+  // Reference values in these units: VHD 2556.8, NTSC 3579.5455,
+  // PAL 4433.61875.
+  //
+  // WHAT STILL HOLDS AT 2556.8 kHz. 2556.8182 kHz is exactly 162.5 * fH —
+  // an ODD MULTIPLE OF HALF THE LINE RATE, structurally the same choice as
+  // standard NTSC's 227.5 * fH. So line_advance() comes out at 180 deg and
+  // the two assumptions that depend on it stay valid: the AUTO chroma_aniso
+  // measurement (its 2-line average still cancels the init's cross-colour
+  // leak) and the sequence path's ambiguity measurement (same-parity fields
+  // still see the carrier flipped 180 deg). The adaptive modes can be left
+  // alone here. Note the default below is the rounded 2556.8, which is
+  // 179.584 deg/line rather than 180 — set 2556.8182 for the exact lock.
+  //
+  // WHAT DOES NOT. Two carrier nulls are built on fs/fsc == 4 and VHD is at
+  // fs/fsc = 5.6, so they stop being nulls:
+  //   1. EstimateNoiseIre's stride-4 second difference no longer cancels
+  //      chroma; it OVER-estimates sigma, loosening the auto-calibrated
+  //      temporal/NR gates.
+  //   2. The box-4 low-pass in DetectFieldParity (frame_bridge.cpp) and in
+  //      the sequence path's ambiguity gate likewise.
+  // Both are fixable exactly for VHD if it proves to matter: 5.6 = 28/5, so
+  // 28 samples span exactly 5 carrier cycles — a stride-28 second difference
+  // and a box-28 low-pass are exact nulls, at the cost of a wider kernel
+  // (28 samples ~= 2 us) passing less luma curvature. Not done here.
+  //
+  // For a subcarrier that is NOT an odd multiple of fH/2, check
+  // FieldGeometry::line_advance(): if it is not ~180 deg, the two assumptions
+  // above are actively wrong for the source and the adaptive modes should be
+  // replaced by forced values (chroma_aniso 0.5, a fixed temporal_strength).
+  bool custom_subcarrier = false;
+  float subcarrier_khz = 2556.8F;  // JVC VHD
+
   // --- Geometry -----------------------------------------------------------
   // Weave both fields into frame geometry before decoding (default, best
   // quality on static material). false => legacy per-field decode.

@@ -27,15 +27,18 @@ float WrapPi(float a) {
 }
 
 // Complex lock-in output per line over the burst window:
-//   z[line] = mean_x[ (seg - mean(seg)) * exp(-i (pi/2) x) ]
+//   z[line] = mean_x[ (seg - mean(seg)) * exp(-i w0 x) ]
 // with x the ABSOLUTE sample index (so the local oscillator matches the carrier
-// referenced to line start, exactly as MakeCarrier does). Returns z and |z|.
+// referenced to line start, exactly as MakeCarrier does) and w0 the carrier's
+// phase advance per sample (pi/2 on a 4fsc grid, g.phase_per_sample() for a
+// non-standard subcarrier). Returns z and |z|.
 void BurstLockin(const Plane& field_ire, const FieldGeometry& g,
                  std::vector<Complex>* z_out, std::vector<float>* amp_out) {
   const int h = field_ire.height();
   const int x0 = g.colour_burst_start;
   const int x1 = g.colour_burst_end;
   const int n = std::max(0, x1 - x0);
+  const float w0 = static_cast<float>(g.phase_per_sample());
 
   z_out->assign(h, Complex{0.0F, 0.0F});
   amp_out->assign(h, 0.0F);
@@ -49,7 +52,7 @@ void BurstLockin(const Plane& field_ire, const FieldGeometry& g,
 
     Complex acc{0.0F, 0.0F};
     for (int x = x0; x < x1; ++x) {
-      const Complex ref = std::polar(1.0F, -kHalfPi * static_cast<float>(x));
+      const Complex ref = std::polar(1.0F, -w0 * static_cast<float>(x));
       acc += (field_ire.at(y, x) - mean) * ref;
     }
     acc /= static_cast<float>(n);
@@ -119,10 +122,16 @@ std::vector<float> BurstLockinPhase(const Plane& field_ire,
   }
   if (first_good < 0) return theta;  // no burst anywhere: keep raw angles
 
-  // Model phase: pi per line, anchored at the first good line.
+  // Model phase: line_advance() per line, anchored at the first good line.
+  // Derived, not hardcoded pi: 180 deg is the NTSC 4fsc value, but a
+  // non-standard subcarrier advances by whatever fsc/fH says (see
+  // FieldGeometry::line_advance). Getting this wrong leaves a per-line
+  // phase RAMP in the deviations d below, which the tridiagonal smoother
+  // then fights instead of smoothing.
+  const float adv = static_cast<float>(g.line_advance());
   std::vector<float> model(h);
   for (int y = 0; y < h; ++y) {
-    model[y] = theta[first_good] + kPi * static_cast<float>(y - first_good);
+    model[y] = theta[first_good] + adv * static_cast<float>(y - first_good);
   }
 
   // Deviation d = wrap(theta - model) about the model.

@@ -58,6 +58,10 @@ struct FrameParams {
   float blanking_level = 0.0F;
   float chroma_dc = 0.0F;  // chroma DC centre for the C channel
   double sample_rate = kFs4Fsc;
+  // Non-standard colour subcarrier (Hz), 0 => the standard's nominal fsc.
+  // The stage sets this from HvdConfig::custom_subcarrier /
+  // HvdConfig::subcarrier_khz; see FieldGeometry::subcarrier_hz.
+  double subcarrier_hz = 0.0;
 };
 
 // A decoded Y/C frame in the 10-bit sample domain (int16_t == VFR sample_type),

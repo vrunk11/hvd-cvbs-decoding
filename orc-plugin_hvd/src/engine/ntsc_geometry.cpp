@@ -10,8 +10,6 @@
 namespace hvd {
 
 namespace {
-constexpr float kHalfPi = 1.57079632679489661923F;  // pi / 2
-
 // 25th percentile of a copy of `v` (partial sort, O(n)). `v` is consumed.
 float Percentile25(std::vector<float>* v) {
   if (v->empty()) return 0.0F;
@@ -33,12 +31,15 @@ ComplexPlane MakeCarrier(const std::vector<float>& theta,
   const int h = static_cast<int>(theta.size());
   const int w = g.active_width();
   ComplexPlane carrier(h, w);
+  // Phase advance per sample: pi/2 on a 4fsc grid, g.phase_per_sample()
+  // in general (non-standard subcarrier).
+  const float w0 = static_cast<float>(g.phase_per_sample());
   for (int y = 0; y < h; ++y) {
     for (int x = 0; x < w; ++x) {
-      // Absolute sample index of this active column, so the 90-deg/sample
+      // Absolute sample index of this active column, so the per-sample
       // carrier is referenced to the true line start (not the crop origin).
       const int sample = g.active_video_start + x;
-      const float phase = theta[y] + kHalfPi * static_cast<float>(sample);
+      const float phase = theta[y] + w0 * static_cast<float>(sample);
       carrier.at(y, x) = std::polar(1.0F, phase);
     }
   }
@@ -78,11 +79,11 @@ ComplexPlane MakeCarrierPal(const std::vector<float>& theta,
   const int a0 = g.active_video_start;
   const int width = g.active_width();
   ComplexPlane carrier(lines, width);
-  constexpr float kHalfPi = 1.57079632679489661923F;
+  const float w0 = static_cast<float>(g.phase_per_sample());
   for (int y = 0; y < lines; ++y) {
     const bool sw = vswitch[y] < 0;
     for (int x = 0; x < width; ++x) {
-      const float phi = theta[y] + kHalfPi * static_cast<float>(a0 + x);
+      const float phi = theta[y] + w0 * static_cast<float>(a0 + x);
       const Complex cpos = std::polar(1.0F, phi);
       // s = -1 lines: -conj(exp(i*phi)) = -exp(-i*phi)
       carrier.at(y, x) = sw ? Complex(-cpos.real(), cpos.imag()) : cpos;

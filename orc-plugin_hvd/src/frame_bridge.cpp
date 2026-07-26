@@ -52,6 +52,7 @@ FieldGeometry FieldGeometryFromParams(const FrameParams& fp) {
   g.last_active_field_line =
       fp.last_active_frame_line != 0 ? fp.last_active_frame_line / 2 : 0;
   g.sample_rate = fp.sample_rate;
+  g.subcarrier_hz = fp.subcarrier_hz;
   g.standard = fp.is_pal ? VideoStandard::kPal : VideoStandard::kNtsc;
   return g;
 }

@@ -45,6 +45,8 @@ constexpr const char* kDebugDir = "debug_dir";
 constexpr const char* kAcc = "acc";
 constexpr const char* kChromaGain = "chroma_gain";
 constexpr const char* kMonochrome = "monochrome";
+constexpr const char* kCustomSubcarrier = "custom_subcarrier";
+constexpr const char* kSubcarrierKhz = "subcarrier_khz";
 constexpr const char* kSymmetryVariant = "symmetry_variant";
 constexpr const char* kChromaPhaseDeg = "chroma_phase_deg";
 constexpr const char* kFftThreads = "fft_threads";
@@ -132,6 +134,11 @@ HvdDecodedRepresentation::HvdDecodedRepresentation(
     // engine can claim it (the effective-carrier machinery is ready; the
     // line-advance and burst model are not derived for it yet).
     fp.is_pal = (sp.system == VideoSystem::PAL);
+    // Non-standard subcarrier: overrides the fsc implied by the system,
+    // never the sample rate (the host still stores the standard 4fsc grid).
+    fp.subcarrier_hz = config_.custom_subcarrier
+                           ? static_cast<double>(config_.subcarrier_khz) * 1.0e3
+                           : 0.0;
     return fp;
 }
 
@@ -969,6 +976,20 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             ParameterType::DOUBLE, real(0.0, 10.0, 1.0)},
         ParameterDescriptor{kMonochrome, "Monochrome",
             "Zero the chroma channel.", ParameterType::BOOL, boolean(false)},
+        ParameterDescriptor{kCustomSubcarrier, "Non-standard subcarrier",
+            "For sources with a deliberately lowered colour subcarrier — "
+            "notably JVC VHD at 2556.8 kHz. Tracks the frequency below "
+            "instead of the standard's nominal fsc (NTSC 3579.5455 kHz, "
+            "PAL 4433.61875 kHz); the sample grid is unchanged, only the "
+            "carrier moves. OFF (default) uses the standard.",
+            ParameterType::BOOL, boolean(false)},
+        ParameterDescriptor{kSubcarrierKhz, "Subcarrier frequency (kHz)",
+            "Used only when the checkbox above is ON. VHD 2556.8 (exact "
+            "line lock 2556.8182 = 162.5 x fH), NTSC 3579.5455, PAL "
+            "4433.61875. Wrong by a few kHz and the hue rotates "
+            "progressively along each line: sweep it while watching a flat "
+            "colour area.",
+            ParameterType::DOUBLE, real(500.0, 6000.0, 2556.8)},
         ParameterDescriptor{kPreviewFullRaster, "Preview: full raster",
             "PREVIEW ONLY (never affects the exported/written frames, which "
             "always honour the configured VideoParameters crop). ON: show "
@@ -1114,6 +1135,8 @@ HvdChromaDecoderStage::get_parameters() const
         {kAcc, config_.acc},
         {kChromaGain, static_cast<double>(config_.chroma_gain)},
         {kMonochrome, config_.monochrome},
+        {kCustomSubcarrier, config_.custom_subcarrier},
+        {kSubcarrierKhz, static_cast<double>(config_.subcarrier_khz)},
         {kPreviewFullRaster, preview_full_raster_},
         {kPreviewFieldView, preview_field_view_},
         {kSymmetryVariant, config_.symmetry_variant},
@@ -1173,6 +1196,8 @@ bool HvdChromaDecoderStage::set_parameters(
     get_bool(kAcc, config_.acc);
     get_double(kChromaGain, config_.chroma_gain);
     get_bool(kMonochrome, config_.monochrome);
+    get_bool(kCustomSubcarrier, config_.custom_subcarrier);
+    get_double(kSubcarrierKhz, config_.subcarrier_khz);
     get_bool(kPreviewFullRaster, preview_full_raster_);
     get_bool(kPreviewFieldView, preview_field_view_);
     get_bool(kSymmetryVariant, config_.symmetry_variant);

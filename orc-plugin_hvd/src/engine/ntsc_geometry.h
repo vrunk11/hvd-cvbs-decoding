@@ -14,6 +14,7 @@
 #ifndef ORC_PLUGIN_HVD_ENGINE_NTSC_GEOMETRY_H_
 #define ORC_PLUGIN_HVD_ENGINE_NTSC_GEOMETRY_H_
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -54,11 +55,44 @@ struct FieldGeometry {
   double sample_rate = kFs4Fsc;   // Hz
   VideoStandard standard = VideoStandard::kNtsc;
 
-  // Per-line carrier phase advance on the stored grid: 180 deg (NTSC,
-  // 227.5 cycles/line) or 270 deg (PAL, 283.75 cycles/line).
+  // NON-STANDARD SUBCARRIER (0 => use the standard's nominal fsc).
+  //
+  // Exists for captures whose composite is NTSC in every respect the host
+  // measures (line rate, sync, blanking, burst window, 4fsc-nominal sample
+  // grid) but whose colour subcarrier is NOT fs/4 — e.g. a disc/tape format
+  // with a deliberately lowered subcarrier. The sample RATE is unchanged
+  // (the host still stores CVBS_U10_4FSC on the standard's grid); only the
+  // carrier that rides on that grid moves.
+  //
+  // Nothing else in the engine reads this directly: it feeds phase_per_sample()
+  // and line_advance() below, and every equation downstream is generic in the
+  // effective carrier c. See docs for what does NOT follow automatically.
+  double subcarrier_hz = 0.0;
+
+  // Effective colour subcarrier frequency (Hz).
+  double fsc() const {
+    if (subcarrier_hz > 0.0) return subcarrier_hz;
+    return standard == VideoStandard::kPal ? kFscPal : kFscNtsc;
+  }
+
+  // Carrier phase advance per SAMPLE (rad). Exactly pi/2 when the grid is
+  // 4fsc (the standard case); anything else for a moved subcarrier.
+  double phase_per_sample() const {
+    return 2.0 * 3.14159265358979323846 * fsc() / sample_rate;
+  }
+
+  // Per-line carrier phase advance on the stored grid, derived rather than
+  // tabulated. cycles/line = fsc * field_width / sample_rate, so the standard
+  // cases fall out unchanged: NTSC 227.5 cycles/line -> 180 deg, PAL 283.75
+  // -> 270 deg. A non-standard fsc that is NOT an odd multiple of fH/2 gives
+  // something else, and that is diagnostic: several assumptions in this engine
+  // (the 2-line leak cancellation, the same-parity 180 deg flip) are only true
+  // at 180 deg.
   double line_advance() const {
-    return standard == VideoStandard::kPal ? 1.5 * 3.14159265358979323846
-                                           : 3.14159265358979323846;
+    const double cycles =
+        fsc() * static_cast<double>(field_width) / sample_rate;
+    const double frac = cycles - std::floor(cycles);
+    return 2.0 * 3.14159265358979323846 * frac;
   }
   // Nominal burst amplitude for ACC: 20 IRE (NTSC) / 21.43 IRE (PAL,
   // +/-150 mV on the 700 mV white).
