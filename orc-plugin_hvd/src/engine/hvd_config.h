@@ -140,6 +140,13 @@ struct HvdConfig {
   // separate for the same reason enable_temporal and temporal_strength are:
   // so a dialled-in frequency survives toggling the feature off and on.
   //
+  // TYPE IS double, NOT float, unlike every other numeric field here. The
+  // host's spinbox resolves 0.0001 kHz = 0.1 Hz, but float's ULP at 2556 kHz
+  // is 2^-12 kHz = 0.24 Hz — coarser than the control feeding it, so a float
+  // would silently swallow individual spinbox steps and could not hold
+  // 2556.8182 exactly. Everything downstream (FrameParams::subcarrier_hz,
+  // FieldGeometry::subcarrier_hz) is already double; this closes the one gap.
+  //
   // UNITS ARE kHz, NOT MHz, and that is not cosmetic: the host renders every
   // DOUBLE parameter with a hardcoded 4 decimal places
   // (stageparameterdialog.cpp, setDecimals(4)), which a plugin cannot
@@ -175,7 +182,7 @@ struct HvdConfig {
   // above are actively wrong for the source and the adaptive modes should be
   // replaced by forced values (chroma_aniso 0.5, a fixed temporal_strength).
   bool custom_subcarrier = false;
-  float subcarrier_khz = 2556.8F;  // JVC VHD
+  double subcarrier_khz = 2556.8182;  // VHD
 
   // --- Geometry -----------------------------------------------------------
   // Weave both fields into frame geometry before decoding (default, best

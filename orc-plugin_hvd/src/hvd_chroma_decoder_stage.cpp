@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <type_traits>
 #include <condition_variable>
 #include <fstream>
 #include <sstream>
@@ -136,9 +137,8 @@ HvdDecodedRepresentation::HvdDecodedRepresentation(
     fp.is_pal = (sp.system == VideoSystem::PAL);
     // Non-standard subcarrier: overrides the fsc implied by the system,
     // never the sample rate (the host still stores the standard 4fsc grid).
-    fp.subcarrier_hz = config_.custom_subcarrier
-                           ? static_cast<double>(config_.subcarrier_khz) * 1.0e3
-                           : 0.0;
+    fp.subcarrier_hz =
+        config_.custom_subcarrier ? config_.subcarrier_khz * 1.0e3 : 0.0;
     return fp;
 }
 
@@ -1136,7 +1136,7 @@ HvdChromaDecoderStage::get_parameters() const
         {kChromaGain, static_cast<double>(config_.chroma_gain)},
         {kMonochrome, config_.monochrome},
         {kCustomSubcarrier, config_.custom_subcarrier},
-        {kSubcarrierKhz, static_cast<double>(config_.subcarrier_khz)},
+        {kSubcarrierKhz, config_.subcarrier_khz},
         {kPreviewFullRaster, preview_full_raster_},
         {kPreviewFieldView, preview_field_view_},
         {kSymmetryVariant, config_.symmetry_variant},
@@ -1152,13 +1152,18 @@ HvdChromaDecoderStage::get_parameters() const
 bool HvdChromaDecoderStage::set_parameters(
     const std::map<std::string, ParameterValue>& params)
 {
-    auto get_double = [&](const char* key, float& dst) {
+    // Generic in the destination type. Most config fields are float, but
+    // subcarrier_khz is double: the GUI's step there (0.1 Hz) is finer than
+    // float's ULP at 2556 kHz (0.24 Hz), so a float destination would swallow
+    // spinbox steps. See hvd_config.h.
+    auto get_double = [&](const char* key, auto& dst) {
+        using T = std::decay_t<decltype(dst)>;
         auto it = params.find(key);
         if (it == params.end()) return;
         if (std::holds_alternative<double>(it->second))
-            dst = static_cast<float>(std::get<double>(it->second));
+            dst = static_cast<T>(std::get<double>(it->second));
         else if (std::holds_alternative<int32_t>(it->second))
-            dst = static_cast<float>(std::get<int32_t>(it->second));
+            dst = static_cast<T>(std::get<int32_t>(it->second));
     };
     auto get_int = [&](const char* key, int& dst) {
         auto it = params.find(key);
