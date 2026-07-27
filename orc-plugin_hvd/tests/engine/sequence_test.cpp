@@ -286,15 +286,35 @@ void RunTests() {
         clean.fields, clean.inits, g, c2d);
     const std::vector<DecodedField> d3c = hvd::DecodeFieldWindowWithInits(
         clean.fields, clean.inits, g, c3d);
+    hvd::SequenceDiagnostics dgc;
     const std::vector<DecodedField> dac = hvd::DecodeFieldWindowWithInits(
-        clean.fields, clean.inits, g, cauto);
+        clean.fields, clean.inits, g, cauto, &dgc);
     const double q2 = ChromaPsnr(d2c, clean.chi_truth);
     const double q3 = ChromaPsnr(d3c, clean.chi_truth);
     const double qa = ChromaPsnr(dac, clean.chi_truth);
-    std::printf("  clean scene: 2D=%.2f  3D@2=%.2f  adaptive=%.2f dB\n",
-                q2, q3, qa);
-    CHECK(qa > q3);        // adaptive avoids the fixed-strong penalty...
+    std::printf("  clean scene: 2D=%.2f  3D@2=%.2f  adaptive=%.2f dB"
+                "  (resolved strength=%.2f)\n",
+                q2, q3, qa, dgc.resolved_strength);
+    // Assert on what this block actually exists to test: the ambiguity
+    // metric must SEE that this scene carries no carrier-frequency luma and
+    // back the strength off to the floor.
+    //
+    // This used to be checked INDIRECTLY, as `qa > q3` — i.e. "backing off
+    // beats fixed-strong 3D" — which only held because fixed-strong 3D paid
+    // a penalty on clean content. That penalty was not intrinsic to the
+    // neighbour equations: it was the data/prior imbalance now fixed by the
+    // renormalisation in VariationalRefine{,Joint} (adding six neighbour
+    // equations grew the data side while the spatial priors kept fixed
+    // weights, silently weakening them). Measured on this very scene with
+    // the renormalisation disabled: 3D@2 = 41.46 dB against 2D = 44.33 —
+    // the ~-3 dB the old comment described. With it enabled, strong 3D on
+    // clean content is mildly POSITIVE (44.60 vs 44.33): with the balance
+    // preserved the neighbours can only average noise. So the ordering the
+    // old assertion encoded is gone, and asserting the resolved strength
+    // directly is both what was meant and robust to that fix.
+    CHECK(dgc.resolved_strength < 0.3F);  // clean scene -> back off
     CHECK(qa > q2 - 1.0);  // ...while staying near the 2D optimum
+    CHECK(qa > q3 - 1.0);  // ...and not far behind fixed-strong either
   }
 
   // --- adaptive strength: LOCALIZED ambiguity (thin bars / small text) ------
