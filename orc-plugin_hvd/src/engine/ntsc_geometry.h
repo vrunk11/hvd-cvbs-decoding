@@ -75,22 +75,41 @@ struct FieldGeometry {
     return standard == VideoStandard::kPal ? kFscPal : kFscNtsc;
   }
 
-  // Carrier phase advance per SAMPLE (rad). Exactly pi/2 when the grid is
-  // 4fsc (the standard case); anything else for a moved subcarrier.
+  // Carrier phase advance per SAMPLE (rad).
+  //
+  // When no non-standard subcarrier is declared this returns exactly pi/2 as
+  // a CONSTANT, and deliberately does not recompute it from fsc()/sample_rate.
+  // The stored grid IS 4fsc by definition of the source format, so pi/2 is
+  // the definition rather than a measurement — and callers legitimately build
+  // FieldGeometry values whose sample_rate is not physically meaningful (the
+  // engine tests set standard = kPal while leaving sample_rate at its NTSC
+  // default). Deriving unconditionally silently handed those callers a wrong
+  // carrier. Derivation happens only when the caller has explicitly opted in
+  // by setting subcarrier_hz, and is then their responsibility to feed with a
+  // real sample_rate.
   double phase_per_sample() const {
-    return 2.0 * 3.14159265358979323846 * fsc() / sample_rate;
+    if (subcarrier_hz <= 0.0) return 0.5 * 3.14159265358979323846;
+    return 2.0 * 3.14159265358979323846 * subcarrier_hz / sample_rate;
   }
 
-  // Per-line carrier phase advance on the stored grid, derived rather than
-  // tabulated. cycles/line = fsc * field_width / sample_rate, so the standard
-  // cases fall out unchanged: NTSC 227.5 cycles/line -> 180 deg, PAL 283.75
-  // -> 270 deg. A non-standard fsc that is NOT an odd multiple of fH/2 gives
-  // something else, and that is diagnostic: several assumptions in this engine
-  // (the 2-line leak cancellation, the same-parity 180 deg flip) are only true
-  // at 180 deg.
+  // Per-line carrier phase advance on the stored grid.
+  //
+  // Standard subcarrier: the tabulated 180 deg (NTSC, 227.5 cycles/line) or
+  // 270 deg (PAL, 283.75 cycles/line), for the same reason as above —
+  // field_width is a real samples-per-line only in production geometries,
+  // whereas tests set it to whatever their synthetic plane is wide.
+  //
+  // Non-standard subcarrier: derived as cycles/line = fsc * field_width /
+  // sample_rate. This is diagnostic — several assumptions in this engine (the
+  // 2-line leak cancellation, the same-parity 180 deg flip) hold only at
+  // 180 deg, so a value far from it is a warning about the source.
   double line_advance() const {
+    if (subcarrier_hz <= 0.0) {
+      return standard == VideoStandard::kPal ? 1.5 * 3.14159265358979323846
+                                             : 3.14159265358979323846;
+    }
     const double cycles =
-        fsc() * static_cast<double>(field_width) / sample_rate;
+        subcarrier_hz * static_cast<double>(field_width) / sample_rate;
     const double frac = cycles - std::floor(cycles);
     return 2.0 * 3.14159265358979323846 * frac;
   }
