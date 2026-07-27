@@ -54,9 +54,19 @@
 
             # Apple Clang does not ship OpenMP headers/runtime. Keep the
             # existing GCC/MinGW setup unchanged and provide LLVM OpenMP
-            # only on Darwin so <omp.h> and libomp are available to Clang.
+            # only on Darwin so <omp.h> and the runtime are available to it.
+            #
+            # The attribute is llvmPackages.openmp -- there is no top-level
+            # `libomp` in nixpkgs. Note how this hid on the other platforms:
+            # `lib.optionals cond list` does not force `list` when `cond` is
+            # false, so a non-existent attribute inside the Darwin-only branch
+            # is never evaluated on Linux/Windows and the build looks healthy.
+            # Taking it from llvmPackages (rather than a pinned llvmPackages_NN)
+            # keeps the runtime on the same LLVM generation as the default
+            # Darwin stdenv's clang, which is what the toolchain-tag note at the
+            # top of this file is about.
             ] ++ lib.optionals stdenv.isDarwin [
-              libomp
+              llvmPackages.openmp
             ] ++ [
 
             # Development tools (mirrors the decode-orc dev shell subset
@@ -98,10 +108,10 @@
             #     expansion and evaluates it as a Nix expression: a PARSE
             #     error, which fires on Linux too despite the Darwin guard.
             ${pkgs.lib.optionalString stdenv.isDarwin ''
-              export OpenMP_ROOT="${pkgs.libomp}"
-              export LIBOMP_ROOT="${pkgs.libomp}"
-              export CPPFLAGS="-I${pkgs.libomp}/include ''${CPPFLAGS:-}"
-              export LDFLAGS="-L${pkgs.libomp}/lib ''${LDFLAGS:-}"
+              export OpenMP_ROOT="${pkgs.llvmPackages.openmp}"
+              export LIBOMP_ROOT="${pkgs.llvmPackages.openmp}"
+              export CPPFLAGS="-I${pkgs.llvmPackages.openmp}/include ''${CPPFLAGS:-}"
+              export LDFLAGS="-L${pkgs.llvmPackages.openmp}/lib ''${LDFLAGS:-}"
             ''}
           '';
 
