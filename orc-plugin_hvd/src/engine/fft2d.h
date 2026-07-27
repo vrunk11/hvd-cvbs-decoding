@@ -37,22 +37,17 @@ class Fft2d {
   // std::thread::hardware_concurrency() at construction (use every core for
   // the one frame usually being decoded — the preview/normal path).
   //
-  // IMPORTANT for parallel export (hvd_chroma_decoder_stage.cpp): FFTW's
-  // threading is a global PLANNER setting (fftwf_plan_with_nthreads),
-  // applied at plan-CREATION time, not per-execution — so this only
-  // affects plans created AFTER this call, and every Fft2d sharing the
-  // process (i.e. every export worker thread's own Fft2d) affects the same
-  // global FFTW planner state while planning. That's already serialised by
-  // the same planning mutex that guards fftwf_plan_dft_2d (see fft2d.cpp),
-  // so it's safe, but each export worker MUST call SetThreadCount(1) before
-  // its first Forward()/Inverse() — otherwise every one of the N worker
-  // threads would ALSO fan its own FFTs out across every core, the same
-  // oversubscription problem LimitOpenMpThreadsPerWorker() exists to avoid,
-  // just for FFTW instead of OpenMP.
-  //
-  // No-op (transforms always run on 1 thread, silently) if FFTW wasn't
-  // built with threading support — see CMakeLists.txt's FFTW3F_THREADS
-  // detection.
+  // FFTW is built WITHOUT threading support in this project (see
+  // vcpkg.json / CMakeLists.txt: a threaded fftw3f pulls in its own OpenMP
+  // runtime alongside this project's own -fopenmp one, which caused DLL/
+  // symbol conflicts the host's own decode-orc doesn't have — for FFT sizes
+  // this small, the speed difference measured as negligible against the
+  // OpenMP-parallel IRLS/CG solver that does the actual work). So this is
+  // ALWAYS a no-op now: transforms always run on 1 thread internally,
+  // silently, regardless of n. Kept (rather than removed) purely so
+  // callers — export workers pinning this to 1 per hvd_chroma_decoder_
+  // stage.cpp's oversubscription-avoidance logic, and the config_.
+  // fft_threads GUI knob — don't need conditional compilation of their own.
   void SetThreadCount(int n);
 
  private:

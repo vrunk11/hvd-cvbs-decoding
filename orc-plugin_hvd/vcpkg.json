@@ -2,12 +2,7 @@
   "name": "orc-plugin-hvd",
   "version": "0.1.0",
   "dependencies": [
-    {
-      "name": "fftw3",
-      "features": [
-        "threads"
-      ]
-    },
+    "fftw3",
     "fmt"
   ]
 }

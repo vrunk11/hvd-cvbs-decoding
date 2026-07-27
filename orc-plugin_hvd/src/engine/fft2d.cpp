@@ -38,16 +38,6 @@ std::mutex& PlanningMutex() {
   static std::mutex m;
   return m;
 }
-
-#ifdef HVD_HAVE_FFTW_THREADS
-void EnsureFftwThreadsInitialised() {
-  static std::once_flag once;
-  std::call_once(once, [] {
-    std::lock_guard<std::mutex> lock(PlanningMutex());
-    fftwf_init_threads();
-  });
-}
-#endif
 }  // namespace
 
 struct Fft2d::Impl {
@@ -59,12 +49,15 @@ struct Fft2d::Impl {
   ComplexPlane scratch_in;
   ComplexPlane scratch_out;
 
-  // Thread count FFTW uses internally for plans created FROM NOW ON (not
-  // retroactively for already-cached plans — see SetThreadCount's doc
-  // comment in fft2d.h). Defaults to every core: the common case is one
-  // frame being decoded at a time (preview), where using every core inside
-  // the FFT itself is exactly what we want.
-  int thread_count = std::max<int>(1, static_cast<int>(std::thread::hardware_concurrency()));
+  // Thread count requested via Fft2d::SetThreadCount / HvdEngine::SetFftThreads.
+  // Stored so callers (export workers pinning this to 1, see fft2d.h) keep
+  // compiling and behaving the same, but FFTW itself no longer threads its
+  // own transforms — this build links the single-threaded fftw3f (see the
+  // vcpkg.json / CMakeLists comment on HVD_HAVE_FFTW_THREADS's removal): the
+  // library problems from a second OpenMP runtime bundled into a threaded
+  // fftw3f outweighed a speed gain that measured as negligible next to the
+  // OpenMP-parallel IRLS/CG solver, which remains fully threaded.
+  int thread_count = 1;
 
   ~Impl() {
     std::lock_guard<std::mutex> lock(PlanningMutex());
@@ -76,15 +69,9 @@ struct Fft2d::Impl {
     const auto key = std::make_tuple(h, w, sign);
     auto it = plans.find(key);
     if (it != plans.end()) return it->second;
-#ifdef HVD_HAVE_FFTW_THREADS
-    EnsureFftwThreadsInitialised();
-#endif
     fftwf_plan p;
     {
       std::lock_guard<std::mutex> lock(PlanningMutex());
-#ifdef HVD_HAVE_FFTW_THREADS
-      fftwf_plan_with_nthreads(thread_count);
-#endif
       p = fftwf_plan_dft_2d(h, w, in, out, sign, FFTW_ESTIMATE);
     }
     plans.emplace(key, p);

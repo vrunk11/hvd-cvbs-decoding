@@ -86,93 +86,36 @@ find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
     pkg_check_modules(FFTW3F IMPORTED_TARGET fftw3f)
 endif()
-
 if(NOT FFTW3F_FOUND)
-    # Nix exposes single-precision FFTW as the fftwFloat package. In CI,
-    # FFTW_DIR/FFTW3F_ROOT points at that package prefix. Also search
-    # CMAKE_PREFIX_PATH so this works outside Nix when a prefix is supplied.
-    find_library(FFTW3F_LIBRARY
-        NAMES fftw3f libfftw3f-3 fftw3f-3 libfftw3f
-        HINTS
-            ENV FFTW3F_ROOT
-            ENV FFTW_DIR
-            ${CMAKE_PREFIX_PATH}
-        PATH_SUFFIXES lib
-    )
-    find_path(FFTW3F_INCLUDE_DIR
-        NAMES fftw3.h
-        HINTS
-            ENV FFTW3F_ROOT
-            ENV FFTW_DIR
-            ${CMAKE_PREFIX_PATH}
-        PATH_SUFFIXES include
-    )
-
+    find_library(FFTW3F_LIBRARY NAMES fftw3f libfftw3f-3 fftw3f-3 libfftw3f
+        HINTS ENV FFTW_DIR PATH_SUFFIXES lib)
+    find_path(FFTW3F_INCLUDE_DIR NAMES fftw3.h
+        HINTS ENV FFTW_DIR PATH_SUFFIXES include)
     if(NOT FFTW3F_LIBRARY OR NOT FFTW3F_INCLUDE_DIR)
         message(FATAL_ERROR
-            "FFTW3 single-precision (fftw3f) not found. "
-            "Install/provide the single-precision FFTW package "
-            "(nixpkgs: fftwFloat), or pass "
-            "-DFFTW3F_LIBRARY=<path/to/libfftw3f> and "
-            "-DFFTW3F_INCLUDE_DIR=<path/to/include>. "
+            "FFTW3 single-precision (fftw3f) not found. Pass "
+            "-DFFTW3F_LIBRARY=<...> and -DFFTW3F_INCLUDE_DIR=<dir of fftw3.h>. "
             "Note: the single-precision 'f' variant is required.")
     endif()
-
     add_library(PkgConfig::FFTW3F INTERFACE IMPORTED)
     set_target_properties(PkgConfig::FFTW3F PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES "${FFTW3F_INCLUDE_DIR}"
         INTERFACE_LINK_LIBRARIES "${FFTW3F_LIBRARY}")
-else()
-    message(STATUS "Found FFTW3F via pkg-config: ${FFTW3F_VERSION}")
 endif()
 
-# --- FFTW3 threading (optional): lets FFTW's own 2-D transforms use
-# multiple threads internally — this is on top of, not instead of, the
-# OpenMP/std::thread parallelism elsewhere in hvd_core; it's the last major
-# unparallelised chunk of a single frame's decode (HolographicInit does 3-4
-# full-picture 2-D FFTs per frame).
-#
-# This does NOT search for a separate library file. Some FFTW builds ship
-# threading as a distinct fftw3f_threads/fftw3f_omp library, but vcpkg's
-# fftw3[threads] (or [openmp]) feature compiles the threading symbols
-# (fftwf_init_threads, fftwf_plan_with_nthreads) directly INTO the base
-# fftw3f library instead — verified against an actual vcpkg x64-mingw-
-# dynamic build, which produces only libfftw3f.dll/.dll.a, no separate
-# threads/omp artifact at all. So instead of looking for a file, we just
-# try to actually link a program calling those symbols against whatever
-# fftw3f we already have — the only test that's actually correct across
-# both packaging styles.
-include(CheckCXXSourceCompiles)
-get_target_property(_fftw3f_test_incs PkgConfig::FFTW3F INTERFACE_INCLUDE_DIRECTORIES)
-get_target_property(_fftw3f_test_libs PkgConfig::FFTW3F INTERFACE_LINK_LIBRARIES)
-set(CMAKE_REQUIRED_INCLUDES ${_fftw3f_test_incs})
-set(CMAKE_REQUIRED_LIBRARIES ${_fftw3f_test_libs})
-check_cxx_source_compiles("
-    #include <fftw3.h>
-    int main() {
-      fftwf_init_threads();
-      fftwf_plan_with_nthreads(1);
-      return 0;
-    }
-" HVD_FFTW_THREADS_AVAILABLE)
-unset(CMAKE_REQUIRED_INCLUDES)
-unset(CMAKE_REQUIRED_LIBRARIES)
-
-if(HVD_FFTW_THREADS_AVAILABLE)
-    message(STATUS
-        "FFTW3 threading symbols available in fftw3f: FFTW's own "
-        "transforms will use multiple threads too, not just the caller's "
-        "OpenMP/std::thread parallelism.")
-else()
-    message(WARNING
-        "fftwf_init_threads/fftwf_plan_with_nthreads not available in the "
-        "linked fftw3f — FFTW's 2-D transforms will run single-threaded. "
-        "This is currently the largest remaining unparallelised chunk of "
-        "per-frame decode time. If using vcpkg, make sure vcpkg.json "
-        "requests fftw3's 'threads' or 'openmp' feature. The build "
-        "proceeds fine either way — this is a perf nice-to-have, not a "
-        "hard requirement.")
-endif()
+# --- FFTW3 threading: deliberately NOT used ------------------------------
+# This project used to detect and, if present, use fftw3f's own internal
+# threading (fftwf_init_threads/fftwf_plan_with_nthreads) on top of the
+# OpenMP/std::thread parallelism already in hvd_core. That is removed: a
+# threaded fftw3f (vcpkg's fftw3[threads] feature, see vcpkg.json) links its
+# own OpenMP runtime, which alongside this project's own -fopenmp one
+# produced DLL/symbol conflicts the host (decode-orc, built without threaded
+# FFTW) doesn't have. The transforms here are small enough per call
+# (HolographicInit's 3-4 full-picture 2-D FFTs per frame) that the measured
+# speed gain from threading FFTW itself was negligible next to the
+# OpenMP-parallel IRLS/CG solver that dominates decode time and remains
+# fully threaded. See fft2d.h's SetThreadCount doc comment: it is kept as a
+# no-op so callers don't need conditional compilation of their own.
 
 # --- hvd_core: the SDK-free numerical library (engine + frame bridge) ---------
 # NOTE: variational.cpp already has #pragma omp parallel for on its hot
@@ -195,59 +138,13 @@ endif()
 # automatically whenever -fopenmp is present at link time, no need to name
 # the library by hand. find_package(OpenMP) is kept only for the
 # diagnostic message below.
-# OpenMP:
-# - Linux/GCC: use the compiler's normal OpenMP support.
-# - Windows/MinGW: keep the existing explicit -fopenmp behavior; GCC pulls
-#   in libgomp at link time.
-# - macOS/Clang: Apple Clang needs the Nix-provided libomp package for both
-#   <omp.h> and the OpenMP runtime. Prefer CMake's OpenMP target when it is
-#   available, with explicit libomp hints from the Nix environment.
-if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    find_path(OpenMP_CXX_INCLUDE_DIR
-        NAMES omp.h
-        HINTS
-            ENV OpenMP_ROOT
-            ENV LIBOMP_ROOT
-        PATH_SUFFIXES include
-    )
-    find_library(OpenMP_CXX_LIBRARY
-        NAMES omp libomp
-        HINTS
-            ENV OpenMP_ROOT
-            ENV LIBOMP_ROOT
-        PATH_SUFFIXES lib
-    )
-
-    if(OpenMP_CXX_INCLUDE_DIR AND OpenMP_CXX_LIBRARY)
-        message(STATUS
-            "Using macOS LLVM OpenMP: "
-            "${OpenMP_CXX_INCLUDE_DIR}, ${OpenMP_CXX_LIBRARY}")
-
-        add_library(hvd_openmp INTERFACE)
-        target_include_directories(hvd_openmp INTERFACE
-            "${OpenMP_CXX_INCLUDE_DIR}")
-        target_compile_options(hvd_openmp INTERFACE -fopenmp)
-        target_link_options(hvd_openmp INTERFACE -fopenmp)
-        target_link_libraries(hvd_openmp INTERFACE "${OpenMP_CXX_LIBRARY}")
-        set(HVD_OPENMP_AVAILABLE ON)
-    else()
-        message(FATAL_ERROR
-            "OpenMP is required on macOS, but libomp/omp.h was not found. "
-            "Make sure nixpkgs.libomp is in the devShell.")
-    endif()
-else()
-    find_package(OpenMP QUIET)
-    if(OpenMP_CXX_FOUND)
-        set(HVD_OPENMP_AVAILABLE ON)
-    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        # Preserve the existing Linux/MinGW behavior.
-        message(WARNING
-            "OpenMP not detected by find_package(OpenMP); forcing "
-            "-fopenmp for GCC/Clang.")
-        set(HVD_OPENMP_AVAILABLE ON)
-    else()
-        message(WARNING "OpenMP not detected; OpenMP code may not link.")
-    endif()
+find_package(OpenMP QUIET)
+if(NOT OpenMP_CXX_FOUND)
+    message(WARNING
+        "OpenMP not detected by find_package(OpenMP): if the compiler is "
+        "GCC or Clang we still force -fopenmp explicitly below, so this is "
+        "informational, not necessarily a problem. On MinGW-w64, OpenMP "
+        "just needs libgomp to be installed.")
 endif()
 
 add_library(hvd_core STATIC
@@ -265,24 +162,17 @@ add_library(hvd_core STATIC
 )
 target_include_directories(hvd_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(hvd_core PUBLIC PkgConfig::FFTW3F)
-if(HVD_FFTW_THREADS_AVAILABLE)
-    # No extra target_link_libraries: the threading symbols are already
-    # part of PkgConfig::FFTW3F, just above — see the detection comment.
-    target_compile_definitions(hvd_core PUBLIC HVD_HAVE_FFTW_THREADS)
-endif()
 
-if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    # Propagate the Nix libomp include path, -fopenmp, and runtime to every
-    # consumer of hvd_core (plugin + tests).
-    target_link_libraries(hvd_core PUBLIC hvd_openmp)
-elseif(OpenMP_CXX_FOUND)
-    # Keep Windows/MSVC and any other platform where CMake found a proper
-    # OpenMP target on the existing implementation.
-    target_link_libraries(hvd_core PUBLIC OpenMP::OpenMP_CXX)
-elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    # Preserve the existing Linux/MinGW fallback.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # PUBLIC: needs to reach every consumer's compile AND link command
+    # (the plugin DLL, every tests/engine/*_test, hvd_stage_smoke_test,
+    # hvd_plugin_entrypoints_test — anything that pulls in variational.cpp
+    # transitively through hvd_core).
     target_compile_options(hvd_core PUBLIC -fopenmp)
     target_link_options(hvd_core PUBLIC -fopenmp)
+elseif(OpenMP_CXX_FOUND)
+    # MSVC or anything else find_package(OpenMP) actually handles cleanly.
+    target_link_libraries(hvd_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
 # Frame-level parallel export (hvd_chroma_decoder_stage.cpp, part of the
