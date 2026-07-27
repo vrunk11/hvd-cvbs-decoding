@@ -85,12 +85,14 @@
             export FFTW3F_ROOT="${pkgs.fftwFloat}"
 
             # Apple Clang needs the Nix-provided LLVM OpenMP runtime.
-            if [ "${pkgs.stdenv.hostPlatform.isDarwin}" = "1" ]; then
+            # This is evaluated by Nix only on Darwin; do not interpolate
+            # the Boolean stdenv.isDarwin into the shell script.
+            ${lib.optionalString stdenv.isDarwin ''
               export OpenMP_ROOT="${pkgs.libomp}"
               export LIBOMP_ROOT="${pkgs.libomp}"
-              export CPPFLAGS="-I${pkgs.libomp}/include ${CPPFLAGS:-}"
-              export LDFLAGS="-L${pkgs.libomp}/lib ${LDFLAGS:-}"
-            fi
+              export CPPFLAGS="-I${pkgs.libomp}/include $${CPPFLAGS:-}"
+              export LDFLAGS="-L${pkgs.libomp}/lib $${LDFLAGS:-}"
+            ''}
           '';
 
           CMAKE_EXPORT_COMPILE_COMMANDS = 1;
