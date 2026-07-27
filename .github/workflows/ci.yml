@@ -1,5 +1,18 @@
 name: CI and Release
 
+# WHY THIS FILE IS AT THE REPOSITORY ROOT
+#
+# GitHub Actions only discovers workflows in <repo-root>/.github/workflows/.
+# This repository's root holds orc-plugin_hvd/ and research/, so the previous
+# copy at orc-plugin_hvd/.github/workflows/ci.yml was never picked up — it had
+# never run. Every `run:` step below therefore sets working-directory to the
+# plugin subdirectory (where CMakeLists.txt lives) via the job-level `defaults`.
+#
+# NOTE: `defaults.run.working-directory` applies to `run:` steps ONLY. Steps
+# using `uses:` (checkout, upload-artifact, download-artifact) resolve their
+# paths against the workspace root regardless, which is why the artifact upload
+# path below carries an explicit orc-plugin_hvd/ prefix.
+
 on:
   push:
     branches: [ main ]
@@ -17,23 +30,39 @@ jobs:
   # matrix spends its time. Needs only cmake + g++ + fftw3f.
   engine-tests:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: orc-plugin_hvd
     steps:
       - uses: actions/checkout@v4
-      - name: Install FFTW (single precision) 
+
+      - name: Install FFTW (single precision)
         run: sudo apt-get update && sudo apt-get install -y libfftw3-dev cmake ninja-build
+
       - name: Configure (engine only)
         run: cmake -S . -B build-engine -G Ninja -DHVD_ENGINE_ONLY=ON -DBUILD_TESTS=ON
+
       - name: Build
         run: cmake --build build-engine --parallel
+
       - name: Test
         run: ctest --test-dir build-engine --output-on-failure
 
   build-test-package:
     needs: engine-tests
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: orc-plugin_hvd
     env:
       ORC_SDK_DIR: ${{ github.workspace }}/decode-orc
-      ORC_SDK_REF: v2.0.0
+      # Tracks the host's main branch, matching orc-plugin_skeleton. A pinned
+      # tag would be more reproducible, but this plugin now includes
+      # <orc/abi/orc_plugin_sdk.h> (the tiered SDK layout) and only an SDK
+      # that ships the orc/abi/ tier will satisfy it. Re-pin to the earliest
+      # tag containing orc/sdk/include/orc/abi/ once that is known; the
+      # verification step below reports the available tiers on mismatch.
+      ORC_SDK_REF: main
       ORC_CMAKE_ARGS: -DORC_INTREE_SDK_DIR=${{ github.workspace }}/decode-orc -DBUILD_TESTS=ON
     strategy:
       fail-fast: false
@@ -53,7 +82,7 @@ jobs:
             use_nix: false
 
     steps:
-      - name: Checkout skeleton plugin
+      - name: Checkout plugin
         uses: actions/checkout@v4
 
       - name: Checkout decode-orc host repository
@@ -70,7 +99,13 @@ jobs:
       - name: Verify SDK headers (POSIX)
         if: runner.os != 'Windows'
         run: |
-          test -f "$ORC_SDK_DIR/orc/sdk/include/orc/plugin/orc_plugin_sdk.h"
+          if [ ! -f "$ORC_SDK_DIR/orc/sdk/include/orc/abi/orc_plugin_sdk.h" ]; then
+            echo "::error::SDK checkout '$ORC_SDK_REF' has no orc/abi/ tier."
+            echo "This plugin includes <orc/abi/orc_plugin_sdk.h>."
+            echo "Tiers present under orc/sdk/include/orc:"
+            ls -1 "$ORC_SDK_DIR/orc/sdk/include/orc" || true
+            exit 1
+          fi
           test -f "$ORC_SDK_DIR/orc/sdk/include/orc/plugin/orc_stage_preview.h"
           test -f "$ORC_SDK_DIR/orc/sdk/include/orc/plugin/orc_stage_runtime.h"
 
@@ -78,8 +113,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          if (-not (Test-Path "$env:ORC_SDK_DIR/orc/sdk/include/orc/plugin/orc_plugin_sdk.h")) {
-            throw "Missing orc_plugin_sdk.h in SDK checkout"
+          if (-not (Test-Path "$env:ORC_SDK_DIR/orc/sdk/include/orc/abi/orc_plugin_sdk.h")) {
+            Write-Host "::error::SDK checkout '$env:ORC_SDK_REF' has no orc/abi/ tier."
+            Write-Host "Tiers present under orc/sdk/include/orc:"
+            Get-ChildItem "$env:ORC_SDK_DIR/orc/sdk/include/orc" -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host " - $($_.Name)" }
+            throw "Missing orc/abi/orc_plugin_sdk.h in SDK checkout"
           }
           if (-not (Test-Path "$env:ORC_SDK_DIR/orc/sdk/include/orc/plugin/orc_stage_preview.h")) {
             throw "Missing orc_stage_preview.h in SDK checkout"
@@ -100,6 +139,9 @@ jobs:
           nix develop --accept-flake-config --command \
             cmake -S . -B build $ORC_CMAKE_ARGS
 
+      # No explicit `vcpkg install` step: vcpkg.json in this directory puts
+      # vcpkg into manifest mode, so the toolchain file below installs fftw3
+      # (with the threads feature) and fmt during configure.
       - name: Configure (native)
         if: ${{ !matrix.use_nix }}
         run: >
@@ -147,11 +189,12 @@ jobs:
           if (-not $candidate) { throw 'Could not locate built plugin DLL' }
           Copy-Item $candidate.FullName "dist/orc-plugin_hvd_chroma_decoder_windows.dll"
 
+      # `uses:` steps ignore working-directory, hence the explicit prefix.
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
           name: plugin-${{ matrix.platform }}
-          path: dist/*
+          path: orc-plugin_hvd/dist/*
 
   publish-release:
     if: startsWith(github.ref, 'refs/tags/v')

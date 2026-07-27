@@ -193,7 +193,7 @@ PalBurstLockin BurstLockinPhasePal(const Plane& field_ire,
   out.theta.assign(h, 0.0F);
   out.vswitch.assign(h, 1);
 
-  const float adv = static_cast<float>(g.line_advance());  // 3*pi/2
+  const float adv = static_cast<float>(g.line_advance());  // 3*pi/2 for standard PAL
   constexpr float kQuarterPi = 0.78539816339744830962F;
 
   const float amp_max =

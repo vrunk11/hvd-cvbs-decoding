@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include <orc/plugin/orc_plugin_sdk.h>
+#include <orc/abi/orc_plugin_sdk.h>
 #include <orc/stage/colour_preview_provider.h>
 #include <orc/stage/preview/stage_custom_preview_renderer.h>
 #include <orc/stage/triggerable_stage.h>

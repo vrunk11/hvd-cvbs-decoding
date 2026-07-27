@@ -2,7 +2,7 @@
   description = "Decode-Orc HVD chroma decoder stage plugin";
 
   # Keep the nixpkgs input aligned with the decode-orc host repository's
-  # flake (github:simoninns/decode-orc). Since Decode-Orc 2.0 (host ABI 5)
+  # flake (github:simoninns/decode-orc). Since Decode-Orc 2.0 (host ABI 5+)
   # the plugin loader requires the plugin's toolchain tag — compiler family,
   # major version, and C++ standard library — to equal the host's exactly.
   # Building from a different nixpkgs generation (and therefore a different
@@ -19,10 +19,12 @@
           inherit system;
         };
 
-        # Use the nixpkgs default stdenv (gcc + libstdc++), exactly as the
-        # decode-orc flake does. Do not add clang here: compiling the plugin
-        # with a different compiler family than the host changes the
-        # toolchain tag and the host will reject the binary.
+        # Use the nixpkgs default stdenv, exactly as the decode-orc flake
+        # does: gcc + libstdc++ on Linux, clang + libc++ on macOS. Do not
+        # override the compiler family here. Building the plugin with a
+        # different family or C++ standard library than the host changes the
+        # toolchain tag and the host will reject the binary; inheriting the
+        # default keeps the tag matched on every platform.
         stdenv = pkgs.stdenv;
       in {
         devShells.default = pkgs.mkShell.override { inherit stdenv; } {
@@ -59,7 +61,10 @@
 
           shellHook = ''
             echo "orc-plugin_hvd nix development environment"
-            echo "C++ toolchain: $(g++ --version | head -n1)"
+            # Probe via $CXX, not a hardcoded g++: the Darwin stdenv is
+            # clang-based and has no g++, so the name would fall through to
+            # Apple's /usr/bin/g++ xcrun shim and fail.
+            echo "C++ toolchain: $($CXX --version | head -n1)"
 
             # Set up ccache if available
             export CMAKE_CXX_COMPILER_LAUNCHER=ccache

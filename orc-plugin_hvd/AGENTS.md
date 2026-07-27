@@ -6,9 +6,13 @@ Use these instructions for all changes in this repository.
 - Follow the latest decode-orc patterns from main:
   - https://github.com/simoninns/decode-orc/tree/main/orc/plugins
   - https://github.com/simoninns/decode-orc/tree/main/orc/plugins/stages
-- For SDK usage and ABI contracts, use only public SDK headers under:
-  - `orc/sdk/include/orc/plugin/`
-  - `orc/sdk/include/orc/stage/`
+- For SDK usage and ABI contracts, use only public SDK headers under the
+  tiered SDK layout:
+  - `orc/sdk/include/orc/abi/` (frozen binary contract: descriptor,
+    entrypoints, registration, services — include `<orc/abi/orc_plugin_sdk.h>`)
+  - `orc/sdk/include/orc/plugin/` (stage API/runtime/preview aggregators)
+  - `orc/sdk/include/orc/stage/` (stage interfaces and data-contract types)
+  - `orc/sdk/include/orc/support/` (header-only/helper conveniences)
 
 ## SDK Boundary (Hard Rule)
 - This repository is an external plugin project.

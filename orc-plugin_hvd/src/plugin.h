@@ -9,7 +9,7 @@
 #pragma once
 
 #include <cstdint>
-#include <orc/plugin/orc_plugin_sdk.h>
+#include <orc/abi/orc_plugin_sdk.h>
 
 #ifndef ORC_STAGE_PLUGIN_VERSION
 #define ORC_STAGE_PLUGIN_VERSION "dev"
