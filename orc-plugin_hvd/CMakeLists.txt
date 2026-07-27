@@ -195,13 +195,59 @@ endif()
 # automatically whenever -fopenmp is present at link time, no need to name
 # the library by hand. find_package(OpenMP) is kept only for the
 # diagnostic message below.
-find_package(OpenMP QUIET)
-if(NOT OpenMP_CXX_FOUND)
-    message(WARNING
-        "OpenMP not detected by find_package(OpenMP): if the compiler is "
-        "GCC or Clang we still force -fopenmp explicitly below, so this is "
-        "informational, not necessarily a problem. On MinGW-w64, OpenMP "
-        "just needs libgomp to be installed.")
+# OpenMP:
+# - Linux/GCC: use the compiler's normal OpenMP support.
+# - Windows/MinGW: keep the existing explicit -fopenmp behavior; GCC pulls
+#   in libgomp at link time.
+# - macOS/Clang: Apple Clang needs the Nix-provided libomp package for both
+#   <omp.h> and the OpenMP runtime. Prefer CMake's OpenMP target when it is
+#   available, with explicit libomp hints from the Nix environment.
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    find_path(OpenMP_CXX_INCLUDE_DIR
+        NAMES omp.h
+        HINTS
+            ENV OpenMP_ROOT
+            ENV LIBOMP_ROOT
+        PATH_SUFFIXES include
+    )
+    find_library(OpenMP_CXX_LIBRARY
+        NAMES omp libomp
+        HINTS
+            ENV OpenMP_ROOT
+            ENV LIBOMP_ROOT
+        PATH_SUFFIXES lib
+    )
+
+    if(OpenMP_CXX_INCLUDE_DIR AND OpenMP_CXX_LIBRARY)
+        message(STATUS
+            "Using macOS LLVM OpenMP: "
+            "${OpenMP_CXX_INCLUDE_DIR}, ${OpenMP_CXX_LIBRARY}")
+
+        add_library(hvd_openmp INTERFACE)
+        target_include_directories(hvd_openmp INTERFACE
+            "${OpenMP_CXX_INCLUDE_DIR}")
+        target_compile_options(hvd_openmp INTERFACE -fopenmp)
+        target_link_options(hvd_openmp INTERFACE -fopenmp)
+        target_link_libraries(hvd_openmp INTERFACE "${OpenMP_CXX_LIBRARY}")
+        set(HVD_OPENMP_AVAILABLE ON)
+    else()
+        message(FATAL_ERROR
+            "OpenMP is required on macOS, but libomp/omp.h was not found. "
+            "Make sure nixpkgs.libomp is in the devShell.")
+    endif()
+else()
+    find_package(OpenMP QUIET)
+    if(OpenMP_CXX_FOUND)
+        set(HVD_OPENMP_AVAILABLE ON)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        # Preserve the existing Linux/MinGW behavior.
+        message(WARNING
+            "OpenMP not detected by find_package(OpenMP); forcing "
+            "-fopenmp for GCC/Clang.")
+        set(HVD_OPENMP_AVAILABLE ON)
+    else()
+        message(WARNING "OpenMP not detected; OpenMP code may not link.")
+    endif()
 endif()
 
 add_library(hvd_core STATIC
@@ -225,16 +271,18 @@ if(HVD_FFTW_THREADS_AVAILABLE)
     target_compile_definitions(hvd_core PUBLIC HVD_HAVE_FFTW_THREADS)
 endif()
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    # PUBLIC: needs to reach every consumer's compile AND link command
-    # (the plugin DLL, every tests/engine/*_test, hvd_stage_smoke_test,
-    # hvd_plugin_entrypoints_test — anything that pulls in variational.cpp
-    # transitively through hvd_core).
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Propagate the Nix libomp include path, -fopenmp, and runtime to every
+    # consumer of hvd_core (plugin + tests).
+    target_link_libraries(hvd_core PUBLIC hvd_openmp)
+elseif(OpenMP_CXX_FOUND)
+    # Keep Windows/MSVC and any other platform where CMake found a proper
+    # OpenMP target on the existing implementation.
+    target_link_libraries(hvd_core PUBLIC OpenMP::OpenMP_CXX)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Preserve the existing Linux/MinGW fallback.
     target_compile_options(hvd_core PUBLIC -fopenmp)
     target_link_options(hvd_core PUBLIC -fopenmp)
-elseif(OpenMP_CXX_FOUND)
-    # MSVC or anything else find_package(OpenMP) actually handles cleanly.
-    target_link_libraries(hvd_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
 # Frame-level parallel export (hvd_chroma_decoder_stage.cpp, part of the

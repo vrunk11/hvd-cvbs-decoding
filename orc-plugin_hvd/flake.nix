@@ -52,6 +52,13 @@
             # `fftw` only provides the default/double-precision variant.
             fftwFloat
 
+            # Apple Clang does not ship OpenMP headers/runtime. Keep the
+            # existing GCC/MinGW setup unchanged and provide LLVM OpenMP
+            # only on Darwin so <omp.h> and libomp are available to Clang.
+            ] ++ lib.optionals stdenv.isDarwin [
+              libomp
+            ] ++ [
+
             # Development tools (mirrors the decode-orc dev shell subset
             # relevant to plugin work).
             clang-tools
@@ -76,6 +83,14 @@
             # deterministic on CI instead of depending on host search paths.
             export FFTW_DIR="${pkgs.fftwFloat}"
             export FFTW3F_ROOT="${pkgs.fftwFloat}"
+
+            # Apple Clang needs the Nix-provided LLVM OpenMP runtime.
+            if [ "${pkgs.stdenv.hostPlatform.isDarwin}" = "1" ]; then
+              export OpenMP_ROOT="${pkgs.libomp}"
+              export LIBOMP_ROOT="${pkgs.libomp}"
+              export CPPFLAGS="-I${pkgs.libomp}/include ${CPPFLAGS:-}"
+              export LDFLAGS="-L${pkgs.libomp}/lib ${LDFLAGS:-}"
+            fi
           '';
 
           CMAKE_EXPORT_COMPILE_COMMANDS = 1;
