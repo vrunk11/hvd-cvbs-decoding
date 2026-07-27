@@ -47,8 +47,10 @@
             libpng
             ffmpeg
 
-            # HVD engine dependency (single-precision FFT).
-            fftw
+            # HVD engine dependency: single-precision FFTW (fftw3f).
+            # nixpkgs exposes single precision as fftwFloat; using plain
+            # `fftw` only provides the default/double-precision variant.
+            fftwFloat
 
             # Development tools (mirrors the decode-orc dev shell subset
             # relevant to plugin work).
@@ -68,6 +70,12 @@
 
             # Set up ccache if available
             export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+            # Make the single-precision FFTW prefix explicit for CMake.
+            # This also makes the fallback find_library/find_path logic
+            # deterministic on CI instead of depending on host search paths.
+            export FFTW_DIR="${pkgs.fftwFloat}"
+            export FFTW3F_ROOT="${pkgs.fftwFloat}"
           '';
 
           CMAKE_EXPORT_COMPILE_COMMANDS = 1;

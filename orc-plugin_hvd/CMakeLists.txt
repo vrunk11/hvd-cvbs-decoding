@@ -22,6 +22,23 @@ if(ORC_PLUGIN_VERSION STREQUAL PROJECT_VERSION)
     endif()
 endif()
 
+# --- MSVC: keep <windows.h> from defining min/max as MACROS ------------------
+# The SDK's <orc/support/stage_instructions.h> includes <windows.h> on _WIN32
+# without setting NOMINMAX, and orc/plugin/orc_stage_tooling.h pulls it in. Once
+# that header is seen, `max` is a function-like macro for the REST of the
+# translation unit, so std::max(0, n) expands to std::((0)>(n)?(0):(n)) and MSVC
+# reports C2589 "illegal token on right side of '::'" at every such call — with
+# <algorithm> correctly included, which is what makes the error look unrelated
+# to its cause.
+#
+# Set here, before any target is created, so it covers hvd_core, the plugin and
+# every test regardless of which SDK branch (in-tree or find_package) is taken
+# and regardless of include order. A per-file #define would only protect the
+# file that remembers to carry it.
+if(WIN32)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -69,21 +86,44 @@ find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
     pkg_check_modules(FFTW3F IMPORTED_TARGET fftw3f)
 endif()
+
 if(NOT FFTW3F_FOUND)
-    find_library(FFTW3F_LIBRARY NAMES fftw3f libfftw3f-3 fftw3f-3 libfftw3f
-        HINTS ENV FFTW_DIR PATH_SUFFIXES lib)
-    find_path(FFTW3F_INCLUDE_DIR NAMES fftw3.h
-        HINTS ENV FFTW_DIR PATH_SUFFIXES include)
+    # Nix exposes single-precision FFTW as the fftwFloat package. In CI,
+    # FFTW_DIR/FFTW3F_ROOT points at that package prefix. Also search
+    # CMAKE_PREFIX_PATH so this works outside Nix when a prefix is supplied.
+    find_library(FFTW3F_LIBRARY
+        NAMES fftw3f libfftw3f-3 fftw3f-3 libfftw3f
+        HINTS
+            ENV FFTW3F_ROOT
+            ENV FFTW_DIR
+            ${CMAKE_PREFIX_PATH}
+        PATH_SUFFIXES lib
+    )
+    find_path(FFTW3F_INCLUDE_DIR
+        NAMES fftw3.h
+        HINTS
+            ENV FFTW3F_ROOT
+            ENV FFTW_DIR
+            ${CMAKE_PREFIX_PATH}
+        PATH_SUFFIXES include
+    )
+
     if(NOT FFTW3F_LIBRARY OR NOT FFTW3F_INCLUDE_DIR)
         message(FATAL_ERROR
-            "FFTW3 single-precision (fftw3f) not found. Pass "
-            "-DFFTW3F_LIBRARY=<...> and -DFFTW3F_INCLUDE_DIR=<dir of fftw3.h>. "
+            "FFTW3 single-precision (fftw3f) not found. "
+            "Install/provide the single-precision FFTW package "
+            "(nixpkgs: fftwFloat), or pass "
+            "-DFFTW3F_LIBRARY=<path/to/libfftw3f> and "
+            "-DFFTW3F_INCLUDE_DIR=<path/to/include>. "
             "Note: the single-precision 'f' variant is required.")
     endif()
+
     add_library(PkgConfig::FFTW3F INTERFACE IMPORTED)
     set_target_properties(PkgConfig::FFTW3F PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES "${FFTW3F_INCLUDE_DIR}"
         INTERFACE_LINK_LIBRARIES "${FFTW3F_LIBRARY}")
+else()
+    message(STATUS "Found FFTW3F via pkg-config: ${FFTW3F_VERSION}")
 endif()
 
 # --- FFTW3 threading (optional): lets FFTW's own 2-D transforms use
