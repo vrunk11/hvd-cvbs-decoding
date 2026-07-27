@@ -85,13 +85,23 @@
             export FFTW3F_ROOT="${pkgs.fftwFloat}"
 
             # Apple Clang needs the Nix-provided LLVM OpenMP runtime.
-            # This is evaluated by Nix only on Darwin; do not interpolate
-            # the Boolean stdenv.isDarwin into the shell script.
-            ${lib.optionalString stdenv.isDarwin ''
+            # Evaluated by Nix only on Darwin; do not interpolate the Boolean
+            # stdenv.isDarwin into the shell script.
+            #
+            # Two things this block gets wrong easily:
+            #   - `lib` is NOT in scope here. The `with pkgs;` above scopes only
+            #     the `packages` list, so it must be spelled `pkgs.lib`.
+            #   - the escape for a literal dollar-brace inside an indented
+            #     string is two single quotes then the dollar, NOT two dollars
+            #     (that is Make / docker-compose). Written with two dollars,
+            #     the lexer opens an antiquotation on the shell parameter
+            #     expansion and evaluates it as a Nix expression: a PARSE
+            #     error, which fires on Linux too despite the Darwin guard.
+            ${pkgs.lib.optionalString stdenv.isDarwin ''
               export OpenMP_ROOT="${pkgs.libomp}"
               export LIBOMP_ROOT="${pkgs.libomp}"
-              export CPPFLAGS="-I${pkgs.libomp}/include $${CPPFLAGS:-}"
-              export LDFLAGS="-L${pkgs.libomp}/lib $${LDFLAGS:-}"
+              export CPPFLAGS="-I${pkgs.libomp}/include ''${CPPFLAGS:-}"
+              export LDFLAGS="-L${pkgs.libomp}/lib ''${LDFLAGS:-}"
             ''}
           '';
 
