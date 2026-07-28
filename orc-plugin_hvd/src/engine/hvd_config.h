@@ -71,7 +71,12 @@ struct HvdConfig {
   // --- Solver budget ------------------------------------------------------
   // Total conjugate-gradient iterations across all IRLS outer passes.
   // 0 => pure holographic reconstruction (fast preview, no refinement).
-  int cg_iterations = 60;
+  // Default kept small (2, not the reference's higher-quality values):
+  // this is what a fresh/never-configured stage decodes with, and a
+  // small number here means a first-run/live-preview/quick-test decode
+  // is fast by default rather than accidentally expensive; raise it
+  // explicitly once you're tuning for final quality.
+  int cg_iterations = 2;
   // Number of IRLS (lagged-diffusivity) outer re-weightings.
   int irls_outer = 4;
   // CG relative gradient-norm early-exit: stop an inner CG loop once
@@ -90,8 +95,36 @@ struct HvdConfig {
   // coherence) have their building blocks ported (VerifyMotion,
   // FitTrajectory/TrajectorySnap, the MotionField* precompute hooks) and
   // activate when that pipeline lands. Reference measurement: >=2x wall
-  // clock, never worse than 0.2 dB.
-  bool fast = false;
+  // clock, never worse than 0.2 dB. Defaults ON (same reasoning as
+  // cg_iterations above): the never-worse-than-0.2dB measurement means
+  // there's little reason for a fresh/unconfigured stage to default to
+  // the slower path.
+  bool fast = true;
+
+  // --- Parallelisation strategy (2D / decoupled-field decode only) --------
+  // The comment in sequence.cpp's decode loop claiming "one field per core
+  // beats one memory-bound loop across all cores" (i.e. parallelise ACROSS
+  // fields, forcing each field's own internal OpenMP loops serial via
+  // OpenMP's no-nested-parallelism default) predates any real profiling on
+  // this project's actual hardware -- it's a plausible-sounding claim, not
+  // a measured one. This flag makes it possible to A/B the two strategies
+  // without recompiling:
+  //   true  (default, unchanged behaviour): parallelise ACROSS fields
+  //         (nf/cores fields decode concurrently, each single-threaded
+  //         internally). Wins when nf (fields in the chunk -- see
+  //         chunk_frames) is comparable to or above the core count.
+  //   false: decode fields ONE AT A TIME, same shape as the GUI preview's
+  //         single-frame decode -- each field's own internal OpenMP loops
+  //         (variational.cpp etc.) are then free to use every core, since
+  //         nothing outer is already inside a parallel region. Likely
+  //         wins when nf is well below the core count (e.g. small
+  //         chunk_frames on a high-core-count machine), where the "true"
+  //         setting would otherwise leave cores idle.
+  // Only affects the 2D/fast decoupled-field path (sequence.cpp); the
+  // slow coupled-temporal path was already serial across fields for
+  // correctness (Gauss-Seidel data dependencies), not performance, and
+  // is unaffected either way.
+  bool parallel_across_fields = true;
 
   // --- Holographic init bandwidths (sideband crop) ------------------------
   // NOTE: vestigial in the REFERENCE too — its holographic_init overrides
@@ -324,7 +357,18 @@ struct HvdConfig {
   // outright. Content-dependent by nature — hence a dial, not a constant.
   float odd_gate_floor = 0.35F;
   int chunk_frames = 6;
-  int chunk_overlap = 2;
+  // Frames of temporal CONTEXT added on each side of an export chunk when
+  // 3D is on (see decode_sequence_chunk_and_write_rgb24) -- and, since
+  // this field is now the single shared source of truth for BOTH paths,
+  // also the size of the preview's mini-3D window (id +/- chunk_overlap;
+  // was hardcoded to +/-1 there before). Default 1 => a 3-frame window
+  // (n-1, n, n+1): the 2D/3D difference is small enough that this is
+  // plenty, and it keeps the preview and the export doing the SAME
+  // amount of temporal work per frame by construction, rather than the
+  // preview using a fixed, separately-hardcoded window while export
+  // scaled with this value -- which was the actual reason "3D looked
+  // fine in preview but was heavy on export" felt inconsistent.
+  int chunk_overlap = 1;
   // Selective 3D (reference: decode_sequence_selective, PORTING.md §21):
   // full-window 2D decode + the complete 3D machinery re-run on a crop of
   // the most Y/C-ambiguous tiles only, feather-blended in. Pays off on

@@ -519,6 +519,11 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
   // discriminator, longer baseline; fields j and j+4 share V-switch
   // parity so the chroma-coherent / leak-sign-flip logic transfers).
   const int amb_stride = g.standard == VideoStandard::kPal ? 4 : 2;
+  // == 0 means AUTO (measure). A NEGATIVE strength means the caller
+  // explicitly switched 3D off and must skip this scan entirely -- it is
+  // not free (a decimated demod over every same-parity field pair in the
+  // window) and, more importantly, it would resolve a positive strength
+  // and silently switch the whole 3D path back on.
   if (ccfg.temporal_strength == 0.0F && ccfg.cg_iterations > 0 &&
       nf > amb_stride) {
     std::vector<float> ambs;
@@ -640,6 +645,11 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
         std::clamp(0.5F * amb - 0.05F, 0.0F, 1.5F);
     if (diag) diag->ambiguity_ire = amb;
   }
+  // Collapse the three-valued input to the two-valued thing the rest of
+  // this function wants. This runs AFTER the adaptive scan above on
+  // purpose: a negative (explicit OFF) strength has to survive long
+  // enough to skip that scan, and only then becomes 0, which
+  // has_temporal's `> 0.0F` test below reads as "no temporal terms".
   if (ccfg.temporal_strength < 0.0F) ccfg.temporal_strength = 0.0F;
 
   if (diag) {
@@ -1053,9 +1063,13 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
       // the fast-mode quality envelope on the regression scene. The
       // sequential sweep stays the slow-mode behaviour, bit-faithful to
       // the reference. Inside the parallel region the solvers' own OpenMP
-      // loops deactivate (no nested parallelism), which is the intended
-      // trade: one field per core beats one memory-bound loop across all
-      // cores.
+      // loops deactivate (no nested parallelism); the intent was "one
+      // field per core beats one memory-bound loop across all cores",
+      // but that's a plausible-sounding claim that was never actually
+      // profiled on real hardware -- see HvdConfig::parallel_across_fields
+      // for an A/B toggle between this and the opposite strategy (decode
+      // fields one at a time, letting each one's internal OpenMP loops use
+      // every core, same shape as the GUI preview's single-frame decode).
       int max_off = 0;
       for (int o : offs) max_off = std::max(max_off, std::abs(o));
       const int reach =
@@ -1063,11 +1077,23 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
       // With no temporal terms the fields are fully decoupled: one color,
       // every field concurrent (this is the per-field 2D decode path).
       const int stride = has_temporal ? reach + 1 : 1;
-      for (int color = 0; color < stride; ++color) {
+      if (ccfg.parallel_across_fields) {
+        for (int color = 0; color < stride; ++color) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
-        for (int j = color; j < nf; j += stride) solve_field(j);
+          for (int j = color; j < nf; j += stride) solve_field(j);
+        }
+      } else {
+        // A/B comparison path (parallel_across_fields = false): no outer
+        // parallel region at all, so each solve_field(j) call's own
+        // internal OpenMP loops are free to use every core for THAT one
+        // field -- exactly the shape of the GUI preview's single-frame
+        // decode. Correctness is identical either way when stride == 1
+        // (the decoupled/fast case this branch is reached for): fields
+        // don't read each other's state, so the order they're solved in
+        // doesn't change the result, only the wall-clock time.
+        for (int j = 0; j < nf; ++j) solve_field(j);
       }
     } else {
       for (int j = 0; j < nf; ++j) solve_field(j);

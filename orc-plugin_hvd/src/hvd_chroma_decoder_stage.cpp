@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <queue>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -38,12 +39,14 @@ constexpr const char* kChromaEps = "chroma_eps";
 constexpr const char* kStructureCoupling = "structure_coupling";
 constexpr const char* kCgIterations = "cg_iterations";
 constexpr const char* kFast = "fast";
+constexpr const char* kParallelAcrossFields = "parallel_across_fields";
 constexpr const char* kCgTol = "cg_tol";
 constexpr const char* kBidirectional = "bidirectional";
 constexpr const char* kSelective3d = "selective_3d";
 constexpr const char* kDiagPrior = "diag_prior";
 constexpr const char* kPasses = "passes";
 constexpr const char* kChunkFrames = "chunk_frames";
+constexpr const char* kChunkOverlap = "chunk_overlap";
 constexpr const char* kFieldOrder = "field_order";
 constexpr const char* kDebugDir = "debug_dir";
 constexpr const char* kAcc = "acc";
@@ -186,33 +189,41 @@ const ::hvd::YcFrameS16& HvdDecodedRepresentation::decoded(FrameID id) const
             bool done = false;
             {
                 // Composite always decodes per FIELD (2D = decoupled
-                // fields, 3D = a mini window of frame id +/- 1) — the same
-                // pipeline as the export. DecodeFrameBuffer below is the
-                // last-resort fallback only.
-                // Preview through the SAME field pipeline as the export
-                // (per-field 2D, or a mini 3D window of frame id +/- 1):
-                // what you judge in the preview is what the export does.
+                // fields, 3D = a window of frame id +/- chunk_overlap) —
+                // the same pipeline as the export, and now the same SIZE
+                // knob too (chunk_overlap), not a separately-hardcoded
+                // +/-1: what you judge in the preview is what the export
+                // does, including how much temporal context it costs.
+                // DecodeFrameBuffer below is the last-resort fallback only.
                 // This replaces the earlier frame-level 3D preview and its
                 // self-priming chain outright — the frame-level temporal
                 // term remains only as the Y/C-native export fallback.
                 const bool coupled =
                     config_.enable_temporal && config_.cg_iterations > 0;
+                const int overlap = std::max(0, config_.chunk_overlap);
                 std::vector<const sample_type*> window;
                 FrameID w0 = id;
-                if (coupled && id > 0 && source_->get_frame(id - 1)) {
-                    w0 = id - 1;
+                if (coupled) {
+                    for (int k = 0; k < overlap; ++k) {
+                        if (w0 == 0 || !source_->get_frame(w0 - 1)) break;
+                        --w0;
+                    }
                 }
                 for (FrameID f = w0;; ++f) {
                     const sample_type* p = source_->get_frame(f);
                     if (!p) break;
                     window.push_back(p);
                     if (!coupled && f == id) break;
-                    if (f >= id + 1) break;
+                    if (f >= id + static_cast<FrameID>(overlap)) break;
                 }
                 const int core = static_cast<int>(id - w0);
                 if (core >= 0 && core < static_cast<int>(window.size())) {
                     ::hvd::HvdConfig eff = config_;
-                    if (!config_.enable_temporal) eff.temporal_strength = 0.0F;
+                    // -1 = explicit OFF, not 0 (= AUTO/measure). Same
+                    // three-valued convention as the export path -- see
+                    // the long comment in
+                    // decode_sequence_chunk_and_write_rgb24().
+                    if (!config_.enable_temporal) eff.temporal_strength = -1.0F;
                     std::vector<::hvd::YcFrameS16> frames =
                         ::hvd::DecodeFrameSequenceWindow(
                             window, core, core + 1, fp, eff, engine_);
@@ -560,13 +571,27 @@ bool HvdDecodedRepresentation::decode_sequence_chunk_and_write_rgb24(
     const int core_end = static_cast<int>(t1 - w0) + 1;
 
     // enable_temporal is the switch; the strength dial keeps its value.
-    // The sequence driver only sees the strength, so the OFF position is
-    // expressed by zeroing it in a local copy (found the hard way: for a
-    // while the "2D" export was silently running 3D-lite because a
-    // positive default strength leaked through, which also made toggling
-    // 3D look like it changed nothing).
+    // The sequence driver only sees the strength, so the OFF position has
+    // to be expressed through it in a local copy.
+    //
+    // IMPORTANT -- the engine's convention (see DecodeFrameSequenceWindow
+    // in engine/sequence.cpp) is THREE-valued, not two:
+    //     < 0  => 3D OFF
+    //     == 0 => AUTO: measure the content's Y/C ambiguity and pick a
+    //             strength, which for anything but perfectly clean
+    //             content resolves to a POSITIVE value and switches the
+    //             entire 3D path (motion estimation, neighbour
+    //             equations, multi-pass/anchor) back on
+    //     > 0  => that fixed strength
+    // Writing 0.0F here therefore did NOT mean "off" -- it meant "decide
+    // for me", so switching 3D off in the GUI left the export running the
+    // adaptive ambiguity scan plus, usually, full 3D anyway. That is what
+    // made composite exports enormously slower than the (frame-path)
+    // preview while looking like the 2D path, and it also masked the
+    // effect of the field-parallelism toggle, since a coupled 3D window
+    // parallelises across far fewer fields than a decoupled 2D one.
     ::hvd::HvdConfig eff = config_;
-    if (!config_.enable_temporal) eff.temporal_strength = 0.0F;
+    if (!config_.enable_temporal) eff.temporal_strength = -1.0F;
     const std::vector<::hvd::YcFrameS16> frames =
         ::hvd::DecodeFrameSequenceWindow(ptrs, core_begin, core_end, fp,
                                          eff, engine,
@@ -674,7 +699,18 @@ bool HvdChromaDecoderStage::trigger(
         }
     }
 
-    if (output_path_.empty()) return fail("no output_path configured");
+    // Default to stdout ("-", see ContainerFromPath()/VideoWriter::Open())
+    // when nothing was ever set, rather than hard-failing: this only
+    // matters for headless invocation (e.g. orc-cli without an
+    // output_path=... argument at all), where omitting it is a
+    // reasonable way to say "just pipe it somewhere" -- via the GUI,
+    // output_path_ is essentially never empty at this point because the
+    // file-browser parameter widget always writes SOME path back through
+    // set_parameters() once touched. The GUI-facing default shown in
+    // get_parameter_descriptors() deliberately stays an empty string, so
+    // a GUI user still sees a blank field prompting an explicit choice
+    // instead of a silent pipe default there too.
+    if (output_path_.empty()) output_path_ = "-";
 
     auto repr = std::dynamic_pointer_cast<const HvdDecodedRepresentation>(cached_output_);
     if (!repr) return fail("no input (connect a video source and try again)");
@@ -683,17 +719,28 @@ bool HvdChromaDecoderStage::trigger(
     if (w == 0 || h == 0) return fail("no active picture geometry");
 
     // Container is decided by output_path_'s extension EXCEPT when the
-    // path is a named pipe: MP4 needs to seek back at the end to rewrite
+    // destination is a pipe: MP4 needs to seek back at the end to rewrite
     // its header (moov atom) with the final duration/index, which a pipe
     // fundamentally can't do, and Matroska (while more pipe-tolerant than
     // MP4) still isn't designed for it the way NUT explicitly is — every
     // NUT frame is fully self-contained as it's written, nothing deferred
     // to a trailer a pipe reader could never seek back to read anyway.
-    // is_fifo() only recognises POSIX named pipes (mkfifo); on Windows a
-    // named pipe (\\.\pipe\...) won't be detected here and falls through
-    // to extension-based selection instead.
+    // Two distinct things count as "a pipe" here:
+    //   - output_path_ == "-": the standard ffmpeg/orc-cli convention for
+    //     "stdout", e.g. `orc-cli ... output_path=- | ffplay -`. This is
+    //     NOT a filesystem path at all — is_fifo() on it would just look
+    //     for (and not find) a real file literally named "-", which is
+    //     exactly what silently produced an empty pipe before this: bytes
+    //     went into a file called "-" on disk, never into the shell pipe
+    //     ffplay was reading from. VideoWriter::Open() below translates
+    //     this to libav's own "pipe:1" URL.
+    //   - an actual named pipe (mkfifo) on disk. is_fifo() only
+    //     recognises POSIX named pipes; on Windows a named pipe
+    //     (\\.\pipe\...) won't be detected here and falls through to
+    //     extension-based selection instead.
     std::error_code fifo_ec;
-    const bool is_pipe = std::filesystem::is_fifo(output_path_, fifo_ec) && !fifo_ec;
+    const bool is_pipe = output_path_ == "-" ||
+        (std::filesystem::is_fifo(output_path_, fifo_ec) && !fifo_ec);
     const ::hvd::VideoContainer container = is_pipe
         ? ::hvd::VideoContainer::kNutRaw
         : ::hvd::ContainerFromPath(output_path_);
@@ -719,8 +766,18 @@ bool HvdChromaDecoderStage::trigger(
             !(vp->system == VideoSystem::NTSC || vp->system == VideoSystem::PAL_M);
         const int fps_num = is_pal ? 25 : 30000;
         const int fps_den = is_pal ? 1 : 1001;
+        // Pixel aspect ratio for the muxer: the exact same source of
+        // truth as get_preview_capability()'s dar_correction_factor (see
+        // that function's long comment on why it has to come from
+        // standard_dar_correction(), not from the active-area pixel
+        // count) -- so the exported file/pipe ends up with the same
+        // corrected 4:3 shape the preview already shows, instead of a
+        // player defaulting to square pixels because nothing told it
+        // otherwise.
+        const double sample_aspect_ratio =
+            vp.has_value() ? standard_dar_correction(vp->system) : 1.0;
         if (!video_writer.Open(output_path_, static_cast<int>(w), static_cast<int>(h),
-                               fps_num, fps_den, container)) {
+                               fps_num, fps_den, container, sample_aspect_ratio)) {
             return fail("could not open '" + output_path_ + "' for video export: " +
                         video_writer.last_error());
         }
@@ -767,16 +824,84 @@ bool HvdChromaDecoderStage::trigger(
                                 // concurrently on this path
         const FrameID chunk = static_cast<FrameID>(
             std::max(1, config_.chunk_frames));
+
+        // Decode (this thread, the loop below) and I/O (write_thread)
+        // run CONCURRENTLY. Before this, decode_sequence_chunk_and_write_
+        // rgb24() wrote straight to `out`, so writing chunk N blocked
+        // decoding chunk N+1 on the same thread -- fine for a plain file
+        // (write returns almost instantly) but not for `out` when it's a
+        // pipe being drained by a realtime consumer (e.g. `| ffplay -`):
+        // every chunk's write then had to wait for that chunk's own
+        // *playback* time, on top of its decode time, instead of the two
+        // overlapping. bounded_queue_depth caps how many DECODED-BUT-NOT-
+        // YET-WRITTEN chunks can pile up in memory if the writer/consumer
+        // falls behind -- decode can run ahead of a slow consumer, just
+        // not arbitrarily far ahead.
+        constexpr size_t kBoundedQueueDepth = 4;
+        std::mutex queue_mutex;
+        std::condition_variable queue_cv;
+        std::queue<std::string> chunk_queue;
+        bool producer_done = false;
+        std::atomic<bool> io_failed{false};
+        std::string io_failure_message;
+
+        std::thread writer_thread([&]() {
+            for (;;) {
+                std::string chunk_bytes;
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex);
+                    queue_cv.wait(lock, [&] {
+                        return !chunk_queue.empty() || producer_done ||
+                               io_failed.load(std::memory_order_relaxed);
+                    });
+                    if (io_failed.load(std::memory_order_relaxed)) return;
+                    if (chunk_queue.empty()) {
+                        if (producer_done) return;
+                        continue;  // spurious wake with nothing queued yet
+                    }
+                    chunk_bytes = std::move(chunk_queue.front());
+                    chunk_queue.pop();
+                }
+                queue_cv.notify_all();  // wake a producer waiting on "not full"
+                out.write(chunk_bytes.data(),
+                         static_cast<std::streamsize>(chunk_bytes.size()));
+                if (!out) {
+                    io_failure_message = "I/O error writing '" + output_path_ + "'";
+                    io_failed.store(true);
+                    queue_cv.notify_all();
+                    return;
+                }
+            }
+        });
+
         uint64_t written = 0;
         bool sequence_ok = true;
         for (FrameID t0 = range.first; sequence_ok && t0 <= range.last; ) {
-            const FrameID t1 = std::min(t0 + chunk - 1, range.last);
-            if (!repr->decode_sequence_chunk_and_write_rgb24(
-                    t0, t1, range.first, range.last, engine, read_mutex,
-                    out)) {
+            if (io_failed.load(std::memory_order_relaxed)) {
                 sequence_ok = false;
                 break;
             }
+            const FrameID t1 = std::min(t0 + chunk - 1, range.last);
+            std::ostringstream chunk_buf(std::ios::binary);
+            if (!repr->decode_sequence_chunk_and_write_rgb24(
+                    t0, t1, range.first, range.last, engine, read_mutex,
+                    chunk_buf)) {
+                sequence_ok = false;
+                break;
+            }
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                queue_cv.wait(lock, [&] {
+                    return chunk_queue.size() < kBoundedQueueDepth ||
+                           io_failed.load(std::memory_order_relaxed);
+                });
+                if (io_failed.load(std::memory_order_relaxed)) {
+                    sequence_ok = false;
+                    break;
+                }
+                chunk_queue.push(chunk_buf.str());
+            }
+            queue_cv.notify_all();
             written += t1 - t0 + 1;
             if (progress_callback_) {
                 progress_callback_(written, total,
@@ -786,6 +911,14 @@ bool HvdChromaDecoderStage::trigger(
             }
             t0 = t1 + 1;
         }
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            producer_done = true;
+        }
+        queue_cv.notify_all();
+        writer_thread.join();
+
+        if (io_failed.load()) return fail(io_failure_message);
         if (sequence_ok) {
             if (written == 0) return fail("frame range was empty");
             if (!finalize_video()) return false;
@@ -977,7 +1110,7 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "9f): adaptive solver early-exit with a 2/3 iteration cap, and "
             "tile-resolution motion-confidence maps in the 3D path. "
             "Reference measurement: >=2x speed, never worse than 0.2 dB.",
-            ParameterType::BOOL, boolean(false)},
+            ParameterType::BOOL, boolean(true)},
         ParameterDescriptor{kFieldOrder, "Field order",
             "0 = Auto (default): the order is MEASURED from the signal -- "
             "under the true order each field's lines interpolate the "
@@ -1062,14 +1195,21 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "two fields.",
             ParameterType::BOOL, boolean(false)},
         ParameterDescriptor{kOutputPath, "Output file path",
-            "Destination for the Export button. If this is a NAMED PIPE "
-            "(mkfifo), the export always goes out as NUT-wrapped raw "
-            "RGB24 video regardless of any extension in the path (NUT is "
-            "the one streamable-by-design container of the three below -- "
-            "a pipe can't be seeked back to write a trailer/index the "
-            "way FFV1/MKV or MPEG-4/MP4 need to). Otherwise the "
-            "extension decides: .mkv -> FFV1, mathematically lossless "
-            "(encoded as planar RGB, so there's no YUV chroma-"
+            "Destination for the Export button. Left empty when the "
+            "export actually runs, it defaults to STDOUT (same as '-', "
+            "below) -- convenient for headless/CLI use where omitting "
+            "it usually just means 'pipe it somewhere'. Set this to '-' "
+            "(a single dash) explicitly to stream to STDOUT instead of "
+            "a file -- e.g. "
+            "for `orc-cli ... output_path=- | ffplay -`. A NAMED PIPE "
+            "(mkfifo) works the same way. Either one always goes out as "
+            "NUT-wrapped raw RGB24 video regardless of any extension in "
+            "the path (NUT is the one streamable-by-design container of "
+            "the three below -- a pipe/stdout can't be seeked back to "
+            "write a trailer/index the way FFV1/MKV or MPEG-4/MP4 need "
+            "to). Otherwise (a normal file path) the extension decides: "
+            ".mkv -> FFV1, mathematically lossless "
+            "(encoded as 10-bit planar RGB, so there's no YUV chroma-"
             "subsampling loss either -- decoded pixels round-trip "
             "exactly). .mp4 -> MPEG-4 Part 2, lossy (4:2:0 chroma + DCT "
             "compression, fixed quantiser -- avcodec's own native "
@@ -1134,8 +1274,10 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             ParameterType::DOUBLE, real(0.0, 2.0, 0.25)},
         ParameterDescriptor{kCgIterations, "Advanced: Solver iterations",
             "Conjugate-gradient iterations. 0 = holographic init only "
-            "(fast preview).",
-            ParameterType::INT32, integer(0, 400, 60)},
+            "(fast preview). Default kept small (2) so a fresh/"
+            "never-configured stage decodes quickly by default; raise it "
+            "when tuning for final quality, not as a first thing to try.",
+            ParameterType::INT32, integer(0, 400, 2)},
         ParameterDescriptor{kCgTol, "Advanced: Solver early-exit tolerance",
             "Relative gradient-norm at which the conjugate-gradient solve "
             "stops early. 0 = auto (0.02, or 0.10 in fast mode). Measured "
@@ -1166,10 +1308,43 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "just without the NR reference).",
             ParameterType::DOUBLE, real(0.0, 3.0, 1.0)},
         ParameterDescriptor{kChunkFrames, "Advanced: 3D chunk size",
-            "Frames per export window in 3D mode (plus 2 frames of context "
-            "on each side). Bounds memory; larger chunks slightly reduce "
-            "edge effects at chunk boundaries.",
+            "Frames per export window in 3D mode (plus 'Temporal context "
+            "frames', below, on each side). Bounds memory; larger chunks "
+            "slightly reduce edge effects at chunk boundaries.",
             ParameterType::INT32, integer(1, 24, 6)},
+        ParameterDescriptor{kChunkOverlap, "Advanced: Temporal context frames",
+            "Frames of 3D context added on each side of the export "
+            "window (see 3D chunk size, above) -- AND, since this is the "
+            "same value the live preview's own mini-3D window uses "
+            "(id +/- this many frames), also how much temporal context a "
+            "single previewed frame costs. Default 1 gives a 3-frame "
+            "window (n-1, n, n+1): the quality difference between 2D and "
+            "3D is small enough that this is plenty for most content, and "
+            "keeping preview and export on the same value means what you "
+            "judge in the preview is genuinely what the export costs -- "
+            "raising it only in the export while the preview stayed "
+            "fixed used to be why enabling 3D felt fine in preview but "
+            "was disproportionately expensive on export.",
+            ParameterType::INT32, integer(0, 8, 1)},
+        ParameterDescriptor{kParallelAcrossFields,
+            "Advanced: Parallelise across fields (2D/fast decode)",
+            "Export throughput A/B toggle for the decoupled-field decode "
+            "path (2D, or fast mode) -- doesn't affect image quality, "
+            "only wall-clock time, and only when NOT using 3D. ON "
+            "(default): every field in the current chunk decodes "
+            "CONCURRENTLY, one per core, with each field's own internal "
+            "solver forced single-threaded (nested OpenMP parallelism is "
+            "off by default) -- wins when the chunk has at least as many "
+            "fields as you have cores (raise 3D chunk size, above, to get "
+            "there). OFF: fields decode ONE AT A TIME, but each one's "
+            "internal solver is then free to use every core for itself -- "
+            "same parallelisation shape as this stage's own live preview. "
+            "Likely wins when 3D chunk size is small relative to your "
+            "core count, since ON would otherwise leave cores idle. "
+            "Neither setting changes the decoded pixels: fields in this "
+            "path don't read each other's state, so try both and keep "
+            "whichever one measures faster on your hardware.",
+            ParameterType::BOOL, boolean(true)},
         ParameterDescriptor{kTemporalStrength, "Advanced: Temporal strength",
             "Weight of the motion-compensated neighbour-field equations "
             "once Enable 3D is on. 0 = ADAPTIVE (default): the strength is "
@@ -1221,6 +1396,8 @@ HvdChromaDecoderStage::get_parameters() const
         {kSelective3d, config_.selective_3d},
         {kPasses, static_cast<int32_t>(config_.passes)},
         {kChunkFrames, static_cast<int32_t>(config_.chunk_frames)},
+        {kChunkOverlap, static_cast<int32_t>(config_.chunk_overlap)},
+        {kParallelAcrossFields, config_.parallel_across_fields},
         {kFieldOrder, static_cast<int32_t>(config_.field_order)},
         {kDebugDir, config_.debug_dir},
         {kDiagPrior, static_cast<double>(config_.diag_prior)},
@@ -1286,6 +1463,8 @@ bool HvdChromaDecoderStage::set_parameters(
     get_bool(kSelective3d, config_.selective_3d);
     get_int(kPasses, config_.passes);
     get_int(kChunkFrames, config_.chunk_frames);
+    get_int(kChunkOverlap, config_.chunk_overlap);
+    get_bool(kParallelAcrossFields, config_.parallel_across_fields);
     get_int(kFieldOrder, config_.field_order);
     get_string(kDebugDir, config_.debug_dir);
     get_double(kDiagPrior, config_.diag_prior);

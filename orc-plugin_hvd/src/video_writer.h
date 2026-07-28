@@ -45,8 +45,14 @@ enum class VideoContainer {
                // needed to view it).
     kMkvFfv1,  // .mkv -> FFV1 in Matroska. Lossless: FFV1 is a
                // mathematically lossless codec and we feed it planar RGB
-               // (GBRP), so there is no YUV chroma-subsampling loss either
-               // — the decoded pixels round-trip exactly.
+               // at 10-bit (GBRP10LE) — no chroma subsampling, so no YUV
+               // loss either, and upconverting this stage's 8-bit source
+               // into the low 8 bits of a 10-bit container round-trips
+               // exactly. 10-bit specifically because this FFV1 encoder
+               // build has no 8-bit GBR format in its supported-formats
+               // list at all (starts at 9-bit), and because 10-bit 4:4:4
+               // is itself a standard depth other tools reading this
+               // file/pipe will recognise, rather than an odd one-off.
     kMp4Mpeg4, // .mp4 -> MPEG-4 Part 2 (avcodec's own native encoder, no
                // external library — unlike H.264/libx264, which vcpkg
                // builds as a whole separate autotools project on the
@@ -89,8 +95,15 @@ public:
     // fps is given as a rational (num/den) rather than a double so the
     // muxer's timestamps land on the exact broadcast rate (30000/1001 for
     // NTSC/PAL-M, 25/1 for PAL) instead of an accumulating rounding error.
+    // `sample_aspect_ratio` is the signal's PIXEL aspect ratio (what
+    // hvd_chroma_decoder_stage.cpp calls dar_correction_factor, from the
+    // same standard_dar_correction() the preview path uses) — written
+    // into the stream so a player stretches non-square CVBS pixels to
+    // the correct 4:3 picture instead of assuming square ones. Pass 1.0
+    // if truly unknown; 0 or negative is treated the same way (skipped).
     bool Open(const std::string& path, int width, int height, int fps_num,
-              int fps_den, VideoContainer container);
+              int fps_den, VideoContainer container,
+              double sample_aspect_ratio = 1.0);
 
     // `rgb24` must point to exactly width*height*3 bytes, row-major, no
     // padding (R,G,B interleaved per pixel) — the same layout

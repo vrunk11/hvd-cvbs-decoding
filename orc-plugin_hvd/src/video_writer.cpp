@@ -10,11 +10,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <thread>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/rational.h>
 #include <libswscale/swscale.h>
 }
 
@@ -58,7 +61,8 @@ VideoWriter::~VideoWriter()
 }
 
 bool VideoWriter::Open(const std::string& path, int width, int height,
-                       int fps_num, int fps_den, VideoContainer container)
+                       int fps_num, int fps_den, VideoContainer container,
+                       double sample_aspect_ratio)
 {
     if (opened_) {
         last_error_ = "VideoWriter already open";
@@ -69,6 +73,17 @@ bool VideoWriter::Open(const std::string& path, int width, int height,
         return false;
     }
 
+    // "-" is the standard ffmpeg/orc-cli convention for "write to
+    // stdout" — NOT a real filesystem path. Passed straight to
+    // avio_open() it would just try (and typically fail, or worse,
+    // silently create) a file literally named "-" in the working
+    // directory, which is exactly what used to make `output_path=- |
+    // ffplay -` produce nothing: bytes went into that file, never into
+    // the shell pipe ffplay was reading. libav's own "pipe:1" URL is the
+    // portable way to actually mean stdout (its pipe protocol handles
+    // both POSIX and Windows).
+    const std::string avio_path = (path == "-") ? "pipe:1" : path;
+
     const char* format_name = nullptr;
     AVCodecID codec_id = AV_CODEC_ID_NONE;
     AVPixelFormat pix_fmt = AV_PIX_FMT_RGB24;
@@ -76,12 +91,19 @@ bool VideoWriter::Open(const std::string& path, int width, int height,
         case VideoContainer::kMkvFfv1:
             format_name = "matroska";
             codec_id = AV_CODEC_ID_FFV1;
-            // Planar RGB, no chroma subsampling: FFV1 + GBRP is bit-exact
-            // lossless for what we hand it (unlike FFV1 + YUV, which
-            // would be lossless only relative to an already-lossy
-            // RGB->YUV step). Not user-configurable: this is what makes
-            // the .mkv path "lossless" at all.
-            pix_fmt = AV_PIX_FMT_GBRP;
+            // Planar RGB, no chroma subsampling: FFV1 + GBRP10LE is
+            // bit-exact lossless for what we hand it (unlike FFV1 + YUV,
+            // which would be lossless only relative to an already-lossy
+            // RGB->YUV step) -- upconverting our 8-bit source into the
+            // low 8 bits of a 10-bit container loses nothing and rounds
+            // back to the identical 8-bit values on read. 10-bit was
+            // chosen over plain 8-bit GBRP for two reasons: this FFV1
+            // encoder build only supports GBR from 9-bit up (see its own
+            // "Supported pixel formats" list -- gbrp8 isn't on it), and
+            // 10-bit 4:4:4 is itself a standard, widely-recognised
+            // intermediate depth other tools expect, which matters if
+            // this file/pipe is read by something other than this plugin.
+            pix_fmt = AV_PIX_FMT_GBRP10LE;
             break;
         case VideoContainer::kMp4Mpeg4:
             format_name = "mp4";
@@ -106,7 +128,7 @@ bool VideoWriter::Open(const std::string& path, int width, int height,
 
     // Chroma-subsampled formats need even dimensions in the subsampled
     // axis/axes (4:2:0 halves both, 4:2:2 halves only width); RGB24/BGR24/
-    // GBRP carry full resolution on every plane and have no such
+    // GBRP10LE carry full resolution on every plane and have no such
     // constraint. CVBS active pictures are effectively always even
     // already, but this is cheap insurance against an off-by-one crop
     // producing a codec-level error that would otherwise read as a
@@ -122,7 +144,7 @@ bool VideoWriter::Open(const std::string& path, int width, int height,
     }
 
     int ret = avformat_alloc_output_context2(&fmt_ctx_, nullptr, format_name,
-                                             path.c_str());
+                                             avio_path.c_str());
     if (ret < 0 || !fmt_ctx_) {
         last_error_ = "avformat_alloc_output_context2 failed: " +
                       (ret < 0 ? AvErrorString(ret) : std::string("null context"));
@@ -161,6 +183,20 @@ bool VideoWriter::Open(const std::string& path, int width, int height,
     stream_->time_base = codec_ctx_->time_base;
     codec_ctx_->pix_fmt = pix_fmt;
 
+    // Pixel (sample) aspect ratio: without this, a player has no way to
+    // know CVBS pixels aren't square and will display at 1:1 -- exactly
+    // the "pipe doesn't get the aspect ratio" bug this fixes. Set on
+    // BOTH the codec context and the stream: some readers only look at
+    // the stream's codecpar (populated from codec_ctx_ a few lines
+    // below via avcodec_parameters_from_context), others compare the
+    // two and get suspicious if they disagree, so they need to agree
+    // from the start rather than one lagging the other.
+    if (sample_aspect_ratio > 0.0) {
+        const AVRational sar = av_d2q(sample_aspect_ratio, 100000);
+        codec_ctx_->sample_aspect_ratio = sar;
+        stream_->sample_aspect_ratio = sar;
+    }
+
     if (container == VideoContainer::kMp4Mpeg4) {
         // Fixed-quantizer ("qscale") encoding: the generic avcodec knob
         // every native encoder understands, unlike CRF which is a
@@ -173,6 +209,33 @@ bool VideoWriter::Open(const std::string& path, int width, int height,
         // spirit as the FFV1/lossless path's fixed choices, just lossy.
         codec_ctx_->flags |= AV_CODEC_FLAG_QSCALE;
         codec_ctx_->global_quality = FF_QP2LAMBDA * 4;
+    }
+
+    // Slice-based multithreading: without this, thread_count defaults to
+    // 1 -- i.e. every encode here used to run on a SINGLE core while
+    // decode itself uses every core via OpenMP, making the encoder the
+    // bottleneck once the export's producer/consumer queue fills up
+    // (visible on file exports too, not just pipes, since it's not an
+    // I/O problem). Doubly true for FFV1 feeding it GBRP10LE: FFV1's
+    // golomb-rice coder only handles up to 8-bit samples, so anything
+    // 9-bit or above (like our 10-bit choice) is forced onto FFV1's
+    // range coder, which is inherently slower per sample -- exactly why
+    // it needs the parallelism restored, not just as a nice-to-have.
+    // Not done for kNutRaw: AV_CODEC_ID_RAWVIDEO doesn't compress at all,
+    // so there is nothing for extra threads to parallelise there.
+    if (container == VideoContainer::kMkvFfv1 ||
+        container == VideoContainer::kMp4Mpeg4) {
+        const unsigned hw = std::thread::hardware_concurrency();
+        const int threads = static_cast<int>(hw != 0 ? std::min(hw, 16u) : 4u);
+        codec_ctx_->thread_count = threads;
+        codec_ctx_->thread_type = FF_THREAD_SLICE;
+        if (container == VideoContainer::kMkvFfv1) {
+            // FFV1-specific: thread_count alone only sets the ceiling --
+            // the frame also has to actually BE cut into that many
+            // independently-codeable slices, which is what this option
+            // controls (a plain int, not restricted to "nice" numbers).
+            av_opt_set_int(codec_ctx_->priv_data, "slices", threads, 0);
+        }
     }
 
     if (fmt_ctx_->oformat->flags & AVFMT_GLOBALHEADER)
@@ -193,7 +256,7 @@ bool VideoWriter::Open(const std::string& path, int width, int height,
     }
 
     if (!(fmt_ctx_->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open(&fmt_ctx_->pb, path.c_str(), AVIO_FLAG_WRITE);
+        ret = avio_open(&fmt_ctx_->pb, avio_path.c_str(), AVIO_FLAG_WRITE);
         if (ret < 0) {
             last_error_ = "could not open '" + path + "': " + AvErrorString(ret);
             CleanUp();
@@ -225,10 +288,10 @@ bool VideoWriter::Open(const std::string& path, int width, int height,
     }
 
     // SWS_POINT: the two sides are the same width/height, so this is a
-    // pure pixel-format conversion (channel split/reorder for GBRP, or
-    // the standard RGB->YUV matrix for YUV420P) with no resampling —
-    // there is no "better" scaling filter to pick here because nothing is
-    // being scaled.
+    // pure pixel-format conversion (channel split/reorder + a lossless
+    // 8->10-bit upconversion for GBRP10LE, or the standard RGB->YUV
+    // matrix for YUV420P) with no resampling — there is no "better"
+    // scaling filter to pick here because nothing is being scaled.
     sws_ctx_ = sws_getContext(width, height, AV_PIX_FMT_RGB24, width, height,
                               codec_ctx_->pix_fmt, SWS_POINT, nullptr, nullptr,
                               nullptr);
@@ -358,14 +421,31 @@ std::streamsize FrameEncodingStreambuf::xsputn(const char* s, std::streamsize n)
 {
     if (failed_ || n <= 0) return failed_ ? 0 : n;
     buffer_.insert(buffer_.end(), s, s + n);
-    while (buffer_.size() >= frame_bytes_) {
-        if (!writer_.WriteFrame(reinterpret_cast<const uint8_t*>(buffer_.data()))) {
+    // Consume as many whole frames as are now available, tracking how far
+    // in with `consumed` rather than erasing after each one: erasing
+    // frame_bytes_ off the FRONT of a vector is O(remaining size) (every
+    // trailing byte has to shift down), so doing that once per frame
+    // inside this loop is O(frames_in_this_call^2) overall. That was
+    // invisible while every call carried at most ~1 frame (the row-by-row
+    // writers, or the parallel path's one-frame-at-a-time buffer copy),
+    // but the field-pipeline's decode/write overlap now hands a whole
+    // CHUNK's worth of frames to a single xsputn() call, and at the
+    // default chunk size that quietly became the dominant cost of the
+    // entire export -- worst of all on the plain rawvideo/NUT pipe path,
+    // where there's no encoding step to distract from it.
+    size_t consumed = 0;
+    while (buffer_.size() - consumed >= frame_bytes_) {
+        if (!writer_.WriteFrame(
+                reinterpret_cast<const uint8_t*>(buffer_.data() + consumed))) {
             failed_ = true;
             return 0;  // ostream::write() treats a short sputn() as
                        // failure and sets badbit — exactly the signal the
                        // callers already check via `if (!out)`.
         }
-        buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<long>(frame_bytes_));
+        consumed += frame_bytes_;
+    }
+    if (consumed > 0) {
+        buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<long>(consumed));
     }
     return n;
 }
