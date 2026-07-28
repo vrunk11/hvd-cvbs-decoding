@@ -192,17 +192,14 @@ struct HvdConfig {
   // --- Engine performance (not in the Python reference — this only exists
   // because of how differently a single C++ process schedules threads
   // compared to a one-shot numpy script) ------------------------------------
-  // How many threads FFTW uses internally for each 2-D transform in the
-  // preview/single-frame path (parallel-export workers always force this
-  // to 1 themselves, regardless of this value — see
-  // hvd_chroma_decoder_stage.cpp's worker_fn). FFTW's own thread
-  // synchronisation overhead is fixed per call, so on an image this small
-  // (~700x480 active picture) it can easily cost more than it saves; 1
-  // effectively disables FFTW's internal threading. Tune this live instead
-  // of guessing-and-recompiling: try 1 (off), 2, 4, and your full core
-  // count, and keep whichever measures fastest — there's no way to predict
-  // the right value analytically, it depends on the exact CPU and image
-  // size.
+  // DEAD as a user-facing knob: no longer exposed in the GUI parameter
+  // list. This build links single-threaded fftw3f (see fft2d.cpp — a
+  // threaded fftw3f dragged in a second OpenMP runtime, for a speed gain
+  // that measured as negligible next to the already-threaded IRLS/CG
+  // solver), so FFTW itself never actually threads its own transforms
+  // regardless of this value. Kept only so HvdEngine::SetFftThreads()
+  // (still called with this default) and Fft2d::SetThreadCount() keep
+  // compiling; remove together if that plumbing is ever cleaned up too.
   int fft_threads = 4;
 
   // --- 3-D / temporal --------------------------------------------------

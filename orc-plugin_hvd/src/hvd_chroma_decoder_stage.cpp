@@ -6,6 +6,7 @@
  */
 
 #include "hvd_chroma_decoder_stage.h"
+#include "video_writer.h"
 
 #include <cstdint>
 #include <orc/stage/cvbs_signal_constants.h>
@@ -16,7 +17,9 @@
 #include <cmath>
 #include <type_traits>
 #include <condition_variable>
+#include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -50,7 +53,6 @@ constexpr const char* kCustomSubcarrier = "custom_subcarrier";
 constexpr const char* kSubcarrierKhz = "subcarrier_khz";
 constexpr const char* kSymmetryVariant = "symmetry_variant";
 constexpr const char* kChromaPhaseDeg = "chroma_phase_deg";
-constexpr const char* kFftThreads = "fft_threads";
 constexpr const char* kPreviewFullRaster = "preview_full_raster";
 constexpr const char* kPreviewFieldView = "preview_field_view";
 constexpr const char* kEnableTemporal = "enable_temporal";
@@ -151,10 +153,8 @@ const ::hvd::YcFrameS16& HvdDecodedRepresentation::decoded(FrameID id) const
     const ::hvd::FrameParams fp = frame_params();
     ::hvd::YcFrameS16 yc;
     if (source_ && fp.frame_width > 0 && fp.frame_height > 0) {
-        // Tunable live from the UI (fft_threads) rather than hardcoded —
-        // FFTW's own thread-sync overhead can outweigh its benefit on an
-        // image this small, and the right value is CPU/size-dependent, not
-        // something to guess once in code. See hvd_config.h.
+        // No-op in this build (single-threaded fftw3f — see hvd_config.h's
+        // comment on fft_threads); kept only so the plumbing keeps compiling.
         engine_.SetFftThreads(config_.fft_threads);
 
         // IMPORTANT: for a source that's already Y/C separated (S-Video-
@@ -682,8 +682,68 @@ bool HvdChromaDecoderStage::trigger(
     const auto [w, h] = repr->active_picture_size();
     if (w == 0 || h == 0) return fail("no active picture geometry");
 
-    std::ofstream out(output_path_, std::ios::binary | std::ios::trunc);
-    if (!out) return fail("could not open '" + output_path_ + "' for writing");
+    // Container is decided by output_path_'s extension EXCEPT when the
+    // path is a named pipe: MP4 needs to seek back at the end to rewrite
+    // its header (moov atom) with the final duration/index, which a pipe
+    // fundamentally can't do, and Matroska (while more pipe-tolerant than
+    // MP4) still isn't designed for it the way NUT explicitly is — every
+    // NUT frame is fully self-contained as it's written, nothing deferred
+    // to a trailer a pipe reader could never seek back to read anyway.
+    // is_fifo() only recognises POSIX named pipes (mkfifo); on Windows a
+    // named pipe (\\.\pipe\...) won't be detected here and falls through
+    // to extension-based selection instead.
+    std::error_code fifo_ec;
+    const bool is_pipe = std::filesystem::is_fifo(output_path_, fifo_ec) && !fifo_ec;
+    const ::hvd::VideoContainer container = is_pipe
+        ? ::hvd::VideoContainer::kNutRaw
+        : ::hvd::ContainerFromPath(output_path_);
+    std::ofstream raw_file;
+    ::hvd::VideoWriter video_writer;
+    std::unique_ptr<::hvd::FrameEncodingStreambuf> video_streambuf;
+    std::unique_ptr<std::ostream> video_stream;
+    std::ostream* out_ptr = nullptr;
+
+    if (container == ::hvd::VideoContainer::kRaw) {
+        raw_file.open(output_path_, std::ios::binary | std::ios::trunc);
+        if (!raw_file) return fail("could not open '" + output_path_ + "' for writing");
+        out_ptr = &raw_file;
+    } else {
+        // Frame rate for the muxer: the same is_pal test used everywhere
+        // else in this file (system == NTSC or PAL_M stays on the 30000/
+        // 1001 side; PAL_M genuinely runs at NTSC's field rate despite its
+        // PAL-style chroma). Expressed as a rational so timestamps land on
+        // the exact broadcast rate rather than accumulating a rounding
+        // error from a double.
+        const auto vp = cached_output_->get_video_parameters();
+        const bool is_pal = vp.has_value() &&
+            !(vp->system == VideoSystem::NTSC || vp->system == VideoSystem::PAL_M);
+        const int fps_num = is_pal ? 25 : 30000;
+        const int fps_den = is_pal ? 1 : 1001;
+        if (!video_writer.Open(output_path_, static_cast<int>(w), static_cast<int>(h),
+                               fps_num, fps_den, container)) {
+            return fail("could not open '" + output_path_ + "' for video export: " +
+                        video_writer.last_error());
+        }
+        video_streambuf = std::make_unique<::hvd::FrameEncodingStreambuf>(
+            video_writer, static_cast<size_t>(w) * static_cast<size_t>(h) * 3);
+        video_stream = std::make_unique<std::ostream>(video_streambuf.get());
+        out_ptr = video_stream.get();
+    }
+    std::ostream& out = *out_ptr;
+
+    // Every success return below goes through this first: a video file
+    // isn't valid just because the frame bytes happened to reach the
+    // encoder — the container trailer (and any frames FFmpeg is still
+    // holding back internally) still needs writing. No-op for the raw
+    // (kRaw) path.
+    auto finalize_video = [&]() -> bool {
+        if (container == ::hvd::VideoContainer::kRaw) return true;
+        if (!video_writer.Finalize()) {
+            fail("failed finalizing '" + output_path_ + "': " + video_writer.last_error());
+            return false;
+        }
+        return true;
+    };
 
     const FrameIDRange range = cached_output_->frame_range();
     if (range.last < range.first) return fail("frame range was empty");
@@ -728,6 +788,7 @@ bool HvdChromaDecoderStage::trigger(
         }
         if (sequence_ok) {
             if (written == 0) return fail("frame range was empty");
+            if (!finalize_video()) return false;
             export_status_ = "Export complete: " + std::to_string(written) +
                              " frames (field pipeline) -> " + output_path_;
             trigger_in_progress_.store(false);
@@ -762,6 +823,7 @@ bool HvdChromaDecoderStage::trigger(
             }
         }
         if (written == 0) return fail("frame range was empty");
+        if (!finalize_video()) return false;
         export_status_ = "Export complete: " + output_path_;
         trigger_in_progress_.store(false);
         return true;
@@ -868,6 +930,7 @@ bool HvdChromaDecoderStage::trigger(
         return fail(failure_message.empty() ? "export failed" : failure_message);
     }
     if (written == 0) return fail("frame range was empty");
+    if (!finalize_video()) return false;
     export_status_ = "Export complete: " + std::to_string(written) +
                      " frames -> " + output_path_;
     trigger_in_progress_.store(false);
@@ -892,52 +955,50 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
                                     ParameterValue{def}, {}, false, std::nullopt};
     };
 
+    // The SDK's ParameterDescriptor list has no notion of UI sections/
+    // categories (see ParameterConstraints below: min/max/default/enum-
+    // choices/bool/optional, nothing group-related) -- the host just renders
+    // this vector as a flat list, in order. So the "2 parties" split lives
+    // here, in code, via two things a flat list CAN express:
+    //   1. Order: every BASIC parameter comes before every ADVANCED one.
+    //   2. Label prefix: advanced entries are labelled "Advanced: ..." so
+    //      they're visually distinguishable even in a flat list/search box.
+    // Parameter KEYS (kLambdaC, kFast, ...), TYPES, RANGES and DEFAULTS are
+    // all unchanged from before this reorganisation -- existing saved
+    // presets/projects still round-trip identically. If the SDK grows real
+    // parameter groups later, this split maps onto that directly.
+
     return {
-        ParameterDescriptor{kOddGateFloor, "Odd-offset gate floor",
-            "Weight kept on opposite-parity (odd) neighbour equations where "
-            "the half-line envelope says that field cannot see the feature. "
-            "CEILING of an automatic per-pixel floor: the value is scaled "
-            "down where the field's vertical profile is a one-line EXTREMUM "
-            "(hair, fur, fine fabric — the opposite parity never sampled the "
-            "feature, so its equation is uninformed) and kept where it is a "
-            "monotonic edge (both fields see it; the equation is biased but "
-            "informative). Leave at 0.35 unless diagnosing.",
-            ParameterType::DOUBLE, real(0.0, 1.0, 0.35)},
-        ParameterDescriptor{kCoherenceGate, "Coherence gate",
-            "InSAR-style complex-coherence gating of the temporal equations. "
-            "0 disables it; higher trusts the coherence measurement more.",
-            ParameterType::DOUBLE, real(0.0, 1.0, 0.6)},
-        ParameterDescriptor{kLambdaC, "Chroma smoothness",
-            "Arbitration prior. Higher = smoother chroma (less rainbowing); "
-            "lower = sharper chroma.",
-            ParameterType::DOUBLE, real(0.0, 8.0, 1.0)},
-        ParameterDescriptor{kCharbonnierEps, "Luma edge scale (IRE)",
-            "Edge-preservation scale of the luma prior, in IRE.",
-            ParameterType::DOUBLE, real(0.05, 5.0, 0.5)},
-        ParameterDescriptor{kChromaEps, "Chroma edge scale (IRE)",
-            "Edge-preservation scale of the chroma prior, in IRE.",
-            ParameterType::DOUBLE, real(0.05, 5.0, 1.0)},
-        ParameterDescriptor{kStructureCoupling, "Y->chroma edge coupling",
-            "Open the chroma edge where luma has one (removes hanging dots).",
-            ParameterType::DOUBLE, real(0.0, 2.0, 0.25)},
-        ParameterDescriptor{kCgIterations, "Solver iterations",
-            "Conjugate-gradient iterations. 0 = holographic init only "
-            "(fast preview).",
-            ParameterType::INT32, integer(0, 400, 60)},
+        // ===================================================================
+        // BASIC -- day-to-day controls. Safe to explore; defaults are sane.
+        // ===================================================================
         ParameterDescriptor{kFast, "Fast mode",
             "Same algorithm, cheaper logistics (reference's --fast, THEORY "
             "9f): adaptive solver early-exit with a 2/3 iteration cap, and "
             "tile-resolution motion-confidence maps in the 3D path. "
             "Reference measurement: >=2x speed, never worse than 0.2 dB.",
             ParameterType::BOOL, boolean(false)},
-        ParameterDescriptor{kCgTol, "Solver early-exit tolerance",
-            "Relative gradient-norm at which the conjugate-gradient solve "
-            "stops early. 0 = auto (0.02, or 0.10 in fast mode). Measured "
-            "on real re-encoded photo content (PORTING.md Sec. 19): 0.3 "
-            "combined with fast mode is ~2.3x the default-path speed at "
-            "equal-or-slightly-better PSNR and flat-zone rainbow score. "
-            "Iteration count above remains the hard ceiling.",
-            ParameterType::DOUBLE, real(0.0, 0.9, 0.0)},
+        ParameterDescriptor{kFieldOrder, "Field order",
+            "0 = Auto (default): the order is MEASURED from the signal -- "
+            "under the true order each field's lines interpolate the "
+            "other's at +0.5 line, under the inverted order at -0.5, a "
+            "deterministic half-line vertical correlation vote (majority "
+            "over the export window; falls back to the ld-decode format "
+            "convention, field 1 = top, on flat content). 1 = force "
+            "field 1 top. 2 = force field 1 bottom. Wrong-order symptoms: "
+            "one-line serration on static horizontal edges, and motion "
+            "that combs even through a player's deinterlacer.",
+            ParameterType::INT32, integer(0, 2, 0)},
+        ParameterDescriptor{kEnableTemporal, "Enable 3D (temporal)",
+            "Adds six motion-gated neighbour-field equations per field "
+            "(f\u00b11/\u00b12/\u00b13) to the field-granularity solve, resolving the "
+            "Y/C ambiguity that a single field cannot (cross-colour, "
+            "rainbow on fine detail), and from pass 2 the synth-reference "
+            "anchor adds motion-compensated temporal noise reduction. "
+            "Strength defaults to adaptive (see Temporal strength, in "
+            "Advanced). Measured on the regression scene: +1.9 dB "
+            "single-pass, +6.4 dB anchored 2-pass over per-field 2D.",
+            ParameterType::BOOL, boolean(false)},
         ParameterDescriptor{kBidirectional, "Bidirectional 3D",
             "Use BOTH past and future fields as temporal neighbors "
             "(default). Off = past-only: ~1.6x faster on the 3D path but "
@@ -958,15 +1019,14 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "worthwhile crop and the window stays plain 2D by design "
             "(PORTING.md Sec. 21/21c). Ignored when 3D is off.",
             ParameterType::BOOL, boolean(false)},
-        ParameterDescriptor{kDiagPrior, "Diagonal chroma prior",
-            "Oriented +/-45 deg chroma prior weight (reference's "
-            "--diag-prior), renormalised so total prior mass is unchanged. "
-            "A measured trade-off, not a win: trades axis-aligned chroma "
-            "sharpness (-1 dB on SMPTE bars) for diagonal cross-colour "
-            "suppression (+2 dB on zoneplate torture). 0 = off (default); "
-            "try ~0.5-1.0 on diagonal-artifact-heavy material such as fine "
-            "weaves or venetian blinds.",
-            ParameterType::DOUBLE, real(0.0, 2.0, 0.0)},
+        ParameterDescriptor{kPasses, "3D passes",
+            "Gauss-Seidel fixed-point passes over each export chunk "
+            "(sequence pipeline only). 1 = single pass. From pass 2 the "
+            "decode->NR->re-encode anchor engages: motion-compensated "
+            "temporal noise reduction whose reference never gets trusted "
+            "where the raw data contradicts it. 2 is the reference's "
+            "anchored-mode value.",
+            ParameterType::INT32, integer(1, 4, 1)},
         ParameterDescriptor{kAcc, "Automatic Color Control",
             "Calibrate saturation from burst amplitude (colour path only).",
             ParameterType::BOOL, boolean(true)},
@@ -976,24 +1036,18 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             ParameterType::DOUBLE, real(0.0, 10.0, 1.0)},
         ParameterDescriptor{kMonochrome, "Monochrome",
             "Zero the chroma channel.", ParameterType::BOOL, boolean(false)},
-        ParameterDescriptor{kCustomSubcarrier, "Non-standard subcarrier",
-            "For sources with a deliberately lowered colour subcarrier — "
-            "notably JVC VHD at 2556.8 kHz. Tracks the frequency below "
-            "instead of the standard's nominal fsc (NTSC 3579.5455 kHz, "
-            "PAL 4433.61875 kHz); the sample grid is unchanged, only the "
-            "carrier moves. OFF (default) uses the standard.",
-            ParameterType::BOOL, boolean(false)},
-        ParameterDescriptor{kSubcarrierKhz, "Subcarrier frequency (kHz)",
-            "Used only when the checkbox above is ON. VHD 2556.8 (exact "
-            "line lock 2556.8182 = 162.5 x fH), NTSC 3579.5455, PAL "
-            "4433.61875. Wrong by a few kHz and the hue rotates "
-            "progressively along each line: sweep it while watching a flat "
-            "colour area.",
-            ParameterType::DOUBLE, real(500.0, 6000.0, 2556.8)},
+        ParameterDescriptor{kChromaPhaseDeg, "Chroma phase (deg)",
+            "Rotation applied to the burst-locked phase reference before "
+            "the solver runs, same idea as the classic decoder's Chroma "
+            "Phase (Comb::transformIQ). Range -180 to 180. The recovered "
+            "chroma has been persistently 180 deg off since the Python "
+            "reference, hence the default; treat it as tunable per-capture, "
+            "not as fixed.",
+            ParameterType::DOUBLE, real(-180.0, 180.0, 180.0)},
         ParameterDescriptor{kPreviewFullRaster, "Preview: full raster",
             "PREVIEW ONLY (never affects the exported/written frames, which "
             "always honour the configured VideoParameters crop). ON: show "
-            "the whole stored raster — sync, blanking and the colour burst "
+            "the whole stored raster -- sync, blanking and the colour burst "
             "appear as monochrome signal in the margins, decoded colour "
             "stays confined to the active area. OFF: crop to the active "
             "picture, matching the export. Turn OFF if you need the "
@@ -1003,49 +1057,106 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "PREVIEW ONLY. Navigate per FIELD instead of per woven frame: "
             "each item is one field at native field height (one row per "
             "field line, no interpolation). The honest view for per-field "
-            "artefacts — dropouts, weave/field-order errors, PAL "
-            "V-switch/Hanover checks — that the frame weave smears across "
-            "two fields. Item 2n is frame n's field 1, item 2n+1 its "
-            "field 2.",
+            "artefacts -- dropouts, weave/field-order errors, PAL "
+            "V-switch/Hanover checks -- that the frame weave smears across "
+            "two fields.",
             ParameterType::BOOL, boolean(false)},
-        ParameterDescriptor{kSymmetryVariant, "Spectral-symmetry init",
+        ParameterDescriptor{kOutputPath, "Output file path",
+            "Destination for the Export button. If this is a NAMED PIPE "
+            "(mkfifo), the export always goes out as NUT-wrapped raw "
+            "RGB24 video regardless of any extension in the path (NUT is "
+            "the one streamable-by-design container of the three below -- "
+            "a pipe can't be seeked back to write a trailer/index the "
+            "way FFV1/MKV or MPEG-4/MP4 need to). Otherwise the "
+            "extension decides: .mkv -> FFV1, mathematically lossless "
+            "(encoded as planar RGB, so there's no YUV chroma-"
+            "subsampling loss either -- decoded pixels round-trip "
+            "exactly). .mp4 -> MPEG-4 Part 2, lossy (4:2:0 chroma + DCT "
+            "compression, fixed quantiser -- avcodec's own native "
+            "encoder, no external library, so noticeably less "
+            "size-efficient than H.264 at the same visual quality, which "
+            "is the trade for nothing extra to build). "
+            "Anything else falls back to the original raw interleaved "
+            "RGB24 dump, no container: view with e.g. ffplay -f rawvideo "
+            "-pixel_format rgb24 -video_size WxH.",
+            ParameterType::FILE_PATH,
+            ParameterConstraints{std::nullopt, std::nullopt,
+                                 ParameterValue{std::string{}}, {}, false,
+                                 std::nullopt}},
+
+        // ===================================================================
+        // ADVANCED / FINE-TUNING -- solver and algorithm internals. Defaults
+        // are already tuned from measured regression results (see each
+        // description); change these only when diagnosing a specific
+        // artefact, not as a first thing to try.
+        // ===================================================================
+        ParameterDescriptor{kCustomSubcarrier, "Advanced: Non-standard subcarrier",
+            "For sources with a deliberately lowered colour subcarrier -- "
+            "notably JVC VHD at 2556.8 kHz. Tracks the frequency below "
+            "instead of the standard's nominal fsc (NTSC 3579.5455 kHz, "
+            "PAL 4433.61875 kHz); the sample grid is unchanged, only the "
+            "carrier moves. OFF (default) uses the standard.",
+            ParameterType::BOOL, boolean(false)},
+        ParameterDescriptor{kSubcarrierKhz, "Advanced: Subcarrier frequency (kHz)",
+            "Used only when the checkbox above is ON. VHD 2556.8 (exact "
+            "line lock 2556.8182 = 162.5 x fH), NTSC 3579.5455, PAL "
+            "4433.61875. Wrong by a few kHz and the hue rotates "
+            "progressively along each line: sweep it while watching a flat "
+            "colour area.",
+            ParameterType::DOUBLE, real(500.0, 6000.0, 2556.8)},
+        ParameterDescriptor{kOddGateFloor, "Advanced: Odd-offset gate floor",
+            "Weight kept on opposite-parity (odd) neighbour equations where "
+            "the half-line envelope says that field cannot see the feature. "
+            "CEILING of an automatic per-pixel floor: the value is scaled "
+            "down where the field's vertical profile is a one-line EXTREMUM "
+            "(hair, fur, fine fabric -- the opposite parity never sampled the "
+            "feature, so its equation is uninformed) and kept where it is a "
+            "monotonic edge (both fields see it; the equation is biased but "
+            "informative). Leave at 0.35 unless diagnosing.",
+            ParameterType::DOUBLE, real(0.0, 1.0, 0.35)},
+        ParameterDescriptor{kCoherenceGate, "Advanced: Coherence gate",
+            "InSAR-style complex-coherence gating of the temporal equations. "
+            "0 disables it; higher trusts the coherence measurement more.",
+            ParameterType::DOUBLE, real(0.0, 1.0, 0.6)},
+        ParameterDescriptor{kLambdaC, "Advanced: Chroma smoothness",
+            "Arbitration prior. Higher = smoother chroma (less rainbowing); "
+            "lower = sharper chroma.",
+            ParameterType::DOUBLE, real(0.0, 8.0, 1.0)},
+        ParameterDescriptor{kCharbonnierEps, "Advanced: Luma edge scale (IRE)",
+            "Edge-preservation scale of the luma prior, in IRE.",
+            ParameterType::DOUBLE, real(0.05, 5.0, 0.5)},
+        ParameterDescriptor{kChromaEps, "Advanced: Chroma edge scale (IRE)",
+            "Edge-preservation scale of the chroma prior, in IRE.",
+            ParameterType::DOUBLE, real(0.05, 5.0, 1.0)},
+        ParameterDescriptor{kStructureCoupling,
+            "Advanced: Y->chroma edge coupling",
+            "Open the chroma edge where luma has one (removes hanging dots).",
+            ParameterType::DOUBLE, real(0.0, 2.0, 0.25)},
+        ParameterDescriptor{kCgIterations, "Advanced: Solver iterations",
+            "Conjugate-gradient iterations. 0 = holographic init only "
+            "(fast preview).",
+            ParameterType::INT32, integer(0, 400, 60)},
+        ParameterDescriptor{kCgTol, "Advanced: Solver early-exit tolerance",
+            "Relative gradient-norm at which the conjugate-gradient solve "
+            "stops early. 0 = auto (0.02, or 0.10 in fast mode). Measured "
+            "on real re-encoded photo content (PORTING.md Sec. 19): 0.3 "
+            "combined with fast mode is ~2.3x the default-path speed at "
+            "equal-or-slightly-better PSNR and flat-zone rainbow score. "
+            "Iteration count above remains the hard ceiling.",
+            ParameterType::DOUBLE, real(0.0, 0.9, 0.0)},
+        ParameterDescriptor{kDiagPrior, "Advanced: Diagonal chroma prior",
+            "Oriented +/-45 deg chroma prior weight (reference's "
+            "--diag-prior), renormalised so total prior mass is unchanged. "
+            "A measured trade-off, not a win: trades axis-aligned chroma "
+            "sharpness (-1 dB on SMPTE bars) for diagonal cross-colour "
+            "suppression (+2 dB on zoneplate torture). 0 = off (default); "
+            "try ~0.5-1.0 on diagonal-artifact-heavy material such as fine "
+            "weaves or venetian blinds.",
+            ParameterType::DOUBLE, real(0.0, 2.0, 0.0)},
+        ParameterDescriptor{kSymmetryVariant, "Advanced: Spectral-symmetry init",
             "Add the Transform-NTSC certified-chroma init variant.",
             ParameterType::BOOL, boolean(false)},
-        ParameterDescriptor{kChromaPhaseDeg, "Chroma phase (deg)",
-            "Rotation applied to the burst-locked phase reference before "
-            "the solver runs, same idea as the classic decoder's Chroma "
-            "Phase (Comb::transformIQ). Range -180 to 180. The recovered "
-            "chroma has been persistently 180 deg off since the Python "
-            "reference, hence the default; treat it as tunable per-capture, "
-            "not as fixed.",
-            ParameterType::DOUBLE, real(-180.0, 180.0, 180.0)},
-        ParameterDescriptor{kFftThreads, "FFTW threads (preview)",
-            "Threads FFTW uses internally per transform in the preview "
-            "path (parallel export always forces this to 1 per worker "
-            "regardless). 1 disables FFTW's own threading. There's no way "
-            "to predict the best value analytically — it depends on your "
-            "CPU and image size — so try 1/2/4/your core count live and "
-            "keep whichever measures fastest.",
-            ParameterType::INT32, integer(1, 64, 4)},
-        ParameterDescriptor{kEnableTemporal, "Enable 3D (temporal)",
-            "Adds six motion-gated neighbour-field equations per field "
-            "(f±1/±2/±3) to the field-granularity solve, resolving the "
-            "Y/C ambiguity that a single field cannot (cross-colour, "
-            "rainbow on fine detail), and from pass 2 the synth-reference "
-            "anchor adds motion-compensated temporal noise reduction. "
-            "Strength defaults to adaptive (see Temporal strength). "
-            "Measured on the regression scene: +1.9 dB single-pass, "
-            "+6.4 dB anchored 2-pass over per-field 2D.",
-            ParameterType::BOOL, boolean(false)},
-        ParameterDescriptor{kPasses, "3D passes",
-            "Gauss-Seidel fixed-point passes over each export chunk "
-            "(sequence pipeline only). 1 = single pass. From pass 2 the "
-            "decode->NR->re-encode anchor engages: motion-compensated "
-            "temporal noise reduction whose reference never gets trusted "
-            "where the raw data contradicts it. 2 is the reference's "
-            "anchored-mode value.",
-            ParameterType::INT32, integer(1, 4, 1)},
-        ParameterDescriptor{kNrAnchor, "Anchor strength",
+        ParameterDescriptor{kNrAnchor, "Advanced: Anchor strength",
             "Weight of the decode->NR->re-encode anchor once it engages "
             "(passes >= 2, above) -- how strongly the temporally-denoised "
             "reference pulls the solve versus the raw per-field data. "
@@ -1054,39 +1165,15 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "even with passes >= 2 (Gauss-Seidel iteration continues, "
             "just without the NR reference).",
             ParameterType::DOUBLE, real(0.0, 3.0, 1.0)},
-        ParameterDescriptor{kDebugDir, "Diagnostics directory",
-            "When set, the export also writes, per frame, a PGM map of the "
-            "RESIDUAL CARRIER-BAND ENERGY in the decoded luma — i.e. the "
-            "rainbow/dot-crawl you can see, measured (bright = separation "
-            "failed there) — plus diag.txt logging the decoder's decisions "
-            "per chunk (adaptive strength chosen, measured ambiguity, "
-            "noise, gates, field-order vote). If an artifact persists, "
-            "send the map of the bad zone and the matching diag.txt lines "
-            "instead of describing it.",
-            ParameterType::FILE_PATH,
-            ParameterConstraints{std::nullopt, std::nullopt,
-                                 ParameterValue{std::string{}}, {}, false,
-                                 std::nullopt}},
-        ParameterDescriptor{kFieldOrder, "Field order",
-            "0 = Auto (default): the order is MEASURED from the signal — "
-            "under the true order each field's lines interpolate the "
-            "other's at +0.5 line, under the inverted order at -0.5, a "
-            "deterministic half-line vertical correlation vote (majority "
-            "over the export window; falls back to the ld-decode format "
-            "convention, field 1 = top, on flat content). 1 = force "
-            "field 1 top. 2 = force field 1 bottom. Wrong-order symptoms: "
-            "one-line serration on static horizontal edges, and motion "
-            "that combs even through a player's deinterlacer.",
-            ParameterType::INT32, integer(0, 2, 0)},
-        ParameterDescriptor{kChunkFrames, "3D chunk size",
+        ParameterDescriptor{kChunkFrames, "Advanced: 3D chunk size",
             "Frames per export window in 3D mode (plus 2 frames of context "
             "on each side). Bounds memory; larger chunks slightly reduce "
             "edge effects at chunk boundaries.",
             ParameterType::INT32, integer(1, 24, 6)},
-        ParameterDescriptor{kTemporalStrength, "Temporal strength",
+        ParameterDescriptor{kTemporalStrength, "Advanced: Temporal strength",
             "Weight of the motion-compensated neighbour-field equations "
             "once Enable 3D is on. 0 = ADAPTIVE (default): the strength is "
-            "measured from the content per window — same-parity fields "
+            "measured from the content per window -- same-parity fields "
             "carry the chroma identically but flip luma leakage in sign, "
             "so their demodulated difference isolates exactly the Y/C "
             "ambiguity the 3D equations exist to resolve; strong "
@@ -1095,16 +1182,21 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "noise. Any positive value forces that fixed strength "
             "(reference --3d uses 0.5).",
             ParameterType::DOUBLE, real(0.0, 4.0, 0.0)},
-        ParameterDescriptor{kMcTile, "Motion tile size (px)",
+        ParameterDescriptor{kMcTile, "Advanced: Motion tile size (px)",
             "Block-matching tile size for the temporal path.",
             ParameterType::INT32, integer(8, 128, 32)},
-        ParameterDescriptor{kMcSearch, "Motion search radius (px)",
+        ParameterDescriptor{kMcSearch, "Advanced: Motion search radius (px)",
             "Block-matching search radius for the temporal path.",
             ParameterType::INT32, integer(2, 64, 16)},
-        ParameterDescriptor{kOutputPath, "Output file path",
-            "Destination for the Export button: raw interleaved RGB24, no "
-            "container. View with e.g. ffplay -f rawvideo -pixel_format "
-            "rgb24 -video_size WxH.",
+        ParameterDescriptor{kDebugDir, "Advanced: Diagnostics directory",
+            "When set, the export also writes, per frame, a PGM map of the "
+            "RESIDUAL CARRIER-BAND ENERGY in the decoded luma -- i.e. the "
+            "rainbow/dot-crawl you can see, measured (bright = separation "
+            "failed there) -- plus diag.txt logging the decoder's decisions "
+            "per chunk (adaptive strength chosen, measured ambiguity, "
+            "noise, gates, field-order vote). If an artifact persists, "
+            "send the map of the bad zone and the matching diag.txt lines "
+            "instead of describing it.",
             ParameterType::FILE_PATH,
             ParameterConstraints{std::nullopt, std::nullopt,
                                  ParameterValue{std::string{}}, {}, false,
@@ -1141,7 +1233,6 @@ HvdChromaDecoderStage::get_parameters() const
         {kPreviewFieldView, preview_field_view_},
         {kSymmetryVariant, config_.symmetry_variant},
         {kChromaPhaseDeg, static_cast<double>(config_.chroma_phase_deg)},
-        {kFftThreads, static_cast<int32_t>(config_.fft_threads)},
         {kEnableTemporal, config_.enable_temporal},
         {kTemporalStrength, static_cast<double>(config_.temporal_strength)},
         {kMcTile, static_cast<int32_t>(config_.mc_tile)},
@@ -1207,7 +1298,6 @@ bool HvdChromaDecoderStage::set_parameters(
     get_bool(kPreviewFieldView, preview_field_view_);
     get_bool(kSymmetryVariant, config_.symmetry_variant);
     get_double(kChromaPhaseDeg, config_.chroma_phase_deg);
-    get_int(kFftThreads, config_.fft_threads);
     get_bool(kEnableTemporal, config_.enable_temporal);
     get_double(kTemporalStrength, config_.temporal_strength);
     get_int(kMcTile, config_.mc_tile);

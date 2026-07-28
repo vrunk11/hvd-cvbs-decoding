@@ -45,6 +45,13 @@
             sqlite
             yaml-cpp
             libpng
+            # Also this plugin's own dependency now: video_writer.cpp muxes
+            # .mkv (FFV1, lossless), .mp4 (MPEG-4 Part 2, lossy), and
+            # named-pipe (NUT/raw) exports -- all using avcodec's own
+            # native encoders, deliberately not libx264 (a separate
+            # autotools project that's fiddly to build on some
+            # toolchains; see the vcpkg.json comment for the Windows
+            # side of this).
             ffmpeg
 
             # HVD engine dependency: single-precision FFTW (fftw3f).

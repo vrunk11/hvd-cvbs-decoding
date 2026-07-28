@@ -117,6 +117,38 @@ endif()
 # fully threaded. See fft2d.h's SetThreadCount doc comment: it is kept as a
 # no-op so callers don't need conditional compilation of their own.
 
+# --- FFmpeg (libav*): real-container video export (.mkv/FFV1, .mp4/MPEG-4, NUT) --
+# Only needed by the plugin target's video_writer.cpp, not hvd_core or the
+# engine-only tests -- HVD_ENGINE_ONLY builds skip this block entirely.
+if(NOT HVD_ENGINE_ONLY)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(HVD_FFMPEG IMPORTED_TARGET
+            libavformat libavcodec libavutil libswscale)
+    endif()
+    if(NOT HVD_FFMPEG_FOUND)
+        find_library(HVD_AVFORMAT_LIBRARY NAMES avformat)
+        find_library(HVD_AVCODEC_LIBRARY NAMES avcodec)
+        find_library(HVD_AVUTIL_LIBRARY NAMES avutil)
+        find_library(HVD_SWSCALE_LIBRARY NAMES swscale)
+        find_path(HVD_FFMPEG_INCLUDE_DIR NAMES libavformat/avformat.h)
+        if(NOT HVD_AVFORMAT_LIBRARY OR NOT HVD_AVCODEC_LIBRARY OR
+           NOT HVD_AVUTIL_LIBRARY OR NOT HVD_SWSCALE_LIBRARY OR
+           NOT HVD_FFMPEG_INCLUDE_DIR)
+            message(FATAL_ERROR
+                "FFmpeg (libavformat/libavcodec/libavutil/libswscale) not "
+                "found. Install it (e.g. via vcpkg -- see vcpkg.json) or "
+                "pass -DHVD_AVFORMAT_LIBRARY=<...> etc. by hand.")
+        endif()
+        add_library(PkgConfig::HVD_FFMPEG INTERFACE IMPORTED)
+        set_target_properties(PkgConfig::HVD_FFMPEG PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${HVD_FFMPEG_INCLUDE_DIR}"
+            INTERFACE_LINK_LIBRARIES
+                "${HVD_AVFORMAT_LIBRARY};${HVD_AVCODEC_LIBRARY};${HVD_AVUTIL_LIBRARY};${HVD_SWSCALE_LIBRARY}")
+    endif()
+    # else: pkg_check_modules(... IMPORTED_TARGET) already created
+    # PkgConfig::HVD_FFMPEG for us.
+endif()
+
 # --- hvd_core: the SDK-free numerical library (engine + frame bridge) ---------
 # NOTE: variational.cpp already has #pragma omp parallel for on its hot
 # elementwise loops (gradient, curvature, dot products — the IRLS/CG solver
@@ -195,6 +227,7 @@ orc_add_stage_plugin(
     SOURCES
         src/plugin.cpp
         src/hvd_chroma_decoder_stage.cpp
+        src/video_writer.cpp
     LINK_LIBRARIES
         hvd_core
 )
@@ -202,6 +235,10 @@ orc_add_stage_plugin(
 target_include_directories(${HVD_PLUGIN_TARGET} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+if(TARGET PkgConfig::HVD_FFMPEG)
+    target_link_libraries(${HVD_PLUGIN_TARGET} PRIVATE PkgConfig::HVD_FFMPEG)
+endif()
 endif()  # NOT HVD_ENGINE_ONLY
 
 if(BUILD_TESTS)

@@ -75,12 +75,16 @@ ctest --test-dir build --output-on-failure
 ./scripts/package_local.sh build dist   # -> dist/orc-plugin_hvd_chroma_decoder_linux.so
 ```
 
-Inside `nix develop`, cmake, ninja, pkg-config, fmt, spdlog and FFTW
+Inside `nix develop`, cmake, ninja, pkg-config, fmt, spdlog, FFTW and
+FFmpeg (libav*, for the .mkv/.mp4 export path — see `video_writer.cpp`)
 are all provided; nothing to apt-install.
 
 ### 1.3 Full plugin without Nix (at your own risk)
 
-Possible — install `libfftw3-dev`, `libfmt-dev`, point
+Possible — install `libfftw3-dev`, `libfmt-dev`,
+`libavformat-dev libavcodec-dev libavutil-dev libswscale-dev` (for the
+.mkv/.mp4/pipe export path — MPEG-4 Part 2 and FFV1 are both native to
+avcodec, no separate x264/GPL codec library needed), point
 `-DORC_INTREE_SDK_DIR` at the checkout — but the resulting `.so`
 carries *your* gcc's toolchain tag. Only useful when you also built the
 decode-orc host yourself with the same compiler. For a host installed
@@ -107,11 +111,19 @@ ctest --test-dir build --output-on-failure -C Release
 
 Notes:
 * **Dependencies are declared in `vcpkg.json`** (manifest mode):
-  `fftw3` with the `threads` feature, and `fmt` for the SDK headers.
-  With the toolchain file passed, vcpkg installs them at configure time
-  automatically — do **not** `vcpkg install` anything by hand; manifest
-  mode ignores classic-mode packages (this bit the CI once: an explicit
-  `vcpkg install fmt` step looked load-bearing and fed nothing).
+  `fftw3` with the `threads` feature, `fmt` for the SDK headers, and
+  `ffmpeg` (avcodec/avformat/swscale) for the .mkv/.mp4/pipe export
+  path in `video_writer.cpp` -- deliberately *without* the `x264`
+  feature: libx264 is a whole separate autotools project vcpkg builds
+  on the side, and it's known to fail its `./configure` step under
+  some MinGW/MSYS2 setups (unrelated to this plugin's own code). The
+  .mp4 path uses avcodec's own native MPEG-4 Part 2 encoder instead --
+  bigger files than H.264 at the same visual quality, but nothing
+  extra to build. With the toolchain file passed, vcpkg installs
+  everything at configure time automatically — do **not** `vcpkg
+  install` anything by hand; manifest mode ignores classic-mode
+  packages (this bit the CI once: an explicit `vcpkg install fmt` step
+  looked load-bearing and fed nothing).
 * vcpkg's `fftw3[threads]` compiles the threading symbols directly into
   `fftw3f` (no separate `fftw3f_threads` DLL); the build system detects
   this by *linking a probe*, not by looking for a file, so both

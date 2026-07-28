@@ -18,18 +18,26 @@ if(NOT HVD_ENGINE_ONLY)
 add_executable(hvd_stage_smoke_test
     stage_smoke_test.cpp
     ../src/hvd_chroma_decoder_stage.cpp
+    ../src/video_writer.cpp
 )
 target_link_libraries(hvd_stage_smoke_test PRIVATE ${HVD_TEST_SDK_TARGET} hvd_core)
 target_include_directories(hvd_stage_smoke_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+if(TARGET PkgConfig::HVD_FFMPEG)
+    target_link_libraries(hvd_stage_smoke_test PRIVATE PkgConfig::HVD_FFMPEG)
+endif()
 add_test(NAME hvd_stage_smoke_test COMMAND hvd_stage_smoke_test)
 
 add_executable(hvd_plugin_entrypoints_test
     plugin_entrypoints_test.cpp
     ../src/plugin.cpp
     ../src/hvd_chroma_decoder_stage.cpp
+    ../src/video_writer.cpp
 )
 target_link_libraries(hvd_plugin_entrypoints_test PRIVATE ${HVD_TEST_SDK_TARGET} hvd_core)
 target_include_directories(hvd_plugin_entrypoints_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+if(TARGET PkgConfig::HVD_FFMPEG)
+    target_link_libraries(hvd_plugin_entrypoints_test PRIVATE PkgConfig::HVD_FFMPEG)
+endif()
 add_test(NAME hvd_plugin_entrypoints_test COMMAND hvd_plugin_entrypoints_test)
 endif()  # NOT HVD_ENGINE_ONLY
 
