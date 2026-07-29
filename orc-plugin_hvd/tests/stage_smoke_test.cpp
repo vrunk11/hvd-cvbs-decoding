@@ -62,9 +62,12 @@ int main()
         bool equal = false;
         if (std::holds_alternative<double>(want) &&
             std::holds_alternative<double>(got)) {
-            const double a = std::get<double>(want);
-            const double b = std::get<double>(got);
-            equal = std::fabs(a - b) <= 1e-9 * std::max(1.0, std::fabs(a));
+            // HvdConfig stores these numeric defaults as float. Compare both
+            // values in float so the descriptor and HvdConfig use the same
+            // representation instead of comparing float-vs-double rounding.
+            const float a = static_cast<float>(std::get<double>(want));
+            const float b = static_cast<float>(std::get<double>(got));
+            equal = a == b;
             if (!equal) {
                 std::cerr << "Default mismatch for '" << d.name
                           << "': descriptor=" << a << " HvdConfig=" << b << '\n';
