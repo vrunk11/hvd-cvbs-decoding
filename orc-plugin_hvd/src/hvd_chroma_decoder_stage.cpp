@@ -1157,9 +1157,11 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "(sequence pipeline only). 1 = single pass. From pass 2 the "
             "decode->NR->re-encode anchor engages: motion-compensated "
             "temporal noise reduction whose reference never gets trusted "
-            "where the raw data contradicts it. 2 is the reference's "
-            "anchored-mode value.",
-            ParameterType::INT32, integer(1, 4, 1)},
+            "where the raw data contradicts it. 2 (default, matches the "
+            "reference's anchored-mode value) is where most of the "
+            "quality is; dropping to 1 loses that anchor and gives up a "
+            "fair amount of quality for a faster pass.",
+            ParameterType::INT32, integer(1, 4, 2)},
         ParameterDescriptor{kAcc, "Automatic Color Control",
             "Calibrate saturation from burst amplitude (colour path only).",
             ParameterType::BOOL, boolean(true)},
@@ -1223,6 +1225,19 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             ParameterConstraints{std::nullopt, std::nullopt,
                                  ParameterValue{std::string{}}, {}, false,
                                  std::nullopt}},
+        ParameterDescriptor{kLambdaC, "Chroma smoothness",
+            "Arbitration prior. Higher = smoother chroma (less rainbowing); "
+            "lower = sharper chroma.",
+            ParameterType::DOUBLE, real(0.0, 8.0, 1.0)},
+        ParameterDescriptor{kCgIterations, "Solver iterations",
+            "Conjugate-gradient iterations. 0 = holographic init only "
+            "(fast preview). Default kept small (2) so a fresh/"
+            "never-configured stage decodes quickly by default; raise it "
+            "when tuning for final quality, not as a first thing to try.",
+            ParameterType::INT32, integer(0, 400, 2)},
+        ParameterDescriptor{kSymmetryVariant, "Spectral-symmetry init",
+            "Add the Transform-NTSC certified-chroma init variant.",
+            ParameterType::BOOL, boolean(false)},
 
         // ===================================================================
         // ADVANCED / FINE-TUNING -- solver and algorithm internals. Defaults
@@ -1258,10 +1273,6 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "InSAR-style complex-coherence gating of the temporal equations. "
             "0 disables it; higher trusts the coherence measurement more.",
             ParameterType::DOUBLE, real(0.0, 1.0, 0.6)},
-        ParameterDescriptor{kLambdaC, "Advanced: Chroma smoothness",
-            "Arbitration prior. Higher = smoother chroma (less rainbowing); "
-            "lower = sharper chroma.",
-            ParameterType::DOUBLE, real(0.0, 8.0, 1.0)},
         ParameterDescriptor{kCharbonnierEps, "Advanced: Luma edge scale (IRE)",
             "Edge-preservation scale of the luma prior, in IRE.",
             ParameterType::DOUBLE, real(0.05, 5.0, 0.5)},
@@ -1272,12 +1283,6 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "Advanced: Y->chroma edge coupling",
             "Open the chroma edge where luma has one (removes hanging dots).",
             ParameterType::DOUBLE, real(0.0, 2.0, 0.25)},
-        ParameterDescriptor{kCgIterations, "Advanced: Solver iterations",
-            "Conjugate-gradient iterations. 0 = holographic init only "
-            "(fast preview). Default kept small (2) so a fresh/"
-            "never-configured stage decodes quickly by default; raise it "
-            "when tuning for final quality, not as a first thing to try.",
-            ParameterType::INT32, integer(0, 400, 2)},
         ParameterDescriptor{kCgTol, "Advanced: Solver early-exit tolerance",
             "Relative gradient-norm at which the conjugate-gradient solve "
             "stops early. 0 = auto (0.02, or 0.10 in fast mode). Measured "
@@ -1295,9 +1300,6 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "try ~0.5-1.0 on diagonal-artifact-heavy material such as fine "
             "weaves or venetian blinds.",
             ParameterType::DOUBLE, real(0.0, 2.0, 0.0)},
-        ParameterDescriptor{kSymmetryVariant, "Advanced: Spectral-symmetry init",
-            "Add the Transform-NTSC certified-chroma init variant.",
-            ParameterType::BOOL, boolean(false)},
         ParameterDescriptor{kNrAnchor, "Advanced: Anchor strength",
             "Weight of the decode->NR->re-encode anchor once it engages "
             "(passes >= 2, above) -- how strongly the temporally-denoised "
