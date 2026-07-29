@@ -105,10 +105,30 @@ std::vector<float> BurstLockinPhase(const Plane& field_ire,
   std::vector<float> amp;
   BurstLockin(field_ire, g, &z, &amp);
 
-  // burst = A sin(phi) = Re[(-iA) e^{i phi}] => lock-in z = (-iA/2) e^{i theta}
-  // => theta = angle(z) + pi/2.
+  // SIGN OF THE BURST -- the source of the long-standing 180 deg error.
+  //
+  // The composite model is S = Y + Re[chi * e^{i phi}] with chi = V - iU,
+  // i.e. S_chroma = U sin(phi) + V cos(phi). The NTSC burst sits on the
+  // -U axis (SMPTE 170M-2004 §8.2: 180 deg), so U = -B, V = 0 and
+  //
+  //     chi_burst = V - iU = +iB = B e^{i pi/2}
+  //     burst(x)  = Re[chi_burst e^{i phi}] = -B sin(phi)
+  //
+  // NOT +B sin(phi). The old derivation (and reference/hvd/encode.py:141,
+  // fixed alongside this) evaluated Re[i A e^{i phi}] as +A sin(phi); it is
+  // -A sin(phi). Feeding that through the lock-in:
+  //
+  //     z = mean(burst(x) e^{-i w0 x}) = (B/2) e^{i(theta + pi/2)}
+  //     => theta = arg(z) - pi/2
+  //
+  // The old `+ kHalfPi` was therefore exactly pi out, which is why chroma
+  // "has been persistently 180 deg off since the Python reference" and why
+  // HvdConfig::chroma_phase_deg defaulted to 180 to cancel it. That default
+  // is now 0 -- the compensation belongs here, not in a user-facing trim
+  // control, and it must NOT be applied on PAL, whose lock-in below was
+  // already correct (see BurstLockinPhasePal).
   std::vector<float> theta(h, 0.0F);
-  for (int y = 0; y < h; ++y) theta[y] = std::arg(z[y]) + kHalfPi;
+  for (int y = 0; y < h; ++y) theta[y] = std::arg(z[y]) - kHalfPi;
 
   // "good" lines: burst amplitude above 20 % of the field maximum.
   const float amp_max = amp.empty() ? 0.0F : *std::max_element(amp.begin(),
@@ -166,20 +186,72 @@ std::vector<float> BurstLockinPhase(const Plane& field_ire,
 }
 
 float BurstAmplitudeIre(const Plane& field_ire, const FieldGeometry& g) {
-  std::vector<Complex> z;
-  std::vector<float> amp;
-  BurstLockin(field_ire, g, &z, &amp);
-  // amp here is |z| = A/2 for burst A sin(phi); the reported amplitude is 2|z|.
-  std::vector<float> pos;
-  for (float v : amp)
-    if (v > 0.0F) pos.push_back(2.0F * v);
-  if (pos.empty()) return 20.0F;
+  // AMPLITUDE, unlike PHASE, must not be a coherent average over the whole
+  // burst window.
+  //
+  // The window comes from orc::colour_burst_range() and is a fixed 36
+  // samples (9 cycles) for NTSC / 40 (10 cycles) for PAL -- the NOMINAL
+  // burst length. But SMPTE 170M-2004 Table 2 permits 9 +/- 1 cycles, and
+  // a TBC's sample-0 reference is not guaranteed to place the burst
+  // identically on every capture. Whenever the burst fills only m of the
+  // window's n samples, a coherent mean over all n reports
+  //
+  //     A * m / n        instead of        A
+  //
+  // -- the amplitude is DILUTED by the empty part of the window, linearly.
+  // A perfectly legal 8-cycle burst reads 17.78 IRE instead of 20.00, so
+  // the ACC applies 1.125; a 4-sample window misalignment does the same;
+  // the two together land near 1.25, i.e. 25 % over-saturation that the
+  // operator then has to cancel by hand with Chroma Gain ~0.8.
+  //
+  // Note the host's decoders are immune to this by construction, which is
+  // why the window was never sized for it: palcolour.cpp and comb.cpp
+  // normalise the burst vector to UNIT MAGNITUDE and use it as a phase
+  // reference only, so any dilution cancels out. This decoder is the only
+  // one that consumes the burst's amplitude, so it needs an estimator that
+  // does not care how much of the window is empty.
+  //
+  // Estimator: slide a ONE-CYCLE (4-sample) coherent demodulation across
+  // the window to get the local complex envelope, then take the MEDIAN of
+  // its magnitude. One full cycle at 4fsc rejects DC exactly (the four
+  // unit phasors sum to zero), so no pedestal estimate is needed either --
+  // and the pedestal estimate was itself contaminated by the empty part of
+  // the window. The median is unbiased as long as more than half the
+  // window carries burst, and it does not dilute at all below that; it
+  // simply degrades to the amplitude of whatever burst is present.
+  const int h = field_ire.height();
+  const int x0 = g.colour_burst_start;
+  const int x1 = g.colour_burst_end;
+  const float w0 = static_cast<float>(g.phase_per_sample());
+  if (x1 - x0 < 4) return g.nominal_burst_ire();
 
-  const float med_pos = MedianOf(pos);
+  std::vector<float> per_line;
+  per_line.reserve(static_cast<size_t>(h));
+  std::vector<float> env;
+  for (int y = 0; y < h; ++y) {
+    env.clear();
+    for (int s = x0; s + 4 <= x1; ++s) {
+      Complex acc{0.0F, 0.0F};
+      for (int k = 0; k < 4; ++k) {
+        const int x = s + k;
+        acc += field_ire.at(y, x) *
+               std::polar(1.0F, -w0 * static_cast<float>(x));
+      }
+      // |z| = A/2 for a sinusoid of peak amplitude A.
+      env.push_back(2.0F * std::abs(acc) * 0.25F);
+    }
+    if (!env.empty()) per_line.push_back(MedianOf(env));
+  }
+  if (per_line.empty()) return g.nominal_burst_ire();
+
+  // Across lines: drop the ones with no usable burst (dropouts, VBI), then
+  // take the median of the rest -- unchanged in spirit from before.
+  const float med_all = MedianOf(per_line);
   std::vector<float> good;
-  for (float v : pos)
-    if (v > 0.25F * med_pos) good.push_back(v);
-  return good.empty() ? 20.0F : MedianOf(good);
+  for (float v : per_line) {
+    if (v > 0.25F * med_all) good.push_back(v);
+  }
+  return good.empty() ? g.nominal_burst_ire() : MedianOf(good);
 }
 
 PalBurstLockin BurstLockinPhasePal(const Plane& field_ire,

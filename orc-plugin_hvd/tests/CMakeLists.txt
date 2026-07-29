@@ -58,6 +58,8 @@ set(HVD_ENGINE_TESTS
     field_order_test
     variational_v2_test
     pal_lockin_test
+    chroma_reference_test
+    gain_chain_test
     pal_aniso_group_test
     preview_aspect_test)
 

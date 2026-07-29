@@ -38,13 +38,20 @@ namespace hvd {
 // Populated by the stage from the host's SourceParameters; kept SDK-free so the
 // bridge and engine stay unit-testable without the host.
 struct FrameParams {
-  bool is_pal = false;   // 625-line PAL family (B/G/I/D, fsc 4.43361875 MHz).
-                         // PAL-M / PAL-N (PAL chroma on other line/fsc
-                         // geometries) are NOT covered by this flag yet:
-                         // they need their own line_advance derivation
-                         // (90 deg and 90.43 deg per line respectively)
-                         // before the engine can accept them honestly.
-  int frame_width = 0;   // samples per line (910 NTSC / 1135 PAL)
+  // Composite standard. Replaces the old `bool is_pal`, which could only
+  // say "625-line PAL or not" and therefore routed PAL-M -- PAL chroma on
+  // an NTSC raster -- down the NTSC path, decoding it with no V-switch and
+  // a 180 deg/line carrier model instead of 90 deg/line. PAL-N is still
+  // unsupported (it needs a 90.43 deg/line derivation) and is rejected by
+  // the stage rather than silently mis-decoded.
+  VideoStandard standard = VideoStandard::kNtsc;
+
+  // Back-compat convenience for callers that only care about the V-switch.
+  bool uses_vswitch() const {
+    return standard == VideoStandard::kPal || standard == VideoStandard::kPalM;
+  }
+
+  int frame_width = 0;   // samples per line (910 NTSC / 1135 PAL / 909 PAL-M)
   int frame_height = 0;  // total flat lines (525 NTSC)
   int field1_lines = 0;  // lines of field 1 in the flat buffer (263 NTSC)
   int active_video_start = 0;
@@ -62,7 +69,47 @@ struct FrameParams {
   // The stage sets this from HvdConfig::custom_subcarrier /
   // HvdConfig::subcarrier_khz; see FieldGeometry::subcarrier_hz.
   double subcarrier_hz = 0.0;
+
+  // NON-ORTHOGONAL LINES (PAL only).
+  //
+  // 625-line PAL is not orthogonally sampled: a frame is 709 379 samples,
+  // not 625 * 1135 = 709 375. EBU Tech. 3280-E §1.2 puts the 4 extra
+  // samples on the last line of each field, so frame-flat lines 312 and 624
+  // carry 1137 samples and every other line carries 1135. The host says so
+  // explicitly (orc::kPalExtraSampleLines, frame_line_sample_offset() in
+  // <orc/support/frame_line_util.h>, and VideoFrameRepresentation's own
+  // "PAL frames have non-uniform line lengths" contract).
+  //
+  // Reading such a buffer with a flat `line * frame_width` stride -- which
+  // is what this bridge used to do -- puts the whole of field 2 two samples
+  // early, because lines 312's two extras sit before it. Two samples at
+  // 4fsc is 180 deg of subcarrier and a 2 px horizontal misregistration
+  // between the fields, which quietly corrupts the weave and every
+  // inter-field carrier relationship the engine depends on. (The per-line
+  // lock-in hides it in the demodulation itself: the burst shifts with the
+  // rest of the line, so each line stays self-consistent. Only the
+  // field-to-field geometry breaks -- which is exactly the part that is
+  // hardest to spot by eye.)
+  //
+  // Populated by the stage from the SDK helper; an empty table means a
+  // uniform stride (NTSC, PAL-M, and every synthetic test geometry). Held
+  // as a fixed array rather than a vector so FrameParams stays cheap to
+  // copy -- the stage returns it by value on every frame.
+  static constexpr int kMaxExtraSampleLines = 8;
+  int32_t extra_sample_lines[kMaxExtraSampleLines] = {};
+  int extra_sample_line_count = 0;
 };
+
+// Sample offset of frame-flat line `line` within the SOURCE buffer.
+// Equivalent to orc::frame_line_sample_offset(), re-derived here so this
+// header keeps its no-SDK-dependency property.
+inline int64_t FrameLineOffset(const FrameParams& fp, int line) {
+  int64_t offset = static_cast<int64_t>(line) * fp.frame_width;
+  for (int i = 0; i < fp.extra_sample_line_count; ++i) {
+    if (fp.extra_sample_lines[i] < line) ++offset;
+  }
+  return offset;
+}
 
 // A decoded Y/C frame in the 10-bit sample domain (int16_t == VFR sample_type),
 // same field-sequential geometry as the input. By construction

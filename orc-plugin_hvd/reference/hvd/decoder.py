@@ -143,6 +143,10 @@ class DecoderConfig:
     init_lpf_h_mhz: float = 1.3     # horizontal chroma bandwidth for init
     init_lpf_v_cph: float = 60.0    # vertical bandwidth (cycles/active-picture-height)
     chroma_gain: float = 1.0
+    chroma_phase_deg: float = 0.0    # RELATIVE trim (degrees) added to the
+                                     # measured burst phase; 0 = use the
+                                     # measurement as-is. See
+                                     # burst_lockin_phase().
     monochrome: bool = False
 
 
@@ -162,11 +166,26 @@ def estimate_noise_ire(S: np.ndarray) -> float:
     return float(q / 0.3186 / np.sqrt(6.0))
 
 
-def burst_lockin_phase(field_ire: np.ndarray, p: VideoParameters) -> np.ndarray:
+def burst_lockin_phase(field_ire: np.ndarray, p: VideoParameters,
+                       chroma_phase_deg: float = 0.0) -> np.ndarray:
     """Per-line subcarrier phase offset via lock-in detection on the burst.
 
     Returns theta[line] such that phi(line, x) = theta[line] + (pi/2)*x.
     Lines with no detectable burst inherit the model phase (pi per line).
+
+    `chroma_phase_deg` is a RELATIVE trim, in degrees, added on top of the
+    MEASURED trajectory -- never a replacement for it. It is applied to
+    theta the moment theta is measured, so everything downstream (the
+    per-line model anchor, the deviation the smoother works on, the IRLS
+    weights) is computed relative to the already-trimmed reference and
+    stays self-consistent. A positive value rotates the recovered hue
+    positively, hence the minus sign: the lock-in recovers
+    (signal phase - LO phase), so pushing the LO back advances the result.
+
+    Default 0.0. It used to be 180 in the C++ port, but that was
+    compensating for a sign error in the burst derivation below, not a
+    real property of any source. The error is fixed; the control is a
+    genuine per-capture trim again.
     """
     h, _ = field_ire.shape
     x = np.arange(p.colour_burst_start, p.colour_burst_end)
@@ -176,9 +195,16 @@ def burst_lockin_phase(field_ire: np.ndarray, p: VideoParameters) -> np.ndarray:
     z = (seg * ref[None, :]).mean(axis=1)            # complex lock-in output
     amp = np.abs(z)
 
-    # burst = A*sin(phi) = Re[(-iA) e^{i phi}] => lock-in z = (-iA/2) e^{i theta}
-    # => theta = angle(z) + pi/2
-    theta = np.angle(z) + np.pi / 2.0
+    # The NTSC burst sits on the -U axis (SMPTE 170M-2004 8.2: 180 deg),
+    # so chi_burst = V - iU = +iA and
+    #   burst(x) = Re[iA e^{i phi}] = -A sin(phi)
+    #   z        = mean(burst * e^{-i w0 x}) = (A/2) e^{i(theta + pi/2)}
+    #   => theta = angle(z) - pi/2
+    theta = np.angle(z) - np.pi / 2.0
+
+    # Relative trim, applied to the measurement itself (see docstring).
+    if chroma_phase_deg:
+        theta = theta - np.deg2rad(chroma_phase_deg)
 
     # Robust smoothing of the phase trajectory across lines
     # (Kalman/RTS idea from communications): after time-base
@@ -241,10 +267,16 @@ def _tridiag_smooth(d, a, lam):
 
 def burst_amplitude_ire(field_ire: np.ndarray, p: VideoParameters) -> float:
     """Measured colour-burst amplitude (IRE), for Automatic Color
-    Control. Lock-in output magnitude |z| = A/2 for burst A*sin(phi);
-    median over burst-bearing lines rejects damaged ones. Every
-    analogue TV normalises chroma gain by this — a source chain whose
-    levels drifted otherwise decodes over/under-saturated."""
+    Control. Lock-in output magnitude |z| = A/2 for a burst of peak
+    amplitude A; median over burst-bearing lines rejects damaged ones.
+    Every analogue TV normalises chroma gain by this — a source chain
+    whose levels drifted otherwise decodes over/under-saturated.
+
+    The result is in TRUE IRE (blanking-referenced, see
+    VideoParameters.ire), so a nominal NTSC burst measures 20.0 and the
+    ACC gain below comes out at exactly 1.0. Under the old
+    black-referenced scale it measured 21.62 and the ACC quietly applied
+    a permanent 0.925."""
     x = np.arange(p.colour_burst_start, p.colour_burst_end)
     seg = field_ire[:, p.colour_burst_start:p.colour_burst_end]
     seg = seg - seg.mean(axis=1, keepdims=True)
@@ -1130,7 +1162,7 @@ def decode_field(field_raw: np.ndarray, p: VideoParameters,
                  cfg: DecoderConfig):
     """Decode one field -> (Y, U, V) over the active picture area."""
     ire = p.ire(field_raw)
-    theta = burst_lockin_phase(ire, p)
+    theta = burst_lockin_phase(ire, p, cfg.chroma_phase_deg)
 
     a0, a1 = p.active_video_start, p.active_video_end
     S = ire[:, a0:a1]
@@ -1370,7 +1402,8 @@ def decode_frame(src: TbcSource, frame_index: int, cfg: DecoderConfig,
         return (rgb, None) if return_state else rgb
 
     # ---- woven-frame path ------------------------------------------
-    S, phi = prepare_frame(src, frame_index, first_active_line)
+    S, phi = prepare_frame(src, frame_index, first_active_line,
+                           cfg.chroma_phase_deg)
     Y0, chi0 = holographic_init(S, phi, p, cfg)
     if cfg.cg_iterations > 0 and not cfg.monochrome:
         mc = []
@@ -1394,7 +1427,8 @@ def decode_frame(src: TbcSource, frame_index: int, cfg: DecoderConfig,
 
 
 def prepare_field(src: TbcSource, field_index: int,
-                  first_active_line: int | None = None):
+                  first_active_line: int | None = None,
+                  chroma_phase_deg: float = 0.0):
     """One field's active area -> (S, phi) at field geometry.
 
     The active line range defaults to the .tbc.json metadata
@@ -1406,7 +1440,7 @@ def prepare_field(src: TbcSource, field_index: int,
     lal = p.last_active_field_line or p.field_height
     a0, a1 = p.active_video_start, p.active_video_end
     ire = p.ire(src.read_field(field_index))
-    theta = burst_lockin_phase(ire, p)[fal:lal]
+    theta = burst_lockin_phase(ire, p, chroma_phase_deg)[fal:lal]
     S = ire[fal:lal, a0:a1].astype(np.float32)
     x = np.arange(p.field_width)[a0:a1]
     phi = (theta[:, None] + (np.pi / 2.0) * x[None, :]).astype(np.float32)
@@ -1414,7 +1448,8 @@ def prepare_field(src: TbcSource, field_index: int,
 
 
 def prepare_frame(src: TbcSource, frame_index: int,
-                  first_active_line: int | None = None):
+                  first_active_line: int | None = None,
+                  chroma_phase_deg: float = 0.0):
     """Weave a frame's two fields into (S, phi) at frame geometry."""
     (f0, _m0), (f1, _m1) = src.read_frame_fields(frame_index)
     p = src.params
@@ -1424,7 +1459,7 @@ def prepare_frame(src: TbcSource, frame_index: int,
     S_list, th_list = [], []
     for fld in (f0, f1):
         ire = p.ire(fld)
-        th_list.append(burst_lockin_phase(ire, p))
+        th_list.append(burst_lockin_phase(ire, p, chroma_phase_deg))
         S_list.append(ire[fal:, a0:a1])
 
     lines = S_list[0].shape[0]
@@ -1509,7 +1544,8 @@ def decode_sequence(src: TbcSource, start: int, length: int,
         w0 = max(start, t0 - OV)
         w1 = min(start + length, t1 + OV)
         fidx = list(range(2 * w0, 2 * w1))
-        SP = [prepare_field(src, f, first_active_line) for f in fidx]
+        SP = [prepare_field(src, f, first_active_line,
+                            cfg.chroma_phase_deg) for f in fidx]
         if roi is not None:
             # selective-3D support: run the ENTIRE field-based machinery
             # (motion, gates, solver, weave) on a rectangular crop, in
@@ -1835,7 +1871,8 @@ def decode_sequence_selective(src: TbcSource, start: int, length: int,
         return
 
     # ---- ambiguity from the first frame's init (cheap, no solve) ----
-    S, phi = prepare_frame(src, start, first_active_line)
+    S, phi = prepare_frame(src, start, first_active_line,
+                           cfg.chroma_phase_deg)
     p = src.params
     Y0, chi0 = holographic_init(S, phi, p, cfg)
     boxes = _ambiguous_boxes(Y0, chi0, tile=tile, max_area=max_area,

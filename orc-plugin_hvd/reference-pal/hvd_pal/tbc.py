@@ -37,8 +37,15 @@ class VideoParameters:
     active_video_end: int = 1107
     colour_burst_start: int = 98
     colour_burst_end: int = 138
-    black16bIre: int = 16384
-    white16bIre: int = 54016
+    # EBU Tech. 3280-E: PAL carries NO setup pedestal, so picture black
+    # IS the 0 IRE blanking reference (16384 = 256 x 64). blanking16bIre
+    # is carried explicitly anyway, so this module and the NTSC one share
+    # one shape -- and so the black-vs-blanking distinction that bit the
+    # NTSC path (where they differ by 7.5 IRE) can never be reintroduced
+    # here by copy-paste.
+    black16bIre: int = 16384        # == blanking on PAL: no setup
+    white16bIre: int = 54016        # 100 IRE
+    blanking16bIre: int = 16384     # 0 IRE reference
     first_active_field_line: int = 22
     last_active_field_line: int = 0   # 0 = field_height
     is_source_pal: bool = True
@@ -49,9 +56,18 @@ class VideoParameters:
     def active_width(self) -> int:
         return self.active_video_end - self.active_video_start
 
+    @property
+    def codes_per_ire(self) -> float:
+        """16-bit codes per 1 IRE, referenced to BLANKING."""
+        return (self.white16bIre - self.blanking16bIre) / 100.0
+
     def ire(self, raw: np.ndarray) -> np.ndarray:
-        scale = (self.white16bIre - self.black16bIre) / 100.0
-        return (raw.astype(np.float64) - self.black16bIre) / scale
+        """Raw 16-bit samples -> TRUE IRE (0 = blanking, 100 = white)."""
+        return (raw.astype(np.float64) - self.blanking16bIre) / self.codes_per_ire
+
+    def raw(self, ire: np.ndarray) -> np.ndarray:
+        """Inverse of ire()."""
+        return np.asarray(ire) * self.codes_per_ire + self.blanking16bIre
 
 
 @dataclass
@@ -85,6 +101,10 @@ class TbcSource:
             colour_burst_end=vp_raw.get("colourBurstEnd", 138),
             black16bIre=vp_raw.get("black16bIre", 16384),
             white16bIre=vp_raw.get("white16bIre", 54016),
+            # PAL has no setup: blanking == black unless a file says
+            # otherwise.
+            blanking16bIre=vp_raw.get("blanking16bIre",
+                                      vp_raw.get("black16bIre", 16384)),
             first_active_field_line=vp_raw.get("firstActiveFieldLine", 22),
             last_active_field_line=vp_raw.get("lastActiveFieldLine", 0),
             is_source_pal=vp_raw.get("isSourcePal", True),

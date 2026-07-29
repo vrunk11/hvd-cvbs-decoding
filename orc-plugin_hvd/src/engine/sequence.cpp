@@ -230,7 +230,7 @@ FieldObs PrepareFieldObs(const FieldInput& field, const FieldGeometry& g,
                          const HvdConfig& cfg, int parity) {
   std::vector<float> theta;
   std::vector<int8_t> vswitch;
-  if (g.standard == VideoStandard::kPal) {
+  if (g.uses_vswitch()) {
     PalBurstLockin l = BurstLockinPhasePal(field.samples, g);
     theta = std::move(l.theta);
     vswitch = std::move(l.vswitch);
@@ -238,11 +238,10 @@ FieldObs PrepareFieldObs(const FieldInput& field, const FieldGeometry& g,
     theta = BurstLockinPhase(field.samples, g);
   }
   // Chroma phase correction on the burst-locked reference itself, same as
-  // the frame path (WeaveAndBuildCarrier in engine.cpp).
-  if (cfg.chroma_phase_deg != 0.0F) {
-    const float offset = -cfg.chroma_phase_deg * kPi / 180.0F;
-    for (float& t : theta) t += offset;
-  }
+  // the frame path (WeaveAndBuildCarrier in engine.cpp) -- one shared
+  // helper so the two paths cannot drift. The offset is signed by the
+  // V-switch sense on the PAL family; see ApplyChromaPhase.
+  ApplyChromaPhase(cfg.chroma_phase_deg, g, vswitch, &theta);
   const int fal = g.first_active_field_line;
   const int lal = g.last_active_line();
   const int a0 = g.active_video_start;
@@ -258,7 +257,7 @@ FieldObs PrepareFieldObs(const FieldInput& field, const FieldGeometry& g,
       obs.s.at(y, x) = field.samples.at(fal + y, a0 + x);
   std::vector<float> theta_active(lines);
   for (int y = 0; y < lines; ++y) theta_active[y] = theta[fal + y];
-  if (g.standard == VideoStandard::kPal) {
+  if (g.uses_vswitch()) {
     std::vector<int8_t> sw_active(lines);
     for (int y = 0; y < lines; ++y) sw_active[y] = vswitch[fal + y];
     obs.carrier = MakeCarrierPal(theta_active, sw_active, g);
@@ -436,7 +435,7 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
   HvdConfig ccfg = cfg_in;
   // Standard flag from the geometry (see HvdConfig::is_pal): selects the
   // 4-line (PAL) vs 2-line (NTSC) leak cancellation in AUTO chroma_aniso.
-  ccfg.is_pal = (g.standard == VideoStandard::kPal);
+  ccfg.is_pal = g.uses_vswitch();
   {
     std::vector<float> sigmas;
     sigmas.reserve(fields.size());
@@ -450,7 +449,7 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
   }
 
   std::vector<int> offs;
-  const bool pal = g.standard == VideoStandard::kPal;
+  const bool pal = g.uses_vswitch();
   if (ccfg.extended_temporal) {
     // PAL's strongest equation (180 deg carrier relation, |dc| = 2) sits
     // at f+/-4 — TWO frames — not NTSC's f+/-2; the 135 deg/field ladder
@@ -518,7 +517,7 @@ std::vector<DecodedField> DecodeFieldWindowWithInits(
   // 135 deg/field ladder reaches the flip at two frames — same
   // discriminator, longer baseline; fields j and j+4 share V-switch
   // parity so the chroma-coherent / leak-sign-flip logic transfers).
-  const int amb_stride = g.standard == VideoStandard::kPal ? 4 : 2;
+  const int amb_stride = g.uses_vswitch() ? 4 : 2;
   // == 0 means AUTO (measure). A NEGATIVE strength means the caller
   // explicitly switched 3D off and must skip this scan entirely -- it is
   // not free (a decimated demod over every same-parity field pair in the

@@ -89,6 +89,11 @@ class DecoderConfig:
                                    # and weaves after, as the NTSC decoder)
     acc: bool = True               # Automatic Colour Control from burst
     chroma_gain: float = 1.0
+    chroma_phase_deg: float = 0.0    # RELATIVE trim (degrees) added to
+                                     # the measured burst phase; signed
+                                     # by the V-switch parity so it is
+                                     # uniform across line parities.
+                                     # 0 = trust the measurement.
     monochrome: bool = False
     symmetry_variant: bool = False # Transform-PAL certified-chroma init
                                    # variant (native on PAL, unlike NTSC)
@@ -198,7 +203,8 @@ def _wrap(a):
     return np.angle(np.exp(1j * a))
 
 
-def burst_lockin(field_ire: np.ndarray, p: VideoParameters):
+def burst_lockin(field_ire: np.ndarray, p: VideoParameters,
+                 chroma_phase_deg: float = 0.0):
     """Joint carrier-phase + V-switch-parity estimation from the
     swinging burst.
 
@@ -229,6 +235,8 @@ def burst_lockin(field_ire: np.ndarray, p: VideoParameters):
     if not good.any():
         theta = LINE_ADV * lines
         s = np.where(lines % 2 == 0, 1.0, -1.0)
+        if chroma_phase_deg:
+            theta = theta - s * np.deg2rad(chroma_phase_deg)
         return theta, s, amp
 
     idx = np.where(good)[0]
@@ -259,6 +267,17 @@ def burst_lockin(field_ire: np.ndarray, p: VideoParameters):
     a2 = a_w * 0.15 / np.maximum(r, 0.15)
     xs = _tridiag_smooth(d, a2, lam)
     theta = model + xs
+
+    # RELATIVE hue trim, added on top of the MEASURED trajectory.
+    #
+    # THE PARITY SIGN IS LOAD-BEARING. effective_carrier() conjugates the
+    # carrier on V-switched lines, so a constant offset would rotate the
+    # recovered phasor by -delta on one line parity and +delta on the
+    # other: an alternating hue error, i.e. Hanover bars, at every angle
+    # except 0 and 180. Signing the offset by the measured parity `s`
+    # makes the net rotation of chi uniform on every line.
+    if chroma_phase_deg:
+        theta = theta - s * np.deg2rad(chroma_phase_deg)
     return theta, s, amp
 
 
@@ -572,8 +591,8 @@ def prepare_frame(src: TbcSource, frame_index: int, cfg: DecoderConfig):
     (f0, m0), (f1, m1) = src.read_frame_fields(frame_index)
     S0, S1 = p.ire(f0), p.ire(f1)
 
-    th0, s0, _ = burst_lockin(S0, p)
-    th1, s1, _ = burst_lockin(S1, p)
+    th0, s0, _ = burst_lockin(S0, p, cfg.chroma_phase_deg)
+    th1, s1, _ = burst_lockin(S1, p, cfg.chroma_phase_deg)
 
     fal = p.first_active_field_line
     lal = p.last_active_field_line or p.field_height
@@ -938,7 +957,7 @@ def prepare_field(src: TbcSource, field_index: int, cfg: DecoderConfig):
     """One field's active region + effective carrier (field geometry)."""
     p = src.params
     S_full = p.ire(src.read_field(field_index))
-    th, sw, _ = burst_lockin(S_full, p)
+    th, sw, _ = burst_lockin(S_full, p, cfg.chroma_phase_deg)
     fal = p.first_active_field_line
     lal = p.last_active_field_line or p.field_height
     a0, a1 = p.active_video_start, p.active_video_end

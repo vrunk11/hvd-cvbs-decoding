@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Lock-in phase recovery: synthesize a field whose only content is a colour
-// burst A*sin(phi) with a known per-line phase offset theta, then check the
-// recovered theta matches. Also exercise TridiagSmooth on a trivial system.
+// burst -A*sin(phi) (the real -U axis burst) with a known per-line phase
+// offset theta, then check the recovered theta matches. Also exercise
+// TridiagSmooth on a trivial system.
 
 #include <cmath>
 #include <vector>
@@ -33,14 +34,18 @@ void RunTests() {
   const int h = 30;
   Plane field(h, g.field_width);
 
-  // burst = A sin(theta_line + (pi/2) x). Use the pi-per-line model so the
+  // burst = -A sin(theta_line + (pi/2) x) -- the NTSC burst sits on the -U
+  // axis, so chi_burst = +iA and Re[iA e^{i phi}] = -A sin(phi). The test
+  // used +A sin here, which is the same sign error the decoder had, so the
+  // two cancelled and the test passed on a 180 deg-wrong decoder.
+  // Use the pi-per-line model so the
   // smoother does not fight the ground truth, plus a tiny slow wobble.
   std::vector<float> theta_true(h);
   for (int y = 0; y < h; ++y) {
     theta_true[y] = 0.3F + kPi * static_cast<float>(y) + 0.05F * std::sin(0.2F * y);
     for (int x = g.colour_burst_start; x < g.colour_burst_end; ++x) {
       const float phi = theta_true[y] + kHalfPi * static_cast<float>(x);
-      field.at(y, x) = 20.0F * std::sin(phi);
+      field.at(y, x) = -20.0F * std::sin(phi);
     }
   }
 

@@ -32,8 +32,20 @@ class VideoParameters:
     active_video_end: int = 894
     colour_burst_start: int = 78
     colour_burst_end: int = 110
-    black16bIre: int = 15360
-    white16bIre: int = 51200
+    # ld-decode 16-bit domain levels (CVBS 10-bit x 64).
+    #
+    # WATCH THE NAMES. ld-decode's JSON stores PICTURE BLACK in
+    # `black16bIre` -- on NTSC-M that is the 7.5 IRE setup pedestal,
+    # 282 x 64 = 18048, NOT the 0 IRE blanking reference (240 x 64 =
+    # 15360). The old default here was 15360, i.e. the blanking value
+    # under the black name, so synthetic files (which use the default)
+    # were accidentally right while every real ld-decode capture came out
+    # on a wrong scale. PAL and NTSC-J carry no setup, so black ==
+    # blanking there.
+    black16bIre: int = 18048        # picture black (7.5 IRE on NTSC-M)
+    white16bIre: int = 51200        # 100 IRE
+    blanking16bIre: int = 15360     # 0 IRE reference
+    setup_ire: float = 7.5          # 7.5 for NTSC-M, 0 for NTSC-J / PAL
     first_active_field_line: int = 21
     last_active_field_line: int = 0   # 0 = field_height
     is_source_pal: bool = False
@@ -44,10 +56,35 @@ class VideoParameters:
     def active_width(self) -> int:
         return self.active_video_end - self.active_video_start
 
+    @property
+    def codes_per_ire(self) -> float:
+        """16-bit codes per 1 IRE. Referenced to BLANKING, not black."""
+        return (self.white16bIre - self.blanking16bIre) / 100.0
+
     def ire(self, raw: np.ndarray) -> np.ndarray:
-        """Convert raw 16-bit samples to IRE units (float)."""
-        scale = (self.white16bIre - self.black16bIre) / 100.0
-        return (raw.astype(np.float64) - self.black16bIre) / scale
+        """Convert raw 16-bit samples to TRUE IRE units (float).
+
+        0 IRE is the blanking level and 100 IRE is peak white; the setup
+        pedestal is part of the luma signal, not part of the scale. This
+        used to divide by (white - black) / 100 and offset by black, which
+        on NTSC-M made one unit 331.5 codes instead of the true 358.4 --
+        every value 1.081x too large -- and put picture black at 0 IRE
+        instead of 7.5.
+
+        The error was invisible in any round trip (encode.py made the same
+        mistake, so it cancelled) and invisible on the synthetic files
+        (whose black16bIre default was really the blanking value). It bit
+        only where an ABSOLUTE IRE reference is used, which is exactly the
+        two places that matter: burst_amplitude_ire feeding the ACC (a
+        nominal 20 IRE burst measured 21.62, so the ACC applied a permanent
+        0.925 gain = 7.5 % desaturation), and yuv_to_rgb16, whose
+        IRE_BLACK / IRE_WHITE constants have always assumed true IRE.
+        """
+        return (raw.astype(np.float64) - self.blanking16bIre) / self.codes_per_ire
+
+    def raw(self, ire: np.ndarray) -> np.ndarray:
+        """Inverse of ire(): TRUE IRE -> raw 16-bit sample values."""
+        return np.asarray(ire) * self.codes_per_ire + self.blanking16bIre
 
 
 @dataclass
@@ -68,13 +105,38 @@ class TbcSource:
     # ---------------------------------------------------------------- I/O
 
     @classmethod
-    def open(cls, tbc_path: str, json_path: Optional[str] = None) -> "TbcSource":
+    def open(cls, tbc_path: str, json_path: Optional[str] = None,
+             setup_ire: Optional[float] = None) -> "TbcSource":
+        """Open a .tbc + .tbc.json pair.
+
+        `setup_ire` overrides the assumed pedestal used to derive the
+        blanking (0 IRE) reference from the JSON's picture-black level:
+        7.5 for standard NTSC-M, 0.0 for NTSC-J. ld-decode's JSON does not
+        record which one applies, so the caller has to say (hvd_decode.py
+        passes it from --ntsc-j). Defaults to 7.5.
+        """
         if json_path is None:
             json_path = tbc_path + ".json"
         with open(json_path, "r") as f:
             meta = json.load(f)
 
         vp_raw = meta.get("videoParameters", {})
+
+        # Derive the 0 IRE blanking reference from the picture-black level
+        # ld-decode records. Formula from decode-orc's own
+        # cvbs_signal_constants.h:
+        #     blanking = black - setup * (white - black) / (100 - setup)
+        # A file that explicitly carries a blanking level wins over the
+        # derivation.
+        _black = vp_raw.get("black16bIre", 18048)
+        _white = vp_raw.get("white16bIre", 51200)
+        _setup = 0.0 if vp_raw.get("isSourcePal", False) else (
+            7.5 if setup_ire is None else float(setup_ire))
+        _blanking = vp_raw.get("blanking16bIre")
+        if _blanking is None:
+            _blanking = _black - _setup * (_white - _black) / (100.0 - _setup)
+        _blanking = float(_blanking)
+
         params = VideoParameters(
             field_width=vp_raw.get("fieldWidth", 910),
             field_height=vp_raw.get("fieldHeight", 263),
@@ -82,8 +144,10 @@ class TbcSource:
             active_video_end=vp_raw.get("activeVideoEnd", 894),
             colour_burst_start=vp_raw.get("colourBurstStart", 78),
             colour_burst_end=vp_raw.get("colourBurstEnd", 110),
-            black16bIre=vp_raw.get("black16bIre", 15360),
-            white16bIre=vp_raw.get("white16bIre", 51200),
+            black16bIre=_black,
+            white16bIre=_white,
+            blanking16bIre=_blanking,
+            setup_ire=_setup,
             # ld-decode ships the ACTUAL active field-line range; the
             # historical hardcoded 21 breaks on sources with different
             # vertical geometry (portability audit item)

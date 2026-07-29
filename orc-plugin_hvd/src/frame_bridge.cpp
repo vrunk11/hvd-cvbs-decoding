@@ -13,6 +13,7 @@
 #include <cmath>
 
 #include "engine/engine.h"
+#include "engine/colour.h"
 #include "engine/lockin.h"
 #include <fstream>
 #include <cstdio>
@@ -53,7 +54,7 @@ FieldGeometry FieldGeometryFromParams(const FrameParams& fp) {
       fp.last_active_frame_line != 0 ? fp.last_active_frame_line / 2 : 0;
   g.sample_rate = fp.sample_rate;
   g.subcarrier_hz = fp.subcarrier_hz;
-  g.standard = fp.is_pal ? VideoStandard::kPal : VideoStandard::kNtsc;
+  g.standard = fp.standard;
   return g;
 }
 
@@ -78,14 +79,21 @@ void SplitFrameFields(const int16_t* frame, const FrameParams& fp,
 #pragma omp parallel for schedule(static)
 #endif
   for (int y = 0; y < field_h; ++y) {
+    // Per-line offsets, NOT a flat y * fw stride: PAL's non-orthogonal
+    // lines make the two differ by 2 samples across the field boundary.
+    // See FrameParams::extra_sample_lines.
+    const int64_t off_top = FrameLineOffset(fp, y);
+    const int64_t off_bot = FrameLineOffset(fp, f1 + y);
     for (int x = 0; x < fw; ++x) {
-      const float st =
-          (y < f1) ? static_cast<float>(frame[(y)*fw + x]) : fp.blanking_level;
-      const float sb = (y < f2) ? static_cast<float>(frame[(f1 + y) * fw + x])
+      const float st = (y < f1) ? static_cast<float>(frame[off_top + x])
                                 : fp.blanking_level;
-      top->samples.at(y, x) = SampleToIre(st, fp.black_level, fp.white_level);
+      const float sb = (y < f2) ? static_cast<float>(frame[off_bot + x])
+                                : fp.blanking_level;
+      // TRUE IRE: referenced to blanking, not black -- see SampleToIre.
+      top->samples.at(y, x) =
+          SampleToIre(st, fp.blanking_level, fp.white_level);
       bottom->samples.at(y, x) =
-          SampleToIre(sb, fp.black_level, fp.white_level);
+          SampleToIre(sb, fp.blanking_level, fp.white_level);
     }
   }
 }
@@ -185,10 +193,14 @@ YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
   out.v_plane.assign(static_cast<size_t>(fw) * fh, 0.0);
 
   // Default: pass the composite through as luma, chroma at zero. Outside the
-  // active picture there is no colour information to carry.
-  for (int i = 0; i < fw * fh; ++i) {
-    out.luma[i] = frame[i];
-    out.chroma[i] = 0;
+  // active picture there is no colour information to carry. Copied line by
+  // line through FrameLineOffset (not a flat memcpy) so PAL's
+  // non-orthogonal lines stay aligned with the decoded active region
+  // written below — see FrameParams::extra_sample_lines.
+  for (int line = 0; line < fh; ++line) {
+    const int64_t src = FrameLineOffset(fp, line);
+    std::copy(frame + src, frame + src + fw,
+              out.luma.begin() + static_cast<size_t>(line) * fw);
   }
 
   // Fill the active picture. The engine returns a woven plane of
@@ -198,7 +210,10 @@ YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
   const int a0 = fp.active_video_start;
   const int active_h = yc.luma.height();
   const int active_w = yc.luma.width();
-  const float scale = (fp.white_level - fp.black_level) / 100.0F;
+  // Codes per TRUE IRE -- (white - blanking) / 100, matching SampleToIre
+  // above and the composite scale that orc::ComponentFrame /
+  // orc::ColourFrameCarrier specify for chroma.
+  const float scale = CodesPerIre(fp.blanking_level, fp.white_level);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -212,7 +227,9 @@ YcFrameS16 DecodeFrameBuffer(const int16_t* frame, const FrameParams& fp,
       const int flat_col = a0 + c;
       if (flat_col < 0 || flat_col >= fw) continue;
       const size_t idx = static_cast<size_t>(flat_line) * fw + flat_col;
-      out.luma[idx] = ClampU10(fp.black_level + yc.luma.at(r, c) * scale);
+      // Luma IRE is now blanking-referenced (NTSC-M black = 7.5 IRE),
+      // so the reconstruction anchor is blanking, not black.
+      out.luma[idx] = ClampU10(fp.blanking_level + yc.luma.at(r, c) * scale);
       // Zero-centred, signed — see ClampS10 above.
       out.chroma[idx] = ClampS10(yc.chroma.at(r, c) * scale);
       // Baseband chroma (chroma_phasor = V - iU), not the modulated `chroma`
@@ -252,7 +269,7 @@ YcFrameS16 DecodeYcFrameBuffer(const int16_t* luma, const int16_t* chroma,
   const int f2 = fh - f1;
   const FieldGeometry g = FieldGeometryFromParams(fp);
   const int field_h = g.field_height;
-  const float scale = (fp.white_level - fp.black_level) / 100.0F;
+  const float scale = CodesPerIre(fp.blanking_level, fp.white_level);
 
   // --- De-weave chroma only: luma passes straight through from the raw
   //     buffer below (it's already clean, nothing to decode), so there's no
@@ -275,10 +292,13 @@ YcFrameS16 DecodeYcFrameBuffer(const int16_t* luma, const int16_t* chroma,
   for (int y = 0; y < field_h; ++y) {
     for (int x = 0; x < fw; ++x) {
       // Unsigned raw code -> signed, zero-mean, same numeric scale as IRE.
-      const float ct = (y < f1) ? static_cast<float>(chroma[y * fw + x])
-                                 : fp.chroma_dc;
-      const float cb = (y < f2) ? static_cast<float>(chroma[(f1 + y) * fw + x])
-                                 : fp.chroma_dc;
+      const float ct = (y < f1)
+                           ? static_cast<float>(chroma[FrameLineOffset(fp, y) + x])
+                           : fp.chroma_dc;
+      const float cb =
+          (y < f2)
+              ? static_cast<float>(chroma[FrameLineOffset(fp, f1 + y) + x])
+              : fp.chroma_dc;
       chroma_top.samples.at(y, x) = (ct - fp.chroma_dc) / scale;
       chroma_bot.samples.at(y, x) = (cb - fp.chroma_dc) / scale;
     }
@@ -691,7 +711,7 @@ std::vector<YcFrameS16> DecodeFrameSequenceWindow(
   const int fh = fp.frame_height;
   const int f1 = fp.field1_lines;
   const FieldGeometry g = FieldGeometryFromParams(fp);
-  const float scale = (fp.white_level - fp.black_level) / 100.0F;
+  const float scale = CodesPerIre(fp.blanking_level, fp.white_level);
 
   // --- Prepare the window's fields (2 per frame) + measure ACC ------------
   // Parity: field1 = top (parity 0). FrameParams carries no per-field
@@ -736,8 +756,19 @@ std::vector<YcFrameS16> DecodeFrameSequenceWindow(
     const size_t k = burst_amps.size() / 2;
     std::nth_element(burst_amps.begin(), burst_amps.begin() + k,
                      burst_amps.end());
-    const float med = std::max(burst_amps[k], 1.0F);
-    acc_gain = std::clamp(20.0F / med, 0.5F, 2.0F);
+    const float med = burst_amps[k];
+    // AccGain(), not an inlined copy of it, and g.nominal_burst_ire(),
+    // NOT a hardcoded 20.
+    //
+    // This is the DEFAULT composite path (the frame path below is the
+    // last-resort fallback), and it was comparing every standard's
+    // measured burst against the NTSC nominal. On 625-line PAL, whose
+    // nominal burst is 21.43 IRE, that is 20 / 21.43 = 0.933 -- a
+    // permanent 6.7 % desaturation on every PAL decode, on top of
+    // whatever the source chain actually did. The frame path called
+    // AccGain(..., g.nominal_burst_ire()) correctly all along, so the
+    // two paths disagreed with each other as well.
+    acc_gain = AccGain(med, g.nominal_burst_ire());
   }
   const float gain = cfg.chroma_gain * acc_gain;
 
@@ -836,7 +867,15 @@ std::vector<YcFrameS16> DecodeFrameSequenceWindow(
     yc.v_plane.assign(static_cast<size_t>(fw) * fh, 0.0);
     // Outside the active picture: composite passthrough, zero chroma
     // (same contract as DecodeFrameBuffer).
-    for (int i = 0; i < fw * fh; ++i) yc.luma[i] = frames[t][i];
+    // Passthrough of the raw composite outside the active picture. Copy
+    // line by line through FrameLineOffset so PAL's non-orthogonal lines
+    // land on the same rows the decoded active region is written to; a
+    // flat memcpy would shear field 2 by 2 samples relative to it.
+    for (int line = 0; line < fh; ++line) {
+      const int64_t src = FrameLineOffset(fp, line);
+      std::copy(frames[t] + src, frames[t] + src + fw,
+                yc.luma.begin() + static_cast<size_t>(line) * fw);
+    }
 
     const int lines = d0.luma.height();
     const int active_w = d0.luma.width();
@@ -871,7 +910,7 @@ std::vector<YcFrameS16> DecodeFrameSequenceWindow(
             cfg.monochrome ? Complex{} : d.chroma.at(field_line, c);
         const Complex car =
             fields[use_first ? j0 : j1].carrier.at(field_line, c);
-        yc.luma[idx] = ClampU10(fp.black_level + y_ire * scale);
+        yc.luma[idx] = ClampU10(fp.blanking_level + y_ire * scale);
         // Modulated chroma residual, zero-centred/signed (see ClampS10):
         // with cfg.output_fidelity (default) luma + chroma == composite
         // holds exactly, matching the frame path's invariant.

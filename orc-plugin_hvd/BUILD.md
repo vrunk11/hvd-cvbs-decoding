@@ -204,9 +204,10 @@ new nixpkgs generation, update this repo's `flake.lock` to match (rule
   code, include what you use rather than relying on a Linux build to
   tell you. (This bit the PAL port once: `int8_t` in the V-switch
   vectors, fixed across the tree.)
-* **First PAL build against a real SDK** — three identifiers were
-  written offline and must be confirmed once:
-  `VideoFormatCompatibility::ANY` (plugin.h + descriptor),
-  `VideoSystem::PAL` (stage), and the PAL `chroma_phase_deg` starting
-  value. `docs/PAL.md` has the details; each is a one-line fix if the
-  SDK spells it differently.
+* **First PAL build against a real SDK** — two identifiers were written
+  offline and must be confirmed once:
+  `VideoFormatCompatibility::ANY` (plugin.h + descriptor) and
+  `VideoSystem::PAL` (stage). `docs/PAL.md` has the details; each is a
+  one-line fix if the SDK spells it differently.
+  The third item, the PAL `chroma_phase_deg` starting value, is resolved:
+  it is **0**, the same as NTSC. See `docs/PAL.md` §3.

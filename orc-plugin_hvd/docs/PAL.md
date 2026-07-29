@@ -75,10 +75,26 @@ checked against the real SDK headers:
    `fsc_from_system()` in `cvbs_signal_constants.h` return
    `kPalSampleRate = 17 734 475` / `kPalFsc = 4 433 618.75`, matching
    the engine's own `kFs4FscPal` / `kFscPal` exactly.
-3. `chroma_phase_deg` default (180) — STILL UNVERIFIED, and genuinely
-   unverifiable without material: it is the NTSC-validated value, and
-   PAL's correct value must be confirmed on a real capture (the
-   swinging-burst convention may land it at 0 — dial it on colour bars).
+3. `chroma_phase_deg` default — RESOLVED, and the answer is **0 for both
+   standards**. The old 180 was never a property of any source: it
+   cancelled a sign error in the NTSC lock-in (`theta = arg(z) + pi/2`
+   where the correct relation is `arg(z) - pi/2`; the NTSC burst is on
+   -U, so `chi_burst = +iB` and `burst = -B sin(phi)`).
+   `BurstLockinPhasePal` derived the swinging-burst case correctly from
+   the start — verified analytically and numerically: `arg(z) - theta`
+   is `+pi/4` on unswitched lines and `+3pi/4` on switched ones, exactly
+   what `theta_ref = a_meas - pi/2 + s*pi/4` implements. So the global
+   180 made NTSC look right *and rotated every PAL decode by half a
+   turn*. The sign is fixed in `lockin.cpp`; the default is 0 in
+   `HvdConfig` **and in the GUI ParameterDescriptor** (the two are now
+   cross-checked by `tests/stage_smoke_test.cpp`).
+
+   The parameter is a RELATIVE trim added on top of the measured burst
+   phase, never a replacement for it, and on the PAL family it is signed
+   by the measured V-switch parity (`ApplyChromaPhase`) — otherwise a
+   constant offset rotates chi by `-delta` on one line parity and
+   `+delta` on the other, i.e. Hanover bars at every angle except 0 and
+   180. `tests/engine/chroma_reference_test.cpp` pins all of this.
 
 ## What is ported from the research, and what is not
 

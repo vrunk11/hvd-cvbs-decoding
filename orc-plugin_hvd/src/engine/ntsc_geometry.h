@@ -33,12 +33,28 @@ constexpr double kFs4Fsc = 4.0 * kFscNtsc;        // 14 318 181.8 Hz
 constexpr double kFscPal = 4433618.75;
 constexpr double kFs4FscPal = 4.0 * kFscPal;      // 17 734 475 Hz
 
+// PAL-M (ITU-R BT.1700-1 Annex 1 Part B): 525 lines, 909 samples/line at
+// 4fsc, fsc = (909/4) * fH. That is 227.25 cycles/line, i.e. the carrier
+// advances 90 deg per line -- NOT the 180 deg of NTSC nor the 270 deg of
+// 625-line PAL. The chroma is PAL (swinging burst + V-switch); only the
+// line advance and the raster differ. Levels are the NTSC ones (7.5 IRE
+// setup, 20 IRE burst).
+constexpr double kFscPalM = (909.0 / 4.0) * (525.0 * 30000.0 / 1001.0);
+constexpr double kFs4FscPalM = 4.0 * kFscPalM;
+
 // Which composite standard a field's carrier obeys. This is the ONLY
 // switch the numerical core dispatches on: everything downstream of the
 // carrier builder (init, arbitration, temporal equations, anchor loop)
 // is generic in the effective carrier c — NTSC is the special case
-// c = exp(i*phi); PAL folds the V-switch into c (see MakeCarrierPal).
-enum class VideoStandard { kNtsc, kPal };
+// c = exp(i*phi); the PAL family folds the V-switch into c (see
+// MakeCarrierPal).
+//
+// kPalM is a first-class member rather than an alias of either neighbour:
+// it shares PAL's V-switch and swinging burst but NTSC's raster and
+// levels, so aliasing it to kNtsc (which is what is_pal = false used to
+// do) silently decoded PAL-M chroma with no V-switch and a 180 deg/line
+// carrier model instead of 90 deg/line.
+enum class VideoStandard { kNtsc, kPal, kPalM };
 
 // Composite geometry needed by the engine, expressed in the sample domain of a
 // single field. Populated by the SDK layer from decode-orc SourceParameters (or
@@ -69,10 +85,24 @@ struct FieldGeometry {
   // effective carrier c. See docs for what does NOT follow automatically.
   double subcarrier_hz = 0.0;
 
+  // True when the standard carries a PAL V-switch (and therefore a swinging
+  // burst): 625-line PAL and PAL-M. This -- not `standard == kPal` -- is
+  // what every V-switch dispatch in the engine must test.
+  bool uses_vswitch() const {
+    return standard == VideoStandard::kPal || standard == VideoStandard::kPalM;
+  }
+
   // Effective colour subcarrier frequency (Hz).
   double fsc() const {
     if (subcarrier_hz > 0.0) return subcarrier_hz;
-    return standard == VideoStandard::kPal ? kFscPal : kFscNtsc;
+    switch (standard) {
+      case VideoStandard::kPal:
+        return kFscPal;
+      case VideoStandard::kPalM:
+        return kFscPalM;
+      default:
+        return kFscNtsc;
+    }
   }
 
   // Carrier phase advance per SAMPLE (rad).
@@ -105,16 +135,24 @@ struct FieldGeometry {
   // 180 deg, so a value far from it is a warning about the source.
   double line_advance() const {
     if (subcarrier_hz <= 0.0) {
-      return standard == VideoStandard::kPal ? 1.5 * 3.14159265358979323846
-                                             : 3.14159265358979323846;
+      switch (standard) {
+        case VideoStandard::kPal:
+          return 1.5 * 3.14159265358979323846;  // 270 deg, 283.75 cyc/line
+        case VideoStandard::kPalM:
+          return 0.5 * 3.14159265358979323846;  // 90 deg, 227.25 cyc/line
+        default:
+          return 3.14159265358979323846;        // 180 deg, 227.5 cyc/line
+      }
     }
     const double cycles =
         subcarrier_hz * static_cast<double>(field_width) / sample_rate;
     const double frac = cycles - std::floor(cycles);
     return 2.0 * 3.14159265358979323846 * frac;
   }
-  // Nominal burst amplitude for ACC: 20 IRE (NTSC) / 21.43 IRE (PAL,
-  // +/-150 mV on the 700 mV white).
+  // Nominal burst amplitude for ACC, in TRUE IRE (see SampleToIre below):
+  // 20 IRE for NTSC-M and PAL-M (40 IRE p-p, SMPTE 170M Table 1 /
+  // ITU-R BT.1700-1 Annex 1 Part B), 21.43 IRE for 625-line PAL
+  // (+/-150 mV on the 700 mV white, EBU Tech. 3280-E).
   float nominal_burst_ire() const {
     return standard == VideoStandard::kPal ? 21.43F : 20.0F;
   }
@@ -128,21 +166,46 @@ struct FieldGeometry {
   }
 };
 
-// Convert one plane of composite samples from the caller's linear IRE-like unit.
-// The SDK layer performs the actual 10-bit -> IRE mapping using the source's
-// black/white levels; the engine itself always works in IRE floats. Provided
-// here as a free function so both the stage and tests share one definition.
+// Convert composite samples to TRUE IRE, and back.
 //
-//   ire = (sample - black) / ((white - black) / 100)
-inline float SampleToIre(float sample, float black_level, float white_level) {
-  const float scale = (white_level - black_level) / 100.0F;
-  return (sample - black_level) / scale;
+// THE REFERENCE IS BLANKING, NOT BLACK. 0 IRE is defined by the blanking
+// level and 100 IRE by peak white, so one IRE is (white - blanking) / 100
+// codes. The setup pedestal (NTSC-M: black sits 7.5 IRE above blanking;
+// PAL/PAL-M: black == blanking) is PART of the luma signal, not part of the
+// scale.
+//
+// This used to be referenced to black — (sample - black) / ((white - black)
+// / 100) — which on NTSC-M made one internal unit 5.18 codes instead of the
+// true 5.60, i.e. every internal value came out 1.081x too large. That is
+// invisible on PAL (black == blanking) and invisible in any round trip
+// (the same wrong scale undoes it), but it corrupted every place an
+// ABSOLUTE IRE reference is used:
+//
+//   * BurstAmplitudeIre measured a nominal 20 IRE burst as 21.62, so the
+//     ACC applied a permanent 0.925 gain -> 7.5 % desaturation on NTSC;
+//   * the exported u/v planes came out on a 5.18 codes/IRE scale, while
+//     orc::ComponentFrame and orc::ColourFrameCarrier both specify chroma
+//     on the composite scale, i.e. (cvbs_white - cvbs_blanking) / 100.
+//
+// Both are fixed at the source by referencing blanking here. Note the
+// consequence downstream: on NTSC-M, picture black is now 7.5 IRE (not 0)
+// in the engine's domain, which is exactly what colour.h's YuvToRgb16
+// already assumed via its `black_ire` parameter.
+
+// Codes per 1 IRE.
+inline float CodesPerIre(float blanking_level, float white_level) {
+  return (white_level - blanking_level) / 100.0F;
 }
 
-//   sample = black + ire * ((white - black) / 100)
-inline float IreToSample(float ire, float black_level, float white_level) {
-  const float scale = (white_level - black_level) / 100.0F;
-  return black_level + ire * scale;
+//   ire = (sample - blanking) / ((white - blanking) / 100)
+inline float SampleToIre(float sample, float blanking_level,
+                         float white_level) {
+  return (sample - blanking_level) / CodesPerIre(blanking_level, white_level);
+}
+
+//   sample = blanking + ire * ((white - blanking) / 100)
+inline float IreToSample(float ire, float blanking_level, float white_level) {
+  return blanking_level + ire * CodesPerIre(blanking_level, white_level);
 }
 
 // Build the per-sample carrier phase map phi over the ACTIVE picture, given the
@@ -164,6 +227,29 @@ ComplexPlane MakeCarrier(const std::vector<float>& theta, const FieldGeometry& g
 ComplexPlane MakeCarrierPal(const std::vector<float>& theta,
                             const std::vector<int8_t>& vswitch,
                             const FieldGeometry& g);
+
+// Apply HvdConfig::chroma_phase_deg to a burst-locked phase trajectory.
+//
+// `theta` and `vswitch` are per-line and must be the same length on the PAL
+// family; `vswitch` is ignored (and may be empty) on NTSC. The offset is
+// negated because the lock-in recovers (signal phase - LO phase), and it is
+// signed by the V-switch sense because MakeCarrierPal conjugates the carrier
+// on switched lines -- without that, the net rotation of the recovered
+// phasor alternates in sign line to line (Hanover bars) at every angle other
+// than 0 and 180. Shared by the frame path (engine.cpp) and the field
+// sequence path (sequence.cpp) so the two can never drift apart.
+inline void ApplyChromaPhase(float chroma_phase_deg, const FieldGeometry& g,
+                             const std::vector<int8_t>& vswitch,
+                             std::vector<float>* theta) {
+  if (chroma_phase_deg == 0.0F || theta == nullptr) return;
+  const float offset =
+      -chroma_phase_deg * 3.14159265358979323846F / 180.0F;
+  const bool signed_by_parity = g.uses_vswitch() &&
+                                vswitch.size() == theta->size();
+  for (size_t i = 0; i < theta->size(); ++i) {
+    (*theta)[i] += signed_by_parity && vswitch[i] < 0 ? -offset : offset;
+  }
+}
 
 // Robust per-field noise estimate (IRE), from the stride-4 horizontal second
 // difference. At 4fsc the carrier completes 360 deg over 4 samples, so

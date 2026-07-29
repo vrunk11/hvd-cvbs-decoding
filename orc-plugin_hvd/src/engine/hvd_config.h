@@ -151,16 +151,32 @@ struct HvdConfig {
   bool acc = true;
   float chroma_gain = 1.0F;
   bool monochrome = false;
-  // Chroma phase correction, in degrees, applied directly to the burst-
-  // locked phase reference (theta) BEFORE it's used to build the carrier —
-  // same idea as Comb::Configuration::chromaPhase in the classic decoder
-  // (comb.cpp's transformIQ, theta = (33 + chromaPhase) * pi/180), except
-  // here it's injected at the actual phase-reference stage instead of
-  // rotating U/V after the fact. 0 = no correction. The recovered chroma
-  // has been persistently 180 deg off since the Python reference, so 180 is
-  // the known-good starting point; treat it as tunable per-capture rather
-  // than assuming every source needs exactly 180.
-  float chroma_phase_deg = 180.0F;
+  // Chroma phase correction, in degrees, applied to the burst-locked phase
+  // reference (theta) BEFORE it's used to build the carrier — same idea as
+  // Comb::Configuration::chromaPhase in the classic decoder (comb.cpp's
+  // transformIQ, theta = (33 + chromaPhase) * pi/180), except here it's
+  // injected at the actual phase-reference stage instead of rotating U/V
+  // after the fact.
+  //
+  // DEFAULT IS NOW 0, NOT 180. The old 180 existed solely to cancel a sign
+  // error in the NTSC burst derivation (lockin.cpp: theta = arg(z) + pi/2
+  // where the correct relation is arg(z) - pi/2). That is fixed at source,
+  // so this control is once again what it claims to be: a per-capture trim,
+  // free for the user to spend.
+  //
+  // Worse, the old default was actively WRONG on PAL. BurstLockinPhasePal
+  // derives theta from the swinging burst independently and was already
+  // correct, so the global 180 rotated every 625-line PAL decode by half a
+  // turn. Anyone who had dialled this back to 0 to make PAL look right must
+  // now leave it at 0 for both standards.
+  //
+  // On the PAL family the rotation is applied with the V-switch sign (see
+  // engine.cpp / sequence.cpp): MakeCarrierPal conjugates the carrier on
+  // switched lines, so a naive theta += delta rotates the recovered phasor
+  // by -delta on one line parity and +delta on the other — alternating hue
+  // error, i.e. Hanover bars, for every value except 0 and 180. Signing the
+  // offset by the parity makes the trim uniform and usable at any angle.
+  float chroma_phase_deg = 0.0F;
 
   // --- Non-standard subcarrier -------------------------------------------
   // Some composite sources are NTSC in every respect the host measures
@@ -195,8 +211,13 @@ struct HvdConfig {
   // measurement (its 2-line average still cancels the init's cross-colour
   // leak) and the sequence path's ambiguity measurement (same-parity fields
   // still see the carrier flipped 180 deg). The adaptive modes can be left
-  // alone here. Note the default below is the rounded 2556.8, which is
-  // 179.584 deg/line rather than 180 — set 2556.8182 for the exact lock.
+  // alone here. The default below is the EXACT line lock 2556.8182 (180
+  // deg/line); the rounded 2556.8 gives 179.584 deg/line and quietly
+  // breaks both assumptions above. The GUI descriptor used to default to
+  // the rounded value while this struct held the exact one — two sources
+  // of truth for one default, which is the same class of bug as the old
+  // chroma_phase_deg = 180. tests/stage_smoke_test.cpp now cross-checks
+  // every descriptor default against this struct so it cannot recur.
   //
   // WHAT DOES NOT. Two carrier nulls are built on fs/fsc == 4 and VHD is at
   // fs/fsc = 5.6, so they stop being nulls:

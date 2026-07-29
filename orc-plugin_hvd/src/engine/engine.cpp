@@ -63,7 +63,7 @@ WovenFrame WeaveAndBuildCarrier(const FieldInput& first, const FieldInput& secon
   std::vector<float> theta_bot;
   std::vector<int8_t> sw_top;
   std::vector<int8_t> sw_bot;
-  if (g.standard == VideoStandard::kPal) {
+  if (g.uses_vswitch()) {
     PalBurstLockin lt = BurstLockinPhasePal(top->samples, g);
     PalBurstLockin lb = BurstLockinPhasePal(bot->samples, g);
     theta_top = std::move(lt.theta);
@@ -95,7 +95,7 @@ WovenFrame WeaveAndBuildCarrier(const FieldInput& first, const FieldInput& secon
     }
     theta[2 * y] = theta_top[fal + y];
     theta[2 * y + 1] = theta_bot[fal + y];
-    if (g.standard == VideoStandard::kPal) {
+    if (g.uses_vswitch()) {
       vswitch[2 * y] = sw_top[fal + y];
       vswitch[2 * y + 1] = sw_bot[fal + y];
     }
@@ -105,22 +105,23 @@ WovenFrame WeaveAndBuildCarrier(const FieldInput& first, const FieldInput& secon
   // (same spirit as Comb::FrameBuffer::transformIQ's `theta = (33 +
   // chromaPhase) * pi/180`), so the solver below decomposes the composite
   // against an already-corrected carrier instead of us rotating chi
-  // afterwards. A pure sign flip (the old 180 deg-only fix) is just the
-  // special case cos(pi)=-1, sin(pi)=0 of this, and is sign-invariant (+180
-  // and -180 are the same rotation) — that's the only value this has
-  // actually been validated at. For anything other than 180, the recovered
-  // phasor's phase moves opposite to the reference's (lock-in convention:
-  // recovered phase = signal phase - LO phase), hence the minus sign below;
-  // dial a small value and confirm hue rotates the expected direction on a
-  // colour-bar test before trusting it away from 180.
-  if (cfg.chroma_phase_deg != 0.0F) {
-    const float offset = -cfg.chroma_phase_deg * kPi / 180.0F;
-    for (float& t : theta) t += offset;
-  }
+  // afterwards. The recovered phasor's phase moves opposite to the
+  // reference's (lock-in convention: recovered phase = signal phase - LO
+  // phase), hence the minus sign.
+  //
+  // THE PARITY SIGN IS LOAD-BEARING ON THE PAL FAMILY. MakeCarrierPal
+  // builds c = -exp(-i*phi) on V-switched lines, so adding a constant
+  // delta to theta rotates the recovered chi by -delta on unswitched lines
+  // and by +delta on switched ones: an alternating hue error, i.e. Hanover
+  // bars, for every delta except 0 and 180 (where +delta == -delta). The
+  // old code did exactly that and was consequently only ever usable at its
+  // 180 default. Signing the offset by the V-switch sense makes the net
+  // rotation of chi uniform at chi * exp(-i*delta) on every line, so the
+  // control is now a real trim at any angle on NTSC, PAL and PAL-M alike.
+  ApplyChromaPhase(cfg.chroma_phase_deg, g, vswitch, &theta);
 
-  w.carrier = g.standard == VideoStandard::kPal
-                  ? MakeCarrierPal(theta, vswitch, g)
-                  : MakeCarrier(theta, g);
+  w.carrier = g.uses_vswitch() ? MakeCarrierPal(theta, vswitch, g)
+                               : MakeCarrier(theta, g);
   return w;
 }
 
@@ -144,7 +145,7 @@ FrameYc HvdEngine::DecodeFrame(const FieldInput& first, const FieldInput& second
   // selects the standard-correct leak cancellation in the AUTO
   // chroma_aniso measurement; see hvd_config.h).
   HvdConfig cfg = cfg_in;
-  cfg.is_pal = (g.standard == VideoStandard::kPal);
+  cfg.is_pal = g.uses_vswitch();
 
   const WovenFrame w = WeaveAndBuildCarrier(first, second, g, cfg);
   const Plane& s = w.s;

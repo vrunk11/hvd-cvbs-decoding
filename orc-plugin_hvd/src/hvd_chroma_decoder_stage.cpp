@@ -117,6 +117,38 @@ HvdDecodedRepresentation::HvdDecodedRepresentation(
     if (!params.has_value()) return fp;
     const SourceParameters& sp = *params;
 
+    // REFUSE PRE-CROPPED SOURCES. When an upstream stage has already applied
+    // the active-area crop, active_video_start / first_active_frame_line
+    // become 0-based into a buffer that no longer contains horizontal
+    // blanking -- so the colour burst, which is the entire phase reference
+    // this decoder is built on, is simply not there. The host's own
+    // decoders read this flag and rebase their output coordinates; this one
+    // cannot decode at all without a burst, so it declines instead of
+    // silently locking onto whatever sits at samples 72..108 of the cropped
+    // picture. Returning an invalid FrameParams makes decoded() short-
+    // circuit and the stage report no colour, which is the honest answer.
+    // frame_params() runs once per frame, so the diagnostics latch rather
+    // than flooding the log.
+    static std::atomic<bool> warned_cropped{false};
+    static std::atomic<bool> warned_system{false};
+    if (sp.active_area_cropping_applied) {
+        if (!warned_cropped.exchange(true)) ORC_PLUGIN_LOG_ERROR(
+            "HVD: source has active_area_cropping_applied -- the colour "
+            "burst has been cropped away, so no phase reference is "
+            "available. Place this stage before any active-area crop.");
+        return fp;
+    }
+
+    // PAL-N and anything else the carrier model has not been derived for.
+    // Better an explicit refusal than an NTSC-shaped guess.
+    if (sp.system != VideoSystem::NTSC && sp.system != VideoSystem::PAL &&
+        sp.system != VideoSystem::PAL_M) {
+        if (!warned_system.exchange(true)) ORC_PLUGIN_LOG_ERROR(
+            "HVD: unsupported video system -- only NTSC, PAL and PAL-M have "
+            "a derived carrier model in this decoder.");
+        return fp;
+    }
+
     fp.frame_width = sp.frame_width_nominal;
     fp.frame_height = sp.frame_height;
     fp.field1_lines = static_cast<int>(field1_lines(sp.system));
@@ -134,12 +166,34 @@ HvdDecodedRepresentation::HvdDecodedRepresentation(
                        ? static_cast<float>(sp.chroma_dc_offset)
                        : static_cast<float>(sp.blanking_level);
     fp.sample_rate = sample_rate_from_system(sp.system);
-    // 625-line PAL family only (see FrameParams::is_pal). PAL_M stays on
-    // the NTSC path deliberately — it carries PAL-type chroma on NTSC
-    // line geometry and needs its own carrier derivation before the
-    // engine can claim it (the effective-carrier machinery is ready; the
-    // line-advance and burst model are not derived for it yet).
-    fp.is_pal = (sp.system == VideoSystem::PAL);
+
+    // Composite standard. PAL_M used to fall through to the NTSC branch of
+    // a bool, which decoded PAL chroma with no V-switch and a 180 deg/line
+    // carrier instead of its true 90 deg/line (227.25 cycles on the 909
+    // sample grid) — i.e. silently wrong colour, no diagnostic. It now has
+    // its own VideoStandard; the swinging-burst lock-in is standard-
+    // agnostic, only the line advance and the nominal burst differ.
+    switch (sp.system) {
+        case VideoSystem::PAL:   fp.standard = ::hvd::VideoStandard::kPal;  break;
+        case VideoSystem::PAL_M: fp.standard = ::hvd::VideoStandard::kPalM; break;
+        default:                 fp.standard = ::hvd::VideoStandard::kNtsc; break;
+    }
+
+    // PAL non-orthogonal lines. EBU Tech. 3280-E §1.2 puts 4 extra samples
+    // per frame on the last line of each field, so the flat buffer is NOT a
+    // uniform frame_width stride and field 2 starts 2 samples later than
+    // line*width arithmetic predicts. Mirror the host's own table
+    // (orc::kPalExtraSampleLines / frame_line_sample_offset) into
+    // FrameParams so the SDK-free bridge can index correctly.
+    fp.extra_sample_line_count = 0;
+    if (sp.system == VideoSystem::PAL) {
+        for (int32_t line : kPalExtraSampleLines) {
+            if (fp.extra_sample_line_count <
+                ::hvd::FrameParams::kMaxExtraSampleLines) {
+                fp.extra_sample_lines[fp.extra_sample_line_count++] = line;
+            }
+        }
+    }
     // Non-standard subcarrier: overrides the fsc implied by the system,
     // never the sample rate (the host still stores the standard 4fsc grid).
     fp.subcarrier_hz =
@@ -418,19 +472,50 @@ PreviewImage HvdDecodedRepresentation::WovenToPreviewImage(
 {
     PreviewImage img;
     if (fp.white_level <= fp.black_level) return img;
+    if (fp.white_level <= fp.blanking_level) return img;
     if (pic.width == 0 || pic.height == 0) return img;
 
     img.width = pic.width;
     img.height = pic.height;
     img.rgb_data.resize(static_cast<size_t>(pic.width) * pic.height * 3);
 
+    // Y AND U/V both normalise over black..white -- the LUMA EXCURSION.
+    //
+    // Poynton eq 28.1/28.6 (the matrix below) defines U = 0.492(B'-Y'),
+    // V = 0.877(R'-Y') with Y' in [0, 1]. U and V must therefore be
+    // divided by whatever code range corresponds to Y' in [0, 1], which
+    // is white - black. On NTSC-M / PAL-M that is 92.5 IRE, not 100.
+    //
+    // Three normative facts fix this beyond argument. Scaling chroma by
+    // (white - black) reproduces all three; scaling by (white - blanking)
+    // fails all three:
+    //
+    //   * NTSC 100 % colour bars peak at 130.83 IRE (textbook ~131);
+    //     with the 100 IRE excursion they would peak at 135.58.
+    //   * NTSC 75 % bars peak at EXACTLY 100.000 IRE -- which is the
+    //     entire reason 75 % bars exist; the 100 IRE excursion gives
+    //     103.56 and blows the limit.
+    //   * yellow and cyan reach the SAME peak (Y' + |C| = 1.3333 for
+    //     both); the 100 IRE excursion splits them by 1.39 IRE.
+    //
+    // NOTE: this DELIBERATELY differs from the host on NTSC-M / PAL-M.
+    // orc::ColourFrameCarrier's doc comment and outputwriter.cpp both use
+    // uvRange = white - blanking, which under-saturates those two systems
+    // by 560/518 = 8.1 %. It is invisible on 625-line PAL, where black ==
+    // blanking -- which is presumably why it survived in a PAL-first
+    // lineage. So HVD's own preview will read ~8 % more saturated than
+    // the Video Sink on NTSC; HVD is the correct one. engine/colour.h
+    // (kIreWhite - kIreBlack = 92.5) and the Python reference always had
+    // this right; an earlier revision of this file "fixed" it to match
+    // the host and thereby imported the bug.
     const double range = fp.white_level - fp.black_level;
+    const double uv_range = range;
     for (uint32_t row = 0; row < pic.height; ++row) {
         for (uint32_t col = 0; col < pic.width; ++col) {
             const size_t i = static_cast<size_t>(row) * pic.width + col;
             const double ny = (pic.y[i] - fp.black_level) / range;
-            const double nu = pic.u[i] / range;
-            const double nv = pic.v[i] / range;
+            const double nu = pic.u[i] / uv_range;
+            const double nv = pic.v[i] / uv_range;
             const auto rgb = YuvToRgb8(ny, nu, nv);
             const size_t o = i * 3;
             img.rgb_data[o + 0] = rgb[0];
@@ -456,16 +541,47 @@ bool HvdDecodedRepresentation::WriteWovenAsRgb24(
     std::ostream& out)
 {
     if (fp.white_level <= fp.black_level) return false;
+    if (fp.white_level <= fp.blanking_level) return false;
     if (pic.width == 0 || pic.height == 0) return false;
 
+    // Y AND U/V both normalise over black..white -- the LUMA EXCURSION.
+    //
+    // Poynton eq 28.1/28.6 (the matrix below) defines U = 0.492(B'-Y'),
+    // V = 0.877(R'-Y') with Y' in [0, 1]. U and V must therefore be
+    // divided by whatever code range corresponds to Y' in [0, 1], which
+    // is white - black. On NTSC-M / PAL-M that is 92.5 IRE, not 100.
+    //
+    // Three normative facts fix this beyond argument. Scaling chroma by
+    // (white - black) reproduces all three; scaling by (white - blanking)
+    // fails all three:
+    //
+    //   * NTSC 100 % colour bars peak at 130.83 IRE (textbook ~131);
+    //     with the 100 IRE excursion they would peak at 135.58.
+    //   * NTSC 75 % bars peak at EXACTLY 100.000 IRE -- which is the
+    //     entire reason 75 % bars exist; the 100 IRE excursion gives
+    //     103.56 and blows the limit.
+    //   * yellow and cyan reach the SAME peak (Y' + |C| = 1.3333 for
+    //     both); the 100 IRE excursion splits them by 1.39 IRE.
+    //
+    // NOTE: this DELIBERATELY differs from the host on NTSC-M / PAL-M.
+    // orc::ColourFrameCarrier's doc comment and outputwriter.cpp both use
+    // uvRange = white - blanking, which under-saturates those two systems
+    // by 560/518 = 8.1 %. It is invisible on 625-line PAL, where black ==
+    // blanking -- which is presumably why it survived in a PAL-first
+    // lineage. So HVD's own preview will read ~8 % more saturated than
+    // the Video Sink on NTSC; HVD is the correct one. engine/colour.h
+    // (kIreWhite - kIreBlack = 92.5) and the Python reference always had
+    // this right; an earlier revision of this file "fixed" it to match
+    // the host and thereby imported the bug.
     const double range = fp.white_level - fp.black_level;
+    const double uv_range = range;
     std::vector<uint8_t> row_bytes(static_cast<size_t>(pic.width) * 3);
     for (uint32_t row = 0; row < pic.height; ++row) {
         for (uint32_t col = 0; col < pic.width; ++col) {
             const size_t i = static_cast<size_t>(row) * pic.width + col;
             const double ny = (pic.y[i] - fp.black_level) / range;
-            const double nu = pic.u[i] / range;
-            const double nv = pic.v[i] / range;
+            const double nu = pic.u[i] / uv_range;
+            const double nv = pic.v[i] / uv_range;
             const auto rgb = YuvToRgb8(ny, nu, nv);
             row_bytes[col * 3 + 0] = rgb[0];
             row_bytes[col * 3 + 1] = rgb[1];
@@ -1163,7 +1279,20 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "fair amount of quality for a faster pass.",
             ParameterType::INT32, integer(1, 4, 2)},
         ParameterDescriptor{kAcc, "Automatic Color Control",
-            "Calibrate saturation from burst amplitude (colour path only).",
+            "Normalise saturation to the standard's nominal burst amplitude "
+            "(20 IRE for NTSC-M / PAL-M, 21.43 for 625-line PAL), measured "
+            "from this capture, as every analogue TV does. Corrects level "
+            "drift of the source chain. Gain is clamped to 0.5-2.0. Applies "
+            "to the colour path only: the lossless Y/C split is never "
+            "scaled.\n\n"
+            "NOTE for A/B against the built-in Video Sink: that decoder does "
+            "NO ACC at all -- ld-chroma-decoder's PalColour and Comb "
+            "normalise the burst vector to unit magnitude and use it as a "
+            "PHASE reference only, so chroma amplitude passes through "
+            "exactly as captured. With ACC on, the saturation difference "
+            "you see against the Video Sink is precisely this capture's "
+            "burst deviation from nominal. Turn ACC off (and leave Chroma "
+            "Gain at 1.0) to compare like for like.",
             ParameterType::BOOL, boolean(true)},
         ParameterDescriptor{kChromaGain, "Chroma Gain",
             "Gain applied to U/V on top of ACC, matching the classic "
@@ -1172,13 +1301,22 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
         ParameterDescriptor{kMonochrome, "Monochrome",
             "Zero the chroma channel.", ParameterType::BOOL, boolean(false)},
         ParameterDescriptor{kChromaPhaseDeg, "Chroma phase (deg)",
-            "Rotation applied to the burst-locked phase reference before "
-            "the solver runs, same idea as the classic decoder's Chroma "
-            "Phase (Comb::transformIQ). Range -180 to 180. The recovered "
-            "chroma has been persistently 180 deg off since the Python "
-            "reference, hence the default; treat it as tunable per-capture, "
-            "not as fixed.",
-            ParameterType::DOUBLE, real(-180.0, 180.0, 180.0)},
+            "RELATIVE hue trim, in degrees, ADDED ON TOP of the phase "
+            "measured from this capture's own colour burst -- never a "
+            "replacement for it. 0 means trust the measurement, and a "
+            "correct decoder on a healthy source needs 0. Use it only to "
+            "compensate a real phase error in the source chain, judged on "
+            "colour bars. Positive rotates hue positively. Same idea as the "
+            "classic decoder's Chroma Phase (Comb::transformIQ), except it "
+            "is injected at the phase reference rather than rotating U/V "
+            "afterwards. Range -180 to 180.\n\n"
+            "The default used to be 180, which was NOT a property of any "
+            "source: it cancelled a sign error in the NTSC burst derivation "
+            "(theta = arg(z) + pi/2 where the correct relation is "
+            "arg(z) - pi/2). That is fixed at source, and the PAL lock-in "
+            "was always correct -- so the old 180 default made NTSC look "
+            "right while rotating every PAL decode by half a turn.",
+            ParameterType::DOUBLE, real(-180.0, 180.0, 0.0)},
         ParameterDescriptor{kPreviewFullRaster, "Preview: full raster",
             "PREVIEW ONLY (never affects the exported/written frames, which "
             "always honour the configured VideoParameters crop). ON: show "
@@ -1253,12 +1391,11 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
             "carrier moves. OFF (default) uses the standard.",
             ParameterType::BOOL, boolean(false)},
         ParameterDescriptor{kSubcarrierKhz, "Advanced: Subcarrier frequency (kHz)",
-            "Used only when the checkbox above is ON. VHD 2556.8 (exact "
-            "line lock 2556.8182 = 162.5 x fH), NTSC 3579.5455, PAL "
-            "4433.61875. Wrong by a few kHz and the hue rotates "
-            "progressively along each line: sweep it while watching a flat "
-            "colour area.",
-            ParameterType::DOUBLE, real(500.0, 6000.0, 2556.8)},
+            "Used only when the checkbox above is ON. VHD 2556.8182 (the "
+            "exact line lock, 162.5 x fH), NTSC 3579.5455, PAL 4433.61875. "
+            "Wrong by a few kHz and the hue rotates progressively along "
+            "each line: sweep it while watching a flat colour area.",
+            ParameterType::DOUBLE, real(500.0, 6000.0, 2556.8182)},
         ParameterDescriptor{kOddGateFloor, "Advanced: Odd-offset gate floor",
             "Weight kept on opposite-parity (odd) neighbour equations where "
             "the half-line envelope says that field cannot see the feature. "

@@ -98,6 +98,12 @@ def main():
                          "Y/C ownership, as any 3D comb does).")
     ap.add_argument("--cg-iter", type=int, default=60)
     ap.add_argument("--chroma-gain", type=float, default=1.0)
+    ap.add_argument("--chroma-phase", type=float, default=0.0,
+                    help="RELATIVE hue trim in degrees, added on top of the "
+                         "measured burst phase (0 = trust the measurement). "
+                         "Positive rotates hue positively. This is a "
+                         "per-capture correction, not a calibration "
+                         "constant: a correct decoder needs 0.")
     ap.add_argument("--monochrome", action="store_true")
     args = ap.parse_args()
 
@@ -108,7 +114,12 @@ def main():
               f"Omit the flag for the lossless-split default.",
               file=sys.stderr)
 
-    src = TbcSource.open(args.input, args.input_json)
+    # NTSC-J carries no 7.5 IRE setup, so picture black IS the blanking
+    # reference there; the reader needs to know which to assume when
+    # deriving 0 IRE from the JSON's black16bIre (ld-decode does not
+    # record it). See TbcSource.open.
+    src = TbcSource.open(args.input, args.input_json,
+                         setup_ire=0.0 if args.ntsc_j else 7.5)
 
     # --- decoding / reconstruction boundary notice -------------------
     # Default output is a PURE DECODE: Y + Re[chi e^{i phi}] = S holds
@@ -144,6 +155,7 @@ def main():
                         acc=not args.no_acc,
                         cg_iterations=args.cg_iter,
                         chroma_gain=args.chroma_gain,
+                        chroma_phase_deg=args.chroma_phase,
                         monochrome=args.monochrome)
 
     n = src.num_frames - args.start if args.length < 0 else args.length

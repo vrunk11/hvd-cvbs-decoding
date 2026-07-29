@@ -138,9 +138,16 @@ def encode_frame_to_fields(rgb, params: VideoParameters,
             phi = phi0 + np.pi * line + (np.pi / 2.0) * x_all
             # sync tip (simplified: front 60 samples)
             S[line, :60] = IRE_SYNC
-            # burst on -U axis: chroma = Re[(0 - i*(-A)) e^{i phi}] = A sin(phi)
+            # Burst on the -U axis (SMPTE 170M-2004 8.2: 180 deg).
+            #   chi_burst = V - iU = 0 - i(-A) = +iA
+            #   burst     = Re[iA e^{i phi}] = -A sin(phi)
+            # The sign here used to be +, from evaluating Re[iA e^{i phi}]
+            # as +A sin(phi). It is -A sin(phi). Encoder and decoder were
+            # consistently wrong together, so the round trip looked clean
+            # while every real capture came out 180 deg off in hue -- which
+            # is what HvdConfig::chroma_phase_deg = 180 was papering over.
             b0, b1 = p.colour_burst_start, p.colour_burst_end
-            S[line, b0:b1] += chroma_level * BURST_IRE * np.sin(phi[b0:b1])
+            S[line, b0:b1] -= chroma_level * BURST_IRE * np.sin(phi[b0:b1])
             if line >= first_active_line:
                 src_row = (line - first_active_line) * 2 + fi
                 if src_row < frame.shape[0]:
@@ -151,8 +158,14 @@ def encode_frame_to_fields(rgb, params: VideoParameters,
                     )
         if noise_ire > 0:
             S = S + rng.normal(0.0, noise_ire, S.shape)
-        scale = (p.white16bIre - p.black16bIre) / 100.0
-        raw = np.clip(S * scale + p.black16bIre, 0, 65535).astype("<u2")
+        # TRUE IRE -> raw, anchored on BLANKING (0 IRE). This used to be
+        # `S * (white - black)/100 + black`, which put S = 0 at picture
+        # black and scaled by 92.5 IRE worth of codes -- the same mistake
+        # tbc.py's ire() made, so the pair round-tripped cleanly while both
+        # were wrong in absolute terms. S already carries the pedestal
+        # (IRE_BLACK = 7.5) as part of the signal; it must not be applied
+        # again by the level mapping.
+        raw = np.clip(p.raw(S), 0, 65535).astype("<u2")
         fields.append((raw, pid, fi == 0))
     return fields
 
@@ -181,7 +194,9 @@ def write_tbc(path: str, rgb_frames, params: VideoParameters | None = None,
                 b0, b1 = params.colour_burst_start, params.colour_burst_end
                 for raw, _, _ in flds:
                     bad = rng.random(raw.shape[0]) < burst_dropout
-                    noise = rng.normal(params.black16bIre, 4000,
+                    # Destroyed bursts sit in blanking, not at picture
+                    # black -- the burst window is inside the back porch.
+                    noise = rng.normal(params.blanking16bIre, 4000,
                                        (int(bad.sum()), b1 - b0))
                     raw[bad, b0:b1] = np.clip(noise, 0, 65535).astype("<u2")
             for raw, phase_id, is_first in flds:
@@ -209,6 +224,10 @@ def write_tbc(path: str, rgb_frames, params: VideoParameters | None = None,
             "colourBurstEnd": params.colour_burst_end,
             "black16bIre": params.black16bIre,
             "white16bIre": params.white16bIre,
+            # Not an ld-decode key, but harmless to unknown readers and it
+            # lets the round trip exercise the real setup path instead of
+            # relying on the reader's derivation.
+            "blanking16bIre": params.blanking16bIre,
         },
         "fields": meta_fields,
     }

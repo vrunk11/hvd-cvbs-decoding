@@ -44,7 +44,7 @@ void RunTests() {
 
   const int fw = fp.frame_width;
   const int fh = fp.frame_height;
-  const float scale = (fp.white_level - fp.black_level) / 100.0F;
+  const float scale = (fp.white_level - fp.blanking_level) / 100.0F;
 
   // Synthesize a field-sequential composite: burst in every line, plus a luma
   // ramp and modulated chroma in the active picture of each field.
@@ -57,7 +57,8 @@ void RunTests() {
     for (int x = 0; x < fw; ++x) {
       float ire = 0.0F;
       if (x >= fp.colour_burst_start && x < fp.colour_burst_end) {
-        ire = 20.0F * std::sin(kHalfPi * x + kPi * field_line);
+        // -U axis burst: -A sin(phi). See lockin.cpp.
+        ire = -20.0F * std::sin(kHalfPi * x + kPi * field_line);
       }
       if (x >= fp.active_video_start && x < fp.active_video_end &&
           field_line >= fal_field && field_line < lal_field) {
@@ -69,7 +70,7 @@ void RunTests() {
                          : 0.0F;
         ire = luma + chroma;
       }
-      const float sample = fp.black_level + ire * scale;
+      const float sample = fp.blanking_level + ire * scale;
       frame[static_cast<size_t>(line) * fw + x] =
           static_cast<int16_t>(std::lround(std::clamp(sample, 0.0F, 1023.0F)));
     }
