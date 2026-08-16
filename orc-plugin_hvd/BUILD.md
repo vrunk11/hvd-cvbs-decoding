@@ -124,12 +124,29 @@ git -C C:\src\decode-orc checkout v2.0.0
 cmake -S . -B build `
     -DORC_INTREE_SDK_DIR=C:/src/decode-orc `
     -DBUILD_TESTS=ON `
-    -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+    -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+    -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
 cmake --build build --config Release --parallel
 ctest --test-dir build --output-on-failure -C Release
 ```
 
 Notes:
+* **`-DVCPKG_TARGET_TRIPLET=x64-windows-static-md` is not optional.**
+  Without it, vcpkg defaults to `x64-windows` (dynamic): `fftw3f` and
+  FFmpeg build as separate DLLs the plugin links against at runtime. The
+  release manifest and `scripts/package_local.sh` publish exactly **one
+  file** per platform, so those DLLs never ship with the release — a host
+  that downloads only the plugin `.dll` fails to `LoadLibrary` it (missing
+  dependent DLLs), even though the file itself built and packaged fine.
+  `-static-md` bakes `fftw3f`/FFmpeg into the plugin `.dll` at link time
+  (no external DLLs to distribute) while keeping the **dynamic** CRT
+  (`/MD`, "release-crt") — matching what the host's toolchain tag expects.
+  Do **not** use plain `x64-windows-static`: that switches to the *static*
+  CRT (`/MT`), and the SDK's toolchain tag only distinguishes Debug/Release
+  CRT, not static-vs-dynamic linkage — a `/MT` plugin loaded by a `/MD` host
+  would pass the tag's exact-string check and then hit real, harder-to-diagnose
+  cross-CRT ABI problems (separate heaps, iostream state, etc.) instead of
+  being cleanly rejected at load time.
 * **Dependencies are declared in `vcpkg.json`** (manifest mode):
   `fftw3` with the `threads` feature, `fmt` for the SDK headers, and
   `ffmpeg` (avcodec/avformat/swscale) for the .mkv/.mp4/pipe export
@@ -148,6 +165,9 @@ Notes:
   `fftw3f` (no separate `fftw3f_threads` DLL); the build system detects
   this by *linking a probe*, not by looking for a file, so both
   packaging styles work.
+* Statically linking FFmpeg (LGPL) into this GPL-3.0-or-later plugin is
+  fine license-wise — GPL is strictly stronger than what LGPL requires
+  here, so no separate relinking/object-file obligation is triggered.
 * Engine-only also works on Windows: `cd ..\hvd-core` and configure
   that directory directly (see 2.1) instead of this one — no
   `-DORC_…` options, no decode-orc checkout.
@@ -223,11 +243,20 @@ Two-stage pipeline:
    * checks out this repository **with submodules** (`hvd-core`
      included) plus `simoninns/decode-orc` at `ORC_SDK_REF`;
    * `ubuntu-latest` + `macos-latest` via **Nix** (toolchain-tag
-     correctness), `windows-latest` via **MSVC + vcpkg manifest**;
+     correctness), `windows-latest` via **MSVC** (`-G "Visual Studio 17
+     2022" -A x64`, explicit — not left to CMake's default-generator
+     guess) **+ vcpkg manifest** (`x64-windows-static-md`, see §3.1);
    * verifies the SDK headers exist, enforces the SDK boundary
      (`scripts/check_sdk_boundary.sh`);
    * configures this directory (`hvd-core` is picked up automatically
      at `../hvd-core`), builds, runs the full ctest suite;
+   * **verifies the toolchain tag the just-built binary actually
+     embeds** matches what that platform is supposed to produce
+     (`msvc*` on Windows, `clang*` on macOS, `gcc*` on Linux) — read
+     straight off the compiled descriptor via `orc-plugin-build-info`,
+     the same tool `package_local.sh` uses below, so this checks the
+     real artifact rather than trusting the configure step did what it
+     was asked;
    * packages the artifact and writes that platform's fragment of the
      release manifest in one step (`scripts/package_local.sh`, under
      `bash` on all three OSes including Windows via Git Bash — see
@@ -307,6 +336,18 @@ either script): build the plugin normally, then
 
 ## 6. Troubleshooting
 
+* **Host shows "Stage Plugin Errors" / "LoadLibrary failed" for the
+  downloaded `.dll`** — almost always missing dependent DLLs, not a bad
+  download. The release manifest and `package_local.sh` publish exactly one
+  file per platform; if the Windows build wasn't configured with
+  `-DVCPKG_TARGET_TRIPLET=x64-windows-static-md` (§3.1), `fftw3f` and
+  FFmpeg link as separate DLLs that never ship with that single file, and
+  `LoadLibrary` fails as soon as the host tries to resolve them — well
+  before the toolchain-tag check even runs, so this happens even with an
+  otherwise-correct MSVC build. Confirm with a dependency viewer (e.g.
+  [Dependencies](https://github.com/lucasg/Dependencies)) or, from an MSYS2
+  shell, `ldd path\to\the.dll`. Fix: rebuild with the triplet above and
+  re-tag/re-release.
 * **"hvd-core not found at '...'"** — you forgot
   `git submodule update --init --recursive`, or you're building from a
   tarball/zip download that doesn't carry submodules (GitHub's

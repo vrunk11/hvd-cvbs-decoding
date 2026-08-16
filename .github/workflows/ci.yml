@@ -147,13 +147,39 @@ jobs:
       # No explicit `vcpkg install` step: vcpkg.json in this directory puts
       # vcpkg into manifest mode, so the toolchain file below installs fftw3
       # (with the threads feature) and fmt during configure.
+      #
+      # VCPKG_TARGET_TRIPLET=x64-windows-static-md: without an explicit
+      # triplet, vcpkg defaults to x64-windows (DYNAMIC) on this runner,
+      # which builds fftw3f/ffmpeg as separate DLLs the plugin links against
+      # at runtime. Since the release manifest and package_local.sh publish
+      # exactly one file per platform, those DLLs never ship with the
+      # release — a host that downloads only the plugin .dll then fails to
+      # LoadLibrary it (missing dependent DLLs), even though the file itself
+      # is fine. -static-md switches vcpkg's libraries to static (.lib,
+      # baked into the plugin .dll at link time) while keeping the DYNAMIC
+      # CRT (/MD, "release-crt") — matching what the host's own toolchain
+      # tag expects (the SDK's toolchain tag only distinguishes Debug/Release
+      # CRT, not static-vs-dynamic CRT linkage, so x64-windows-static's /MT
+      # would silently mismatch the host's /MD without the loader's own
+      # exact-string-match check ever catching it).
+      # -G "Visual Studio 17 2022" -A x64: explicit, not left to CMake's
+      # default-generator guess. That default is normally MSVC on Windows,
+      # but "normally" isn't a guarantee worth shipping releases on — a
+      # Visual Studio generator locates and forces cl.exe from the
+      # associated VS install regardless of what else happens to be on
+      # PATH (Git for Windows, Strawberry Perl, RTools and others can all
+      # put a gcc.exe on a GitHub-hosted runner's PATH), so this is the one
+      # line standing between "the CI runner's PATH looked the way we
+      # expect today" and every release binary actually being MSVC.
       - name: Configure (native)
         if: ${{ !matrix.use_nix }}
         run: >
           cmake -S . -B build
+          -G "Visual Studio 17 2022" -A x64
           -DORC_INTREE_SDK_DIR=${{ env.ORC_SDK_DIR }}
           -DBUILD_TESTS=ON
           -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+          -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
 
       - name: Build (Nix)
         if: matrix.use_nix
@@ -170,6 +196,44 @@ jobs:
       - name: Test (native)
         if: ${{ !matrix.use_nix }}
         run: ctest --test-dir build --output-on-failure -C Release
+
+      # Hard gate, not an assumption: reads the toolchain_tag straight out
+      # of the just-built binary's own compiled descriptor (the same
+      # orc-plugin-build-info package_local.sh uses below) and fails the
+      # job if it doesn't match the compiler family this platform is
+      # supposed to produce. In particular this is what actually guarantees
+      # the Windows leg produced an MSVC binary — "-G Visual Studio 17
+      # 2022" makes that the overwhelmingly likely outcome, but this step
+      # checks the artifact itself rather than trusting the configure step
+      # did what it was asked. A silent drift here (e.g. a runner image
+      # change that puts a different compiler ahead in some resolution
+      # order) would otherwise only surface downstream as a confusing
+      # "LoadLibrary failed" or toolchain-tag-mismatch report from a user,
+      # long after the release was published.
+      - name: Verify toolchain tag matches this platform
+        shell: bash
+        run: |
+          exe_ext=""
+          case "${{ matrix.platform }}" in
+            windows) exe_ext=".exe"; expected_prefix="msvc" ;;
+            macos)   expected_prefix="clang" ;;
+            linux)   expected_prefix="gcc" ;;
+          esac
+          build_info="$(find build -type f -name "orc-plugin-build-info${exe_ext}" | head -n1)"
+          if [ -z "$build_info" ]; then
+            echo "::error::orc-plugin-build-info not found under build/"
+            exit 1
+          fi
+          chmod +x "$build_info" 2>/dev/null || true
+          toolchain_tag="$("$build_info" | tr -d '\r' | awk -F= '/^toolchain_tag=/ {print $2}')"
+          echo "toolchain_tag=${toolchain_tag}"
+          case "$toolchain_tag" in
+            ${expected_prefix}*) ;;
+            *)
+              echo "::error::Expected a ${expected_prefix}* toolchain_tag on ${{ matrix.platform }}, got '${toolchain_tag}'. This binary would be rejected (or worse, silently ABI-mismatched) by a real host and must not be published."
+              exit 1
+              ;;
+          esac
 
       # Packages the built binary as a release asset AND writes this
       # platform's fragment of orc-plugin-manifest.yaml — plugin_id,
