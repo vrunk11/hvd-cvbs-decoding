@@ -141,17 +141,20 @@ template <typename T>
 void DxTInto(const BasicPlane<T>& a, BasicPlane<T>& d) {
   const int w = a.width();
   const int h = a.height();
+  const T* __restrict ap = a.data();
+  T* __restrict dp = d.data();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
   for (int y = 0; y < h; ++y) {
+    const int row = y * w;
     if (w < 2) {
-      for (int x = 0; x < w; ++x) d.at(y, x) = T{};
+      for (int x = 0; x < w; ++x) dp[row + x] = T{};
       continue;
     }
-    d.at(y, 0) = -a.at(y, 0);
-    for (int x = 1; x < w - 1; ++x) d.at(y, x) = a.at(y, x - 1) - a.at(y, x);
-    d.at(y, w - 1) = a.at(y, w - 2);
+    dp[row] = -ap[row];
+    for (int x = 1; x < w - 1; ++x) dp[row + x] = ap[row + x - 1] - ap[row + x];
+    dp[row + w - 1] = ap[row + w - 2];
   }
 }
 
@@ -159,18 +162,24 @@ template <typename T>
 void DyTInto(const BasicPlane<T>& a, BasicPlane<T>& d) {
   const int h = a.height();
   const int w = a.width();
+  const T* __restrict ap = a.data();
+  T* __restrict dp = d.data();
   if (h < 2) {
-    for (size_t i = 0; i < d.size(); ++i) d[i] = T{};
+    for (size_t i = 0; i < d.size(); ++i) dp[i] = T{};
     return;
   }
-  for (int x = 0; x < w; ++x) d.at(0, x) = -a.at(0, x);
+  for (int x = 0; x < w; ++x) dp[x] = -ap[x];
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
   for (int y = 1; y < h - 1; ++y) {
-    for (int x = 0; x < w; ++x) d.at(y, x) = a.at(y - 1, x) - a.at(y, x);
+    const int row = y * w;
+    const int rowPrev = row - w;
+    for (int x = 0; x < w; ++x) dp[row + x] = ap[rowPrev + x] - ap[row + x];
   }
-  for (int x = 0; x < w; ++x) d.at(h - 1, x) = a.at(h - 2, x);
+  const int lastRow = (h - 1) * w;
+  const int prevRow = lastRow - w;
+  for (int x = 0; x < w; ++x) dp[lastRow + x] = ap[prevRow + x];
 }
 
 // ---------------------------------------------------------------------------
@@ -208,15 +217,19 @@ template <typename T>
 void D1TInto(const BasicPlane<T>& a, BasicPlane<T>& d) {
   const int h = a.height();
   const int w = a.width();
+  const T* __restrict ap = a.data();
+  T* __restrict dp = d.data();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
   for (int y = 0; y < h; ++y) {
+    const int row = y * w;
+    const int rowPrev = row - w;
     for (int x = 0; x < w; ++x) {
       T v{};
-      if (y + 1 < h && x + 1 < w) v = v - a.at(y, x);
-      if (y >= 1 && x >= 1) v = v + a.at(y - 1, x - 1);
-      d.at(y, x) = v;
+      if (y + 1 < h && x + 1 < w) v = v - ap[row + x];
+      if (y >= 1 && x >= 1) v = v + ap[rowPrev + x - 1];
+      dp[row + x] = v;
     }
   }
 }
@@ -246,15 +259,120 @@ template <typename T>
 void D2TInto(const BasicPlane<T>& a, BasicPlane<T>& d) {
   const int h = a.height();
   const int w = a.width();
+  const T* __restrict ap = a.data();
+  T* __restrict dp = d.data();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
   for (int y = 0; y < h; ++y) {
+    const int row = y * w;
+    const int rowPrev = row - w;
     for (int x = 0; x < w; ++x) {
       T v{};
-      if (y + 1 < h && x >= 1) v = v - a.at(y, x);
-      if (y >= 1 && x + 1 < w) v = v + a.at(y - 1, x + 1);
-      d.at(y, x) = v;
+      if (y + 1 < h && x >= 1) v = v - ap[row + x];
+      if (y >= 1 && x + 1 < w) v = v + ap[rowPrev + x + 1];
+      dp[row + x] = v;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fused forward-difference + elementwise-weight variants: d = w .* D*(a) in
+// a single pass, instead of D*Into(a, tmp) followed by a separate `tmp[i] *=
+// w[i]` loop. Same maths, one fewer full-frame read+write of the
+// intermediate buffer — this is the memory-traffic-bound hot path (CG
+// gradient), so cutting a pass here is a real, not cosmetic, win.
+//
+// PRECONDITION: raw `__restrict` pointers via .data() — caller must guarantee
+// `a`, `w`, and `d` don't alias each other (true at every call site below:
+// `d` is always a scratch buffer distinct from `a`/`w`). No bounds checks;
+// dimensions must already match (same contract as the *Into functions).
+template <typename T>
+void DxWeightedInto(const BasicPlane<T>& a, const BasicPlane<float>& w,
+                     BasicPlane<T>& d) {
+  const int h = a.height();
+  const int wid = a.width();
+  const T* __restrict ap = a.data();
+  const float* __restrict wp = w.data();
+  T* __restrict dp = d.data();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h; ++y) {
+    const int row = y * wid;
+    for (int x = 0; x + 1 < wid; ++x)
+      dp[row + x] = wp[row + x] * (ap[row + x + 1] - ap[row + x]);
+    if (wid > 0) dp[row + wid - 1] = T{};
+  }
+}
+
+template <typename T>
+void DyWeightedInto(const BasicPlane<T>& a, const BasicPlane<float>& w,
+                     BasicPlane<T>& d) {
+  const int h = a.height();
+  const int wid = a.width();
+  const T* __restrict ap = a.data();
+  const float* __restrict wp = w.data();
+  T* __restrict dp = d.data();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h - 1; ++y) {
+    const int row = y * wid;
+    const int rowNext = row + wid;
+    for (int x = 0; x < wid; ++x)
+      dp[row + x] = wp[row + x] * (ap[rowNext + x] - ap[row + x]);
+  }
+  if (h > 0) {
+    const int lastRow = (h - 1) * wid;
+    for (int x = 0; x < wid; ++x) dp[lastRow + x] = T{};
+  }
+}
+
+template <typename T>
+void D1WeightedInto(const BasicPlane<T>& a, const BasicPlane<float>& w,
+                     BasicPlane<T>& d) {
+  const int h = a.height();
+  const int wid = a.width();
+  const T* __restrict ap = a.data();
+  const float* __restrict wp = w.data();
+  T* __restrict dp = d.data();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h; ++y) {
+    const int row = y * wid;
+    if (y + 1 < h) {
+      const int rowNext = row + wid;
+      for (int x = 0; x + 1 < wid; ++x)
+        dp[row + x] = wp[row + x] * (ap[rowNext + x + 1] - ap[row + x]);
+      if (wid > 0) dp[row + wid - 1] = T{};
+    } else {
+      for (int x = 0; x < wid; ++x) dp[row + x] = T{};
+    }
+  }
+}
+
+template <typename T>
+void D2WeightedInto(const BasicPlane<T>& a, const BasicPlane<float>& w,
+                     BasicPlane<T>& d) {
+  const int h = a.height();
+  const int wid = a.width();
+  const T* __restrict ap = a.data();
+  const float* __restrict wp = w.data();
+  T* __restrict dp = d.data();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int y = 0; y < h; ++y) {
+    const int row = y * wid;
+    if (y + 1 < h) {
+      const int rowNext = row + wid;
+      if (wid > 0) dp[row] = T{};
+      for (int x = 1; x < wid; ++x)
+        dp[row + x] = wp[row + x] * (ap[rowNext + x - 1] - ap[row + x]);
+    } else {
+      for (int x = 0; x < wid; ++x) dp[row + x] = T{};
     }
   }
 }

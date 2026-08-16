@@ -144,6 +144,25 @@ BmResult BmPass(const Plane& A, const Plane& B, int tile,
 
   for (int dy : dys) {
     for (int dx : dxs) {
+      // OPTIMISATION: partial distortion elimination (PDE). Exact — the selected
+      // motion field is bit-identical to the exhaustive version; see below.
+
+      //
+      // The bias multiplies the raw SSD before it is compared against the
+      // running best, so the accumulator's kill threshold is best/bias:
+      // once `acc` reaches it, `acc * bias` can only be >= best and this
+      // candidate CANNOT win. Every pixel summed past that point is work
+      // thrown away. Bailing out early leaves `se` holding a TRUNCATED sum,
+      // which is fine precisely because a truncated value is always >= the
+      // threshold that would have rejected the full one — see the note at
+      // the reduction below.
+      const float bias = 1.0F + 0.02F * static_cast<float>(std::abs(dy) + std::abs(dx));
+      const float inv_bias = 1.0F / bias;
+      // cost0 is consumed as an absolute SSD by EstimateMotion's
+      // "prefer zero" margin rule (best > 0.85 * cost0), so it needs the
+      // EXACT, untruncated sum — PDE has to stay off for that candidate.
+      const bool exact_needed = want_cost0 && dy == 0 && dx == 0;
+
       // Parallel over TILE ROWS (each ty owns rows [ty*tile, (ty+1)*tile) of
       // the image AND row ty of `se`, so there are no write conflicts) —
       // THEORY 9f: "tiles and fields parallelise trivially". This loop is
@@ -157,14 +176,24 @@ BmResult BmPass(const Plane& A, const Plane& B, int tile,
           const int y_end = std::min((ty + 1) * tile, h);
           for (int tx = 0; tx < tw; ++tx) {
             const int x_end = std::min((tx + 1) * tile, w);
+            // r.best is only ever written by the SERIAL reduction below,
+            // never inside this parallel region, so reading it here is
+            // race-free.
+            const float kill = exact_needed
+                                   ? std::numeric_limits<float>::infinity()
+                                   : r.best.at(ty, tx) * inv_bias;
             float acc = 0.0F;
             for (int y = ty * tile; y < y_end; ++y) {
               const float* arow = &A.at(y, 0);
               const float* brow = &Bp.at(y + pad - dy, pad - dx);
+              // The inner x loop stays branch-free so it keeps vectorising
+              // (AVX2, confirmed via -fopt-info-vec); the bail-out is
+              // checked once per ROW, not per pixel.
               for (int x = tx * tile; x < x_end; ++x) {
                 const float diff = arow[x] - brow[x];
                 acc += diff * diff;
               }
+              if (acc >= kill) break;
             }
             se.at(ty, tx) = acc;
           }
@@ -183,6 +212,9 @@ BmResult BmPass(const Plane& A, const Plane& B, int tile,
             const int sy = static_cast<int>(std::lround(base_dy->at(ty, tx))) + dy;
             const int sx = static_cast<int>(std::lround(base_dx->at(ty, tx))) + dx;
             const int x_end = std::min((tx + 1) * tile, w);
+            const float kill = exact_needed
+                                   ? std::numeric_limits<float>::infinity()
+                                   : r.best.at(ty, tx) * inv_bias;
             float acc = 0.0F;
             for (int y = ty * tile; y < y_end; ++y) {
               const float* arow = &A.at(y, 0);
@@ -191,6 +223,7 @@ BmResult BmPass(const Plane& A, const Plane& B, int tile,
                 const float diff = arow[x] - brow[x];
                 acc += diff * diff;
               }
+              if (acc >= kill) break;
             }
             se.at(ty, tx) = acc;
           }
@@ -201,10 +234,13 @@ BmResult BmPass(const Plane& A, const Plane& B, int tile,
         for (size_t i = 0; i < se.size(); ++i) r.cost0[i] = se[i];
       }
 
-      const float bias = 1.0F + 0.02F * static_cast<float>(std::abs(dy) + std::abs(dx));
       for (int ty = 0; ty < th; ++ty) {
         for (int tx = 0; tx < tw; ++tx) {
           const float cost = se.at(ty, tx) * bias;
+          // A PDE-truncated `acc` satisfies acc >= kill == best/bias, hence
+          // cost = acc*bias >= best, so this test fails exactly as it would
+          // have with the full sum. Truncation can never change the winner
+          // — the selected (dy, dx) field is bit-identical to the original.
           if (cost < r.best.at(ty, tx)) {
             r.best.at(ty, tx) = cost;
             if (!base_dy) {
@@ -227,6 +263,37 @@ std::vector<int> Range(int lo_inclusive, int hi_inclusive) {
   std::vector<int> v;
   v.reserve(static_cast<size_t>(hi_inclusive - lo_inclusive + 1));
   for (int i = lo_inclusive; i <= hi_inclusive; ++i) v.push_back(i);
+  return v;
+}
+
+// OPTIMISATION: same set of offsets as Range(), but ordered from the CENTRE
+// outwards (0, -1, +1, -2, +2, ...) instead of lo..hi.
+//
+// This exists purely to feed the partial-distortion-elimination bail-out in
+// BmPass. PDE can only skip work once a *good* running best exists, and in
+// real video the true motion vector is overwhelmingly near zero — so
+// evaluating the small offsets first drives the kill threshold down almost
+// immediately, letting every subsequent far-out candidate die after one or
+// two rows instead of summing the whole tile.
+//
+// Reordering is safe for the RESULT (not just approximately — exactly):
+// BmPass only overwrites its winner on a strictly-smaller cost, and the
+// bias term depends only on |dy|+|dx|, not on visit order. The one case
+// where order is observable is an exact cost tie between two candidates,
+// where the earlier-visited one wins; ties like that were already resolved
+// arbitrarily by the old lo..hi order, and any tie means the two vectors
+// are equally good by this cost function.
+std::vector<int> RangeFromCentre(int lo_inclusive, int hi_inclusive) {
+  std::vector<int> v;
+  v.reserve(static_cast<size_t>(hi_inclusive - lo_inclusive + 1));
+  if (lo_inclusive > hi_inclusive) return v;
+  if (lo_inclusive <= 0 && 0 <= hi_inclusive) v.push_back(0);
+  for (int d = 1; d <= std::max(-lo_inclusive, hi_inclusive); ++d) {
+    if (-d >= lo_inclusive && -d <= hi_inclusive) v.push_back(-d);
+    if (d >= lo_inclusive && d <= hi_inclusive) v.push_back(d);
+  }
+  // Offsets entirely on one side of zero never emitted above; fall back.
+  if (v.empty()) return Range(lo_inclusive, hi_inclusive);
   return v;
 }
 
@@ -343,7 +410,7 @@ MotionField EstimateMotion(const Plane& y_ref, const Plane& y_cur, int tile,
   const Plane Bd = Decimate(B, kDecimation);
   const int coarse_tile = std::max(4, tile / kDecimation);
   const BmResult coarse =
-      BmPass(Ad, Bd, coarse_tile, Range(-cs, cs), Range(-cs, cs), nullptr, nullptr);
+      BmPass(Ad, Bd, coarse_tile, RangeFromCentre(-cs, cs), RangeFromCentre(-cs, cs), nullptr, nullptr);
 
   // Upscale the coarse tile-grid vectors onto the full-res tile grid
   // (nearest-neighbour), then scale pixel units back up by kDecimation.
@@ -361,7 +428,7 @@ MotionField EstimateMotion(const Plane& y_ref, const Plane& y_cur, int tile,
 
   // --- Level 1: full-res +/-3 px refinement around the coarse vector ------
   const BmResult refined =
-      BmPass(A, B, tile, Range(-3, 3), Range(-3, 3), &base_dy, &base_dx);
+      BmPass(A, B, tile, RangeFromCentre(-3, 3), RangeFromCentre(-3, 3), &base_dy, &base_dx);
   Plane mdy = refined.mdy;
   Plane mdx = refined.mdx;
   const Plane& best_after_refine = refined.best;

@@ -291,18 +291,10 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
     for (long i = 0; i < n; ++i) yc[i] = s[i] - (c[i] * carrier[i]).real();
 
     // img = 2 * (DxT(wx .* Dx(yc)) + DyT(wy .* Dy(yc)))
-    DxInto(yc, tmpr1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (long i = 0; i < n; ++i) tmpr1[i] *= wx[i];
+    DxWeightedInto(yc, wx, tmpr1);
     DxTInto(tmpr1, img);
 
-    DyInto(yc, tmpr2);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (long i = 0; i < n; ++i) tmpr2[i] *= wy[i];
+    DyWeightedInto(yc, wy, tmpr2);
     DyTInto(tmpr2, tmpr1);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -310,18 +302,10 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
     for (long i = 0; i < n; ++i) img[i] = 2.0F * (img[i] + tmpr1[i]);
 
     // cprior = 2 * (mu_h * DxT(wcx .* Dx(c)) + mu_v * DyT(wcy .* Dy(c)))
-    DxInto(c, tmpc1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (long i = 0; i < n; ++i) tmpc1[i] *= wcx[i];
+    DxWeightedInto(c, wcx, tmpc1);
     DxTInto(tmpc1, cprior);
 
-    DyInto(c, tmpc2);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (long i = 0; i < n; ++i) tmpc2[i] *= wcy[i];
+    DyWeightedInto(c, wcy, tmpc2);
     DyTInto(tmpc2, tmpc3);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -333,17 +317,9 @@ RefineResult VariationalRefine(const Plane& s, const ComplexPlane& carrier,
     // tmpc1..3 are free again by this point (their h/v contributions have
     // been folded into cprior above).
     if (mu_d > 0.0F) {
-      D1Into(c, tmpc1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-      for (long i = 0; i < n; ++i) tmpc1[i] *= wd1[i];
+      D1WeightedInto(c, wd1, tmpc1);
       D1TInto(tmpc1, tmpc2);
-      D2Into(c, tmpc1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-      for (long i = 0; i < n; ++i) tmpc1[i] *= wd2[i];
+      D2WeightedInto(c, wd2, tmpc1);
       D2TInto(tmpc1, tmpc3);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -675,44 +651,28 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
 
     // Spatial Charbonnier priors on grad Y, grad chi (same shape as the
     // pass-1 solver, just added directly onto (gy_out, gc_out) here).
-    DxInto(yy, tmpr1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (long i = 0; i < n; ++i) tmpr1[i] *= wx[i];
+    DxWeightedInto(yy, wx, tmpr1);
     DxTInto(tmpr1, tmpr2);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
     for (long i = 0; i < n; ++i) gy_out[i] += 2.0F * tmpr2[i];
 
-    DyInto(yy, tmpr1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (long i = 0; i < n; ++i) tmpr1[i] *= wy[i];
+    DyWeightedInto(yy, wy, tmpr1);
     DyTInto(tmpr1, tmpr2);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
     for (long i = 0; i < n; ++i) gy_out[i] += 2.0F * tmpr2[i];
 
-    DxInto(cc, tmpc1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (long i = 0; i < n; ++i) tmpc1[i] *= wcx[i];
+    DxWeightedInto(cc, wcx, tmpc1);
     DxTInto(tmpc1, cprior);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
     for (long i = 0; i < n; ++i) gc_out[i] += 2.0F * mu_h * cprior[i];
 
-    DyInto(cc, tmpc2);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (long i = 0; i < n; ++i) tmpc2[i] *= wcy[i];
+    DyWeightedInto(cc, wcy, tmpc2);
     DyTInto(tmpc2, cprior);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -721,22 +681,14 @@ RefineResult VariationalRefineJoint(const Plane& s, const ComplexPlane& carrier,
 
     // Oriented terms: + 2 * mu_d * (D1T(wd1 .* D1(cc)) + D2T(wd2 .* D2(cc))).
     if (mu_d > 0.0F) {
-      D1Into(cc, tmpc1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-      for (long i = 0; i < n; ++i) tmpc1[i] *= wd1[i];
+      D1WeightedInto(cc, wd1, tmpc1);
       D1TInto(tmpc1, cprior);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
       for (long i = 0; i < n; ++i) gc_out[i] += 2.0F * mu_d * cprior[i];
 
-      D2Into(cc, tmpc1);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-      for (long i = 0; i < n; ++i) tmpc1[i] *= wd2[i];
+      D2WeightedInto(cc, wd2, tmpc1);
       D2TInto(tmpc1, cprior);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
