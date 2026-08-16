@@ -85,7 +85,7 @@ cmake -S . -B build \
     -DBUILD_TESTS=ON
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
-./scripts/package_local.sh build dist   # -> dist/orc-plugin_hvd_chroma_decoder_linux.so
+./scripts/package_local.sh build dist   # -> dist/orc-plugin_hvd_chroma_decoder_linux_abi<N>.so
 ```
 
 Inside `nix develop`, cmake, ninja, pkg-config, fmt, spdlog, FFTW and
@@ -227,18 +227,19 @@ Two-stage pipeline:
    * verifies the SDK headers exist, enforces the SDK boundary
      (`scripts/check_sdk_boundary.sh`);
    * configures this directory (`hvd-core` is picked up automatically
-     at `../hvd-core`), builds, runs the full ctest suite, packages the
-     artifact per platform (`scripts/package_local.sh` on POSIX, DLL
-     harvest on Windows);
-   * generates that platform's fragment of the release manifest
-     (`scripts/gen_manifest_fragment.py`, see below), then uploads
+     at `../hvd-core`), builds, runs the full ctest suite;
+   * packages the artifact and writes that platform's fragment of the
+     release manifest in one step (`scripts/package_local.sh`, under
+     `bash` on all three OSes including Windows via Git Bash — see
+     below), then self-checks the fragment merges
+     (`scripts/merge_manifests.sh`) before uploading
      `plugin-{linux,macos,windows}` (binary + fragment together).
 3. **`publish-release`** — on `v*` tags: merges the three platforms'
    manifest fragments into `orc-plugin-manifest.yaml`
-   (`scripts/merge_manifest_fragments.py`) and attaches it, alongside
-   all packaged binaries, to the GitHub release. The plugin version is
-   derived from the tag automatically, on both the descriptor and the
-   manifest.
+   (`scripts/merge_manifests.sh`) and attaches it, alongside all
+   packaged binaries, to the GitHub release. The plugin version comes
+   from the fragments, which got it from the compiled descriptor, which
+   got it from the tag — one source of truth end to end.
 
 To release: `git tag v0.2.0 && git push origin v0.2.0`. To track a new
 host version: bump `ORC_SDK_REF`, and if the host's flake moved to a
@@ -255,6 +256,12 @@ refuses to browse, install, or update to the release. See
 [Plugin Publishing Guide §3](https://github.com/simoninns/decode-orc/blob/main/docs/technical/plugin-publishing.md)
 in the decode-orc repo for the full rationale and schema.
 
+This tooling mirrors [`orc-plugin_skeleton`](https://github.com/simoninns/orc-plugin_skeleton)
+(the official decode-orc external-plugin template) field-for-field and
+script-for-script — `tools/plugin_build_info.cpp`,
+`scripts/package_local.sh`, `scripts/merge_manifests.sh` — so anything
+documented there for the manifest applies here unchanged.
+
 **Never hand-write or hand-edit this file.** Every field on it (`abi`,
 `toolchain_tag`, `sha256`) is either build-environment-dependent or
 binary-dependent, and a value that's wrong or stale is *worse* than a missing
@@ -262,29 +269,38 @@ one — it tells a host the wrong thing about a binary it hasn't inspected yet.
 It's generated fully automatically, in two steps, exactly so no one has to
 keep a hand-maintained ABI number in sync with the SDK:
 
-1. **Per platform** (`scripts/gen_manifest_fragment.py`, run in each matrix
-   job right after packaging): builds `hvd_print_build_info`, a tiny
-   executable linked only against the SDK headers, which prints
-   `plugin_id` / `host_abi` / `toolchain_tag` straight out of
-   `kPluginDescriptor` — i.e. exactly what that platform's just-built binary
-   actually embeds, never re-derived by a second, independent calculation
-   that could drift from it. Combined with a `sha256` of the packaged file,
-   this becomes that platform's `manifest-fragment.json`, uploaded alongside
-   the binary.
-2. **Once, in `publish-release`** (`scripts/merge_manifest_fragments.py`):
-   after all three matrix jobs finish, combines their three fragments (each
-   job only sees its own platform) into the final `orc-plugin-manifest.yaml`
-   and uploads it as a release asset next to the binaries.
+1. **Per platform** (`scripts/package_local.sh`, run in each matrix job
+   right after building): finds `orc-plugin-build-info` — a tiny
+   executable linked only against the SDK headers, built unconditionally
+   alongside the plugin (see `tools/plugin_build_info.cpp`) — and runs it.
+   It prints `plugin_id` / `plugin_version` / `stage_name` / `abi` /
+   `toolchain_tag` straight out of `kPluginDescriptor`, i.e. exactly what
+   that platform's just-built binary actually embeds, never re-derived by
+   a second, independent calculation that could drift from it. Combined
+   with the packaged file's own `sha256`, this becomes a complete,
+   valid, single-artifact `plugin-manifest-<platform>.yaml` — good enough
+   to publish as-is for a one-platform release — uploaded alongside the
+   binary. (Fragment names deliberately don't start with `orc-plugin_`, so
+   the release-asset glob in `publish-release` never picks them up.)
+2. **Once, in `publish-release`** (`scripts/merge_manifests.sh`): after
+   all three matrix jobs finish, combines their three fragments (each job
+   only sees its own platform) into the final `orc-plugin-manifest.yaml`
+   and uploads it as a release asset next to the binaries. Every matrix
+   job also self-checks this step on its own single fragment (the "Check
+   manifest fragment merges" CI step) so a bug in the merge script fails a
+   PR instead of only surfacing at release time.
 
 To regenerate one locally (e.g. to sanity-check the format after touching
 either script): build the plugin normally, then
 
 ```bash
-./build/hvd_print_build_info    # or build/Release/hvd_print_build_info.exe on Windows
-./scripts/gen_manifest_fragment.py --artifact dist/orc-plugin_hvd_chroma_decoder_linux.so \
-    --platform linux --build-info-exe ./build/hvd_print_build_info --out dist/manifest-fragment.json
-./scripts/merge_manifest_fragments.py "dist*/manifest-fragment.json" \
-    --plugin-version 0.2.0 --out orc-plugin-manifest.yaml
+./scripts/package_local.sh build dist
+# -> dist/orc-plugin_hvd_chroma_decoder_linux_abi<N>.so
+# -> dist/plugin-manifest-linux.yaml   (already a complete, valid manifest)
+
+# Merging one platform's fragment with itself, or with others you've built
+# separately, produces the same shape publish-release does:
+./scripts/merge_manifests.sh orc-plugin-manifest.yaml dist/plugin-manifest-linux.yaml
 ```
 
 ---

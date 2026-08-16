@@ -29,6 +29,9 @@ src/hvd_chroma_decoder_stage.*   the stage + its Y/C wrapper representation
 src/video_writer.*               real-container (.mkv/.mp4/pipe) export, SDK-free but plugin-only
 tests/                           SDK tests (stage/entrypoints)
 cmake/DecodeOrcPluginSDKHelpers.cmake   orc_add_stage_plugin()
+tools/plugin_build_info.cpp      release tooling: prints the compiled descriptor for scripts/package_local.sh
+scripts/package_local.sh         packages the binary + writes this platform's manifest fragment
+scripts/merge_manifests.sh       combines per-platform fragments into orc-plugin-manifest.yaml
 flake.nix                        Nix dev shell matching the host toolchain
 instructions.md                  in-app help
 

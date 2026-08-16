@@ -146,25 +146,28 @@ if(TARGET PkgConfig::HVD_FFMPEG)
 endif()
 
 # --- release tooling: print the actual compiled descriptor -------------------
-# Tiny standalone executable (SDK headers only, no hvd_core/FFTW) that prints
-# plugin_id/host_abi/toolchain_tag straight out of kPluginDescriptor for THIS
-# build. CI uses its output to fill orc-plugin-manifest.yaml so the ABI number
-# and toolchain tag can never drift from what the binary actually embeds —
-# see scripts/print_plugin_build_info.cpp and scripts/gen_manifest_fragment.py.
+# Build-info emitter for the release manifest (host ABI 12 and later).
+# Compiled with the same toolchain and SDK headers as the plugin, it prints
+# the descriptor's ABI version and toolchain tag so scripts/package_local.sh
+# can declare them in orc-plugin-manifest.yaml without guessing. Mirrors
+# orc-plugin_skeleton's tools/plugin_build_info.cpp target — same name,
+# same output shape, same RUNTIME_OUTPUT_DIRECTORY convention — so nothing
+# about how a release is assembled needs to be relearned per plugin.
 if(TARGET orc::plugin-sdk)
-    set(_hvd_sdk_target_for_tools orc::plugin-sdk)
-elseif(TARGET orc-plugin-sdk)
-    set(_hvd_sdk_target_for_tools orc-plugin-sdk)
+    set(_hvd_build_info_sdk_target orc::plugin-sdk)
+else()
+    set(_hvd_build_info_sdk_target orc-plugin-sdk)
 endif()
-if(_hvd_sdk_target_for_tools)
-    add_executable(hvd_print_build_info scripts/print_plugin_build_info.cpp)
-    target_link_libraries(hvd_print_build_info PRIVATE ${_hvd_sdk_target_for_tools})
-    target_include_directories(hvd_print_build_info PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    if(ORC_PLUGIN_VERSION)
-        target_compile_definitions(hvd_print_build_info PRIVATE
-            ORC_STAGE_PLUGIN_VERSION="${ORC_PLUGIN_VERSION}")
-    endif()
-endif()
+
+add_executable(orc-plugin-build-info tools/plugin_build_info.cpp)
+target_link_libraries(orc-plugin-build-info PRIVATE ${_hvd_build_info_sdk_target})
+target_include_directories(orc-plugin-build-info PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_definitions(orc-plugin-build-info PRIVATE
+    ORC_STAGE_PLUGIN_VERSION="${ORC_PLUGIN_VERSION}")
+set_target_properties(orc-plugin-build-info PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
 
 if(BUILD_TESTS)
     enable_testing()
