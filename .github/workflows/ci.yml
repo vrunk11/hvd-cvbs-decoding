@@ -148,34 +148,19 @@ jobs:
       # vcpkg into manifest mode, so the toolchain file below installs fftw3
       # (with the threads feature) and fmt during configure.
       #
-      # No explicit -G: left to CMake's own default generator selection, as
-      # in orc-plugin_skeleton and this repo's own prior CI, both of which
-      # have a track record of this working. An earlier revision pinned
-      # -G "Visual Studio 17 2022" -A x64 defensively after a run failed
-      # with "could not find any instance of Visual Studio" — but that
-      # explicit generator goes through the same VS-instance lookup CMake's
-      # default selection does, so it's unlikely to have been the actual
-      # cause; the more plausible suspect is the ~25-minute from-source
-      # vcpkg build the triplet below introduces (building FFmpeg under a
-      # less commonly exercised static triplet), which this repo hadn't
-      # run in CI before. Reverted to match what's proven to work; the
-      # toolchain-tag verification step further below is a real,
-      # evidence-based safety net for this regardless of generator choice.
-      #
-      # VCPKG_TARGET_TRIPLET=x64-windows-static-md: without an explicit
-      # triplet, vcpkg defaults to x64-windows (DYNAMIC) on this runner,
-      # which builds fftw3f/ffmpeg as separate DLLs the plugin links against
-      # at runtime. Since the release manifest and package_local.sh publish
-      # exactly one file per platform, those DLLs never ship with the
-      # release — a host that downloads only the plugin .dll then fails to
-      # LoadLibrary it (missing dependent DLLs), even though the file itself
-      # is fine. -static-md switches vcpkg's libraries to static (.lib,
-      # baked into the plugin .dll at link time) while keeping the DYNAMIC
-      # CRT (/MD, "release-crt") — matching what the host's own toolchain
-      # tag expects (the SDK's toolchain tag only distinguishes Debug/Release
-      # CRT, not static-vs-dynamic CRT linkage, so x64-windows-static's /MT
-      # would silently mismatch the host's /MD without the loader's own
-      # exact-string-match check ever catching it).
+      # No explicit -G and no explicit VCPKG_TARGET_TRIPLET: this is the exact
+      # configure line this repo built green with before, and the one
+      # orc-plugin_skeleton uses. An earlier revision added
+      # -DVCPKG_TARGET_TRIPLET=x64-windows-static-md to try to solve a
+      # *distribution* problem (the host reported "LoadLibrary failed" on an
+      # installed plugin, most likely because the release publishes a single
+      # .dll while a dynamic FFmpeg/FFTW build needs its own DLLs alongside).
+      # That triplet turned a working build into a failing one — a ~25 minute
+      # from-source FFmpeg build that then failed to link (65 unresolved
+      # Winsock/SChannel/MediaFoundation externals, plus an MSVCRTD/CRT
+      # conflict warning) — so it is reverted here: a build that doesn't
+      # produce an artifact can't fix a problem with how the artifact is
+      # distributed. See BUILD.md §3.1 for where that trade-off stands.
       - name: Configure (native)
         if: ${{ !matrix.use_nix }}
         run: >
@@ -183,7 +168,6 @@ jobs:
           -DORC_INTREE_SDK_DIR=${{ env.ORC_SDK_DIR }}
           -DBUILD_TESTS=ON
           -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
-          -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
 
       - name: Build (Nix)
         if: matrix.use_nix

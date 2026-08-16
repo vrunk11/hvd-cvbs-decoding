@@ -26,14 +26,6 @@ target_link_libraries(hvd_stage_smoke_test PRIVATE ${HVD_TEST_SDK_TARGET} hvd_co
 target_include_directories(hvd_stage_smoke_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 if(TARGET PkgConfig::HVD_FFMPEG)
     target_link_libraries(hvd_stage_smoke_test PRIVATE PkgConfig::HVD_FFMPEG)
-    # See HVD_FFMPEG_WIN32_SYSLIBS in ../CMakeLists.txt: linked directly here
-    # too, not just on the plugin target, for the same reason — a static
-    # FFmpeg needs these on every final link that pulls it in, and this test
-    # links video_writer.cpp (and therefore FFmpeg) directly, independent of
-    # the plugin .dll.
-    if(HVD_FFMPEG_WIN32_SYSLIBS)
-        target_link_libraries(hvd_stage_smoke_test PRIVATE ${HVD_FFMPEG_WIN32_SYSLIBS})
-    endif()
 endif()
 add_test(NAME hvd_stage_smoke_test COMMAND hvd_stage_smoke_test)
 
@@ -47,8 +39,5 @@ target_link_libraries(hvd_plugin_entrypoints_test PRIVATE ${HVD_TEST_SDK_TARGET}
 target_include_directories(hvd_plugin_entrypoints_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 if(TARGET PkgConfig::HVD_FFMPEG)
     target_link_libraries(hvd_plugin_entrypoints_test PRIVATE PkgConfig::HVD_FFMPEG)
-    if(HVD_FFMPEG_WIN32_SYSLIBS)
-        target_link_libraries(hvd_plugin_entrypoints_test PRIVATE ${HVD_FFMPEG_WIN32_SYSLIBS})
-    endif()
 endif()
 add_test(NAME hvd_plugin_entrypoints_test COMMAND hvd_plugin_entrypoints_test)

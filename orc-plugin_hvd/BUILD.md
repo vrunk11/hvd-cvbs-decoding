@@ -124,29 +124,29 @@ git -C C:\src\decode-orc checkout v2.0.0
 cmake -S . -B build `
     -DORC_INTREE_SDK_DIR=C:/src/decode-orc `
     -DBUILD_TESTS=ON `
-    -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
-    -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+    -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release --parallel
 ctest --test-dir build --output-on-failure -C Release
 ```
 
 Notes:
-* **`-DVCPKG_TARGET_TRIPLET=x64-windows-static-md` is not optional.**
-  Without it, vcpkg defaults to `x64-windows` (dynamic): `fftw3f` and
-  FFmpeg build as separate DLLs the plugin links against at runtime. The
-  release manifest and `scripts/package_local.sh` publish exactly **one
-  file** per platform, so those DLLs never ship with the release — a host
-  that downloads only the plugin `.dll` fails to `LoadLibrary` it (missing
-  dependent DLLs), even though the file itself built and packaged fine.
-  `-static-md` bakes `fftw3f`/FFmpeg into the plugin `.dll` at link time
-  (no external DLLs to distribute) while keeping the **dynamic** CRT
-  (`/MD`, "release-crt") — matching what the host's toolchain tag expects.
-  Do **not** use plain `x64-windows-static`: that switches to the *static*
-  CRT (`/MT`), and the SDK's toolchain tag only distinguishes Debug/Release
-  CRT, not static-vs-dynamic linkage — a `/MT` plugin loaded by a `/MD` host
-  would pass the tag's exact-string check and then hit real, harder-to-diagnose
-  cross-CRT ABI problems (separate heaps, iostream state, etc.) instead of
-  being cleanly rejected at load time.
+* **Known open issue — installing a released Windows build.** vcpkg's
+  default triplet here is `x64-windows` (**dynamic**), so `fftw3f` and FFmpeg
+  build as separate DLLs this plugin links against at runtime. That is fine
+  for local development (the DLLs sit next to the build), but the release
+  manifest and `scripts/package_local.sh` publish exactly **one file** per
+  platform, so those DLLs do not ship with the release — and a host that
+  downloads only the plugin `.dll` has been observed reporting
+  `LoadLibrary failed` when loading it. An attempt to fix this by switching
+  to `-DVCPKG_TARGET_TRIPLET=x64-windows-static-md` (static FFmpeg/FFTW baked
+  into the plugin `.dll`) was **reverted**: it failed to link — 65 unresolved
+  Winsock/SChannel/MediaFoundation externals plus an `MSVCRTD` CRT-conflict
+  warning — and adding the corresponding Windows system import libs
+  (`ws2_32 secur32 crypt32 ncrypt bcrypt mfplat mfuuid strmiids`) did not
+  resolve it either. The build line above is the one this repo is known to
+  build green with, and is kept for that reason; the distribution side of
+  this remains unsolved and is tracked separately from the build. Local
+  MinGW builds loaded into a self-built MinGW host (§3.2) are unaffected.
 * **Dependencies are declared in `vcpkg.json`** (manifest mode):
   `fftw3` with the `threads` feature, `fmt` for the SDK headers, and
   `ffmpeg` (avcodec/avformat/swscale) for the .mkv/.mp4/pipe export
@@ -252,10 +252,10 @@ Two-stage pipeline:
    * checks out this repository **with submodules** (`hvd-core`
      included) plus `simoninns/decode-orc` at `ORC_SDK_REF`;
    * `ubuntu-latest` + `macos-latest` via **Nix** (toolchain-tag
-     correctness), `windows-latest` via **MSVC + vcpkg manifest**
-     (`x64-windows-static-md`, see §3.1) — no explicit CMake generator,
-     same as `orc-plugin_skeleton` and this repo's own prior CI, both
-     with a track record of this working;
+     correctness), `windows-latest` via **MSVC + vcpkg manifest** (default
+     dynamic triplet, see §3.1) — no explicit CMake generator and no
+     explicit triplet, same as `orc-plugin_skeleton` and this repo's own
+     prior CI, both with a track record of this working;
    * verifies the SDK headers exist, enforces the SDK boundary
      (`scripts/check_sdk_boundary.sh`);
    * configures this directory (`hvd-core` is picked up automatically
@@ -347,17 +347,19 @@ either script): build the plugin normally, then
 ## 6. Troubleshooting
 
 * **Host shows "Stage Plugin Errors" / "LoadLibrary failed" for the
-  downloaded `.dll`** — almost always missing dependent DLLs, not a bad
-  download. The release manifest and `package_local.sh` publish exactly one
-  file per platform; if the Windows build wasn't configured with
-  `-DVCPKG_TARGET_TRIPLET=x64-windows-static-md` (§3.1), `fftw3f` and
-  FFmpeg link as separate DLLs that never ship with that single file, and
+  downloaded `.dll`** — known open issue, see the first note in §3.1. The
+  release publishes a single file per platform, while the Windows build
+  links `fftw3f`/FFmpeg dynamically, so their DLLs are not shipped and
   `LoadLibrary` fails as soon as the host tries to resolve them — well
   before the toolchain-tag check even runs, so this happens even with an
-  otherwise-correct MSVC build. Confirm with a dependency viewer (e.g.
+  otherwise-correct MSVC build. Confirm which DLL is missing with a
+  dependency viewer (e.g.
   [Dependencies](https://github.com/lucasg/Dependencies)) or, from an MSYS2
-  shell, `ldd path\to\the.dll`. Fix: rebuild with the triplet above and
-  re-tag/re-release.
+  shell, `ldd path\to\the.dll`. Switching vcpkg to a static triplet was
+  tried and reverted (it broke the build — §3.1 has the detail), so there
+  is no one-line fix yet. Workaround for local use: build the plugin
+  yourself (§3.1 for an MSVC host, §3.2 for a MinGW one), where the
+  dependency DLLs are present next to the build.
 * **"hvd-core not found at '...'"** — you forgot
   `git submodule update --init --recursive`, or you're building from a
   tarball/zip download that doesn't carry submodules (GitHub's
