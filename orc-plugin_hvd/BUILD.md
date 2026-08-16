@@ -243,9 +243,10 @@ Two-stage pipeline:
    * checks out this repository **with submodules** (`hvd-core`
      included) plus `simoninns/decode-orc` at `ORC_SDK_REF`;
    * `ubuntu-latest` + `macos-latest` via **Nix** (toolchain-tag
-     correctness), `windows-latest` via **MSVC** (`-G "Visual Studio 17
-     2022" -A x64`, explicit — not left to CMake's default-generator
-     guess) **+ vcpkg manifest** (`x64-windows-static-md`, see §3.1);
+     correctness), `windows-latest` via **MSVC + vcpkg manifest**
+     (`x64-windows-static-md`, see §3.1) — no explicit CMake generator,
+     same as `orc-plugin_skeleton` and this repo's own prior CI, both
+     with a track record of this working;
    * verifies the SDK headers exist, enforces the SDK boundary
      (`scripts/check_sdk_boundary.sh`);
    * configures this directory (`hvd-core` is picked up automatically
