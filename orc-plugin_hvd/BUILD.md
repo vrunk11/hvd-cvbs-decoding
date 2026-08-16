@@ -130,23 +130,23 @@ ctest --test-dir build --output-on-failure -C Release
 ```
 
 Notes:
-* **Known open issue — installing a released Windows build.** vcpkg's
-  default triplet here is `x64-windows` (**dynamic**), so `fftw3f` and FFmpeg
-  build as separate DLLs this plugin links against at runtime. That is fine
-  for local development (the DLLs sit next to the build), but the release
-  manifest and `scripts/package_local.sh` publish exactly **one file** per
-  platform, so those DLLs do not ship with the release — and a host that
-  downloads only the plugin `.dll` has been observed reporting
-  `LoadLibrary failed` when loading it. An attempt to fix this by switching
-  to `-DVCPKG_TARGET_TRIPLET=x64-windows-static-md` (static FFmpeg/FFTW baked
-  into the plugin `.dll`) was **reverted**: it failed to link — 65 unresolved
-  Winsock/SChannel/MediaFoundation externals plus an `MSVCRTD` CRT-conflict
-  warning — and adding the corresponding Windows system import libs
-  (`ws2_32 secur32 crypt32 ncrypt bcrypt mfplat mfuuid strmiids`) did not
-  resolve it either. The build line above is the one this repo is known to
-  build green with, and is kept for that reason; the distribution side of
-  this remains unsolved and is tracked separately from the build. Local
-  MinGW builds loaded into a self-built MinGW host (§3.2) are unaffected.
+* **`builtin-baseline` in `vcpkg.json` must stay aligned with the host's.**
+  This plugin links `fftw3` and FFmpeg dynamically, and does *not* ship
+  their DLLs — the release publishes a single `.dll` per platform. That
+  works because the decode-orc host already bundles both (its own
+  `vcpkg.json` depends on `fftw3` and `ffmpeg`, and its Windows packaging
+  copies every vcpkg DLL into `bin/`), so the plugin resolves them out of
+  the host's own directory at load time.
+  What it depends on is getting the **same versions**: FFmpeg's DLLs carry
+  their soversion in the filename (`avcodec-61.dll`, `avcodec-62.dll`, ...),
+  so a plugin built against a newer FFmpeg than the host's asks for a
+  filename the host does not ship, and `LoadLibrary` fails — no matter
+  where the `.dll` is placed, including directly in the host's own
+  `bin/orc-stage-plugins/`. Pinning the same `builtin-baseline` the host
+  pins (`e5a1490e1409d175932ef6014519e9ae149ddb7c`) is what keeps the two
+  in step; without it vcpkg resolves whatever version its registry happens
+  to be at when CI runs. **When the host bumps its baseline, bump this one
+  to match** and re-release.
 * **Dependencies are declared in `vcpkg.json`** (manifest mode):
   `fftw3` with the `threads` feature, `fmt` for the SDK headers, and
   `ffmpeg` (avcodec/avformat/swscale) for the .mkv/.mp4/pipe export
@@ -347,19 +347,19 @@ either script): build the plugin normally, then
 ## 6. Troubleshooting
 
 * **Host shows "Stage Plugin Errors" / "LoadLibrary failed" for the
-  downloaded `.dll`** — known open issue, see the first note in §3.1. The
-  release publishes a single file per platform, while the Windows build
-  links `fftw3f`/FFmpeg dynamically, so their DLLs are not shipped and
-  `LoadLibrary` fails as soon as the host tries to resolve them — well
-  before the toolchain-tag check even runs, so this happens even with an
-  otherwise-correct MSVC build. Confirm which DLL is missing with a
-  dependency viewer (e.g.
-  [Dependencies](https://github.com/lucasg/Dependencies)) or, from an MSYS2
-  shell, `ldd path\to\the.dll`. Switching vcpkg to a static triplet was
-  tried and reverted (it broke the build — §3.1 has the detail), so there
-  is no one-line fix yet. Workaround for local use: build the plugin
-  yourself (§3.1 for an MSVC host, §3.2 for a MinGW one), where the
-  dependency DLLs are present next to the build.
+  plugin `.dll`** — a dependent DLL can't be resolved. Note this fails
+  identically whether the plugin sits in the Plugin Manager's cache or is
+  copied by hand into `Program Files\Decode-Orc\bin\orc-stage-plugins\`,
+  which is the tell: it is not about *where* the file is, it is about which
+  DLL names it asks for. The most likely cause is a vcpkg version skew —
+  see the `builtin-baseline` note in §3.1: the host bundles `fftw3` and
+  FFmpeg in its `bin/`, but a plugin built against a *newer* FFmpeg asks
+  for e.g. `avcodec-62.dll` where the host only ships `avcodec-61.dll`.
+  Diagnose by listing what the `.dll` actually imports — a dependency
+  viewer such as [Dependencies](https://github.com/lucasg/Dependencies), or
+  `ldd path\to\the.dll` from an MSYS2 shell — and compare those names
+  against what is present in `Program Files\Decode-Orc\bin\`. Fix: align
+  `builtin-baseline` with the host's and re-release.
 * **"hvd-core not found at '...'"** — you forgot
   `git submodule update --init --recursive`, or you're building from a
   tarball/zip download that doesn't carry submodules (GitHub's
