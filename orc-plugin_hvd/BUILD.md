@@ -41,7 +41,8 @@ and C++ standard library must match exactly. Practical consequences:
   default gcc matches the host's by construction. Building with your
   distro's gcc will *compile* fine and then be rejected at load time.
 * On Windows, use the same MSVC major version the host release was
-  built with.
+  built with (§3.1) — or MinGW-w64 (§3.2) *only* if you're loading into
+  a MinGW-built host of your own, not an official release.
 * When the host moves (e.g. v2.0.0 → v2.1.0), bump `ORC_SDK_REF` in
   `.github/workflows/ci.yml` and re-check `flake.lock` against the
   host's — a nixpkgs generation change means a new gcc means a new tag.
@@ -106,8 +107,13 @@ from release packages, use 2.2.
 
 ## 3. Windows
 
-MSVC + vcpkg, matching the CI. From a *x64 Native Tools* prompt (or any
-shell with VS 2022's cl on PATH):
+Two supported paths: MSVC (what the official decode-orc releases and this
+plugin's own CI use) and MinGW-w64. **They are not interchangeable outputs**
+— see the toolchain-tag warning at the end of 3.2 before reaching for MinGW.
+
+### 3.1 MSVC + vcpkg (matches the official CI/host)
+
+From a *x64 Native Tools* prompt (or any shell with VS 2022's cl on PATH):
 
 ```powershell
 git submodule update --init --recursive
@@ -145,9 +151,42 @@ Notes:
 * Engine-only also works on Windows: `cd ..\hvd-core` and configure
   that directory directly (see 2.1) instead of this one — no
   `-DORC_…` options, no decode-orc checkout.
-* MinGW-w64 builds work (the CMake handles the OpenMP link-flag quirk
-  explicitly — see the long comment in `../hvd-core/CMakeLists.txt`),
-  but remember rule 1: the host must be MinGW-built too.
+
+### 3.2 MinGW-w64 + vcpkg (`x64-mingw-dynamic`)
+
+Also supported — the CMake already handles the OpenMP link-flag quirk for
+GCC/Clang explicitly (see the long comment in `../hvd-core/CMakeLists.txt`),
+and MinGW is GCC, so it takes the same branch as Linux there. From an MSYS2
+MinGW64 shell (or any shell with a MinGW-w64 g++ on PATH):
+
+```bash
+git submodule update --init --recursive
+
+cmake -S . -B build -G "MinGW Makefiles" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DORC_INTREE_SDK_DIR="C:/path/to/decode-orc" \
+    -DCMAKE_TOOLCHAIN_FILE="C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+    -DVCPKG_TARGET_TRIPLET=x64-mingw-dynamic
+cmake --build build --parallel
+```
+
+Any local `vcpkg` checkout works for `-DCMAKE_TOOLCHAIN_FILE` — it doesn't
+need to live inside your `decode-orc` checkout, that's just one convenient
+place to keep it if you're already cloning both. `vcpkg.json` manifest mode
+installs `x64-mingw-dynamic` builds of `fftw3`/`fmt`/`ffmpeg` the same way it
+does `x64-windows` ones for MSVC; no extra flags needed beyond the triplet.
+
+> **This produces a binary the official decode-orc Windows releases will
+> reject at load time.** The decode-orc project distributes an **MSVC**-built
+> host on Windows (`arch: win64_msvc2022_64` in its own release CI), so its
+> toolchain tag is `msvc19/msvc-stl/release-crt`. A MinGW build's tag is
+> `gcc<N>/libstdc++` — same shape as a Linux build, different from any MSVC
+> host — and the loader requires an **exact** string match (rule 1 above). A
+> MinGW build here is genuinely useful for local development (compiling,
+> `ctest`, iterating on `hvd-core`/the stage without wrestling with MSVC), but
+> don't package or publish it as a release asset unless you are *also*
+> building and distributing your own MinGW-built `decode-orc` host to load it
+> — which is not what the official project ships.
 
 ---
 
@@ -190,16 +229,63 @@ Two-stage pipeline:
    * configures this directory (`hvd-core` is picked up automatically
      at `../hvd-core`), builds, runs the full ctest suite, packages the
      artifact per platform (`scripts/package_local.sh` on POSIX, DLL
-     harvest on Windows), uploads `plugin-{linux,macos,windows}`.
-3. **`publish-release`** — on `v*` tags, attaches all packaged
-   artifacts to the GitHub release. The plugin version is derived from
-   the tag automatically.
+     harvest on Windows);
+   * generates that platform's fragment of the release manifest
+     (`scripts/gen_manifest_fragment.py`, see below), then uploads
+     `plugin-{linux,macos,windows}` (binary + fragment together).
+3. **`publish-release`** — on `v*` tags: merges the three platforms'
+   manifest fragments into `orc-plugin-manifest.yaml`
+   (`scripts/merge_manifest_fragments.py`) and attaches it, alongside
+   all packaged binaries, to the GitHub release. The plugin version is
+   derived from the tag automatically, on both the descriptor and the
+   manifest.
 
 To release: `git tag v0.2.0 && git push origin v0.2.0`. To track a new
 host version: bump `ORC_SDK_REF`, and if the host's flake moved to a
 new nixpkgs generation, update this repo's `flake.lock` to match (rule
 1 again). To track a new `hvd-core` version: bump the submodule commit
 (`cd hvd-core && git pull && cd .. && git add hvd-core && git commit`).
+
+### The release manifest (`orc-plugin-manifest.yaml`)
+
+Every release the decode-orc curated plugin index can offer needs this file:
+it declares, per platform, the exact binary filename, the host ABI it was
+built against, its toolchain tag, and a sha256 digest — without it the host
+refuses to browse, install, or update to the release. See
+[Plugin Publishing Guide §3](https://github.com/simoninns/decode-orc/blob/main/docs/technical/plugin-publishing.md)
+in the decode-orc repo for the full rationale and schema.
+
+**Never hand-write or hand-edit this file.** Every field on it (`abi`,
+`toolchain_tag`, `sha256`) is either build-environment-dependent or
+binary-dependent, and a value that's wrong or stale is *worse* than a missing
+one — it tells a host the wrong thing about a binary it hasn't inspected yet.
+It's generated fully automatically, in two steps, exactly so no one has to
+keep a hand-maintained ABI number in sync with the SDK:
+
+1. **Per platform** (`scripts/gen_manifest_fragment.py`, run in each matrix
+   job right after packaging): builds `hvd_print_build_info`, a tiny
+   executable linked only against the SDK headers, which prints
+   `plugin_id` / `host_abi` / `toolchain_tag` straight out of
+   `kPluginDescriptor` — i.e. exactly what that platform's just-built binary
+   actually embeds, never re-derived by a second, independent calculation
+   that could drift from it. Combined with a `sha256` of the packaged file,
+   this becomes that platform's `manifest-fragment.json`, uploaded alongside
+   the binary.
+2. **Once, in `publish-release`** (`scripts/merge_manifest_fragments.py`):
+   after all three matrix jobs finish, combines their three fragments (each
+   job only sees its own platform) into the final `orc-plugin-manifest.yaml`
+   and uploads it as a release asset next to the binaries.
+
+To regenerate one locally (e.g. to sanity-check the format after touching
+either script): build the plugin normally, then
+
+```bash
+./build/hvd_print_build_info    # or build/Release/hvd_print_build_info.exe on Windows
+./scripts/gen_manifest_fragment.py --artifact dist/orc-plugin_hvd_chroma_decoder_linux.so \
+    --platform linux --build-info-exe ./build/hvd_print_build_info --out dist/manifest-fragment.json
+./scripts/merge_manifest_fragments.py "dist*/manifest-fragment.json" \
+    --plugin-version 0.2.0 --out orc-plugin-manifest.yaml
+```
 
 ---
 

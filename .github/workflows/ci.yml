@@ -194,7 +194,49 @@ jobs:
           if (-not $candidate) { throw 'Could not locate built plugin DLL' }
           Copy-Item $candidate.FullName "dist/orc-plugin_hvd_chroma_decoder_windows.dll"
 
+      # Fragment of orc-plugin-manifest.yaml for THIS platform: plugin_id,
+      # host_abi and toolchain_tag come straight out of the just-built
+      # binary's own descriptor (hvd_print_build_info), never re-derived —
+      # see scripts/gen_manifest_fragment.py. publish-release merges the
+      # three platforms' fragments into the final manifest once all matrix
+      # jobs have finished (they can't see each other's output directly).
+      - name: Generate manifest fragment (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          build_info_exe="$(find build -type f -name 'hvd_print_build_info' | head -n1)"
+          if [ -z "$build_info_exe" ]; then
+            echo "::error::hvd_print_build_info executable not found under build/"
+            find build -maxdepth 3
+            exit 1
+          fi
+          chmod +x "$build_info_exe"
+          artifact="$(find dist -type f \( -name '*.so' -o -name '*.dylib' \) | head -n1)"
+          python3 scripts/gen_manifest_fragment.py \
+            --artifact "$artifact" \
+            --platform ${{ matrix.platform }} \
+            --build-info-exe "$build_info_exe" \
+            --out dist/manifest-fragment.json
+
+      - name: Generate manifest fragment (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $buildInfoExe = Get-ChildItem -Path build -Recurse -File -Filter "hvd_print_build_info.exe" | Select-Object -First 1
+          if (-not $buildInfoExe) {
+            Write-Host "::error::hvd_print_build_info.exe not found under build/"
+            Get-ChildItem -Path build -Recurse -File -Filter "*.exe" | ForEach-Object { Write-Host " - $($_.FullName)" }
+            throw 'hvd_print_build_info.exe not found'
+          }
+          & $buildInfoExe.FullName | Out-File -FilePath build-info.txt -Encoding utf8
+          python scripts/gen_manifest_fragment.py `
+            --artifact dist/orc-plugin_hvd_chroma_decoder_windows.dll `
+            --platform windows `
+            --build-info-text build-info.txt `
+            --out dist/manifest-fragment.json
+
       # `uses:` steps ignore working-directory, hence the explicit prefix.
+      # dist/manifest-fragment.json (generated above) rides along with the
+      # binary in the same upload.
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
@@ -206,12 +248,33 @@ jobs:
     needs: build-test-package
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        # Only need scripts/merge_manifest_fragments.py here — no submodules,
+        # no SDK, nothing built in this job.
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
+      # Every platform's dist/ carries a manifest-fragment.json (written by
+      # gen_manifest_fragment.py in build-test-package); this is the one
+      # place all three come together. plugin_version is the tag with its
+      # leading 'v' stripped, matching ORC_PLUGIN_VERSION's own derivation
+      # in CMakeLists.txt so the manifest and the descriptor never disagree.
+      - name: Generate orc-plugin-manifest.yaml
+        run: |
+          plugin_version="${GITHUB_REF_NAME#v}"
+          python3 orc-plugin_hvd/scripts/merge_manifest_fragments.py \
+            "artifacts/**/manifest-fragment.json" \
+            --plugin-version "$plugin_version" \
+            --out orc-plugin-manifest.yaml
+          cat orc-plugin-manifest.yaml
+
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/orc-plugin_hvd_chroma_decoder_*
+          files: |
+            artifacts/**/orc-plugin_hvd_chroma_decoder_*
+            orc-plugin-manifest.yaml

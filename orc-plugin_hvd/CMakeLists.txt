@@ -145,6 +145,27 @@ if(TARGET PkgConfig::HVD_FFMPEG)
     target_link_libraries(${HVD_PLUGIN_TARGET} PRIVATE PkgConfig::HVD_FFMPEG)
 endif()
 
+# --- release tooling: print the actual compiled descriptor -------------------
+# Tiny standalone executable (SDK headers only, no hvd_core/FFTW) that prints
+# plugin_id/host_abi/toolchain_tag straight out of kPluginDescriptor for THIS
+# build. CI uses its output to fill orc-plugin-manifest.yaml so the ABI number
+# and toolchain tag can never drift from what the binary actually embeds —
+# see scripts/print_plugin_build_info.cpp and scripts/gen_manifest_fragment.py.
+if(TARGET orc::plugin-sdk)
+    set(_hvd_sdk_target_for_tools orc::plugin-sdk)
+elseif(TARGET orc-plugin-sdk)
+    set(_hvd_sdk_target_for_tools orc-plugin-sdk)
+endif()
+if(_hvd_sdk_target_for_tools)
+    add_executable(hvd_print_build_info scripts/print_plugin_build_info.cpp)
+    target_link_libraries(hvd_print_build_info PRIVATE ${_hvd_sdk_target_for_tools})
+    target_include_directories(hvd_print_build_info PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(ORC_PLUGIN_VERSION)
+        target_compile_definitions(hvd_print_build_info PRIVATE
+            ORC_STAGE_PLUGIN_VERSION="${ORC_PLUGIN_VERSION}")
+    endif()
+endif()
+
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
