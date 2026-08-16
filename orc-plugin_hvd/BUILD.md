@@ -168,6 +168,15 @@ Notes:
 * Statically linking FFmpeg (LGPL) into this GPL-3.0-or-later plugin is
   fine license-wise — GPL is strictly stronger than what LGPL requires
   here, so no separate relinking/object-file obligation is triggered.
+* A static FFmpeg pulls in the Windows SDK import libs it would otherwise
+  resolve against its own DLL boundary (`ws2_32`, `secur32`, `crypt32`,
+  `ncrypt`, `bcrypt`, `mfplat`, `mfuuid`, `strmiids` — Winsock, SChannel/TLS,
+  CNG/CryptoAPI, and Media Foundation, all pulled in transitively even
+  though this plugin uses none of it directly, by object files that DO
+  build in for the codecs/muxers it does use). `CMakeLists.txt` links
+  these into `PkgConfig::HVD_FFMPEG` on `WIN32` unconditionally; if you see
+  `LNK2019 unresolved external symbol` for anything Winsock/Cert/NCrypt/MF
+  after touching that block, it's this list that grew stale.
 * Engine-only also works on Windows: `cd ..\hvd-core` and configure
   that directory directly (see 2.1) instead of this one — no
   `-DORC_…` options, no decode-orc checkout.

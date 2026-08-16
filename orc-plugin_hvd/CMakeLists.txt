@@ -122,6 +122,50 @@ endif()
 # else: pkg_check_modules(... IMPORTED_TARGET) already created
 # PkgConfig::HVD_FFMPEG for us.
 
+# --- Windows: system import libs FFmpeg's static libs need but don't carry --
+# Only surfaces with a *static* FFmpeg (vcpkg's x64-windows-static-md triplet,
+# see the VCPKG_TARGET_TRIPLET comment in the Windows CI job / BUILD.md §3.1):
+# a dynamic FFmpeg build resolves these against its own DLL boundary, but a
+# static .lib expects the FINAL link (this plugin's .dll, and each test
+# executable) to supply them.
+#
+# Deliberately linked DIRECTLY onto every consumer below (the plugin AND both
+# test executables) rather than folded into PkgConfig::HVD_FFMPEG's own
+# INTERFACE_LINK_LIBRARIES: an earlier revision did exactly that (appending
+# via `target_link_libraries(PkgConfig::HVD_FFMPEG INTERFACE ...)`) and it
+# did not reach the final link on a real CI run — these system libs never
+# made it into any of the three .vcxproj files' AdditionalDependencies, for
+# reasons that didn't reproduce locally (no Windows/MSVC available to step
+# through), most likely something about how that particular imported
+# target's properties get consumed through orc_add_stage_plugin's own
+# target_link_libraries call and/or through tests/CMakeLists.txt's own
+# separate scope. Linking each name directly onto the real, final targets
+# removes that indirection entirely rather than continuing to debug it
+# blind — see HVD_FFMPEG_WIN32_SYSLIBS below, consumed by both this file and
+# tests/CMakeLists.txt.
+#
+# Windows SDK import libs, so nothing extra to install; each entry is the
+# Windows subsystem covering the linker errors that route without it:
+#   ws2_32   — Winsock2: every socket call in libavformat/network.c (RTP/
+#              RTSP/TCP/UDP support), even though this plugin never opens a
+#              network stream — the object file that DOES gets pulled in for
+#              the codecs/muxers this plugin actually uses.
+#   secur32  — SChannel/SSPI: libavformat's TLS backend (tls_schannel.c).
+#   crypt32, ncrypt, bcrypt — CNG/CryptoAPI: certificate and RNG calls the
+#              same TLS backend uses (self-signed cert generation, secure
+#              random for av_get_random_seed).
+#   mfplat, mfuuid, strmiids — Media Foundation: avcodec's optional
+#              hardware-encoder wrapper (mfenc.c) is compiled in even
+#              though this plugin doesn't select it, and pulls in this
+#              trio's interface GUIDs (IID_ICodecAPI, IID_IMFTransform,
+#              ...) — matches the exact set FFmpeg's own Windows/MSVC
+#              build docs list for --enable-mediafoundation.
+if(WIN32)
+    set(HVD_FFMPEG_WIN32_SYSLIBS ws2_32 secur32 crypt32 ncrypt bcrypt mfplat mfuuid strmiids)
+else()
+    set(HVD_FFMPEG_WIN32_SYSLIBS "")
+endif()
+
 # --- the plugin ---------------------------------------------------------------
 set(HVD_PLUGIN_TARGET "orc-stage-plugin-hvd-chroma-decoder")
 
@@ -143,6 +187,9 @@ target_include_directories(${HVD_PLUGIN_TARGET} PRIVATE
 
 if(TARGET PkgConfig::HVD_FFMPEG)
     target_link_libraries(${HVD_PLUGIN_TARGET} PRIVATE PkgConfig::HVD_FFMPEG)
+    if(HVD_FFMPEG_WIN32_SYSLIBS)
+        target_link_libraries(${HVD_PLUGIN_TARGET} PRIVATE ${HVD_FFMPEG_WIN32_SYSLIBS})
+    endif()
 endif()
 
 # --- release tooling: print the actual compiled descriptor -------------------
