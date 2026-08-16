@@ -3,21 +3,40 @@
 Map between the Python/NumPy reference (`reference/`, a copy of hvd-decode) and
 this C++ plugin: what was ported, what was deferred, and how it was verified.
 
+> **Repo layout note:** the pieces this document maps between now live in
+> three different places, not all under this plugin directory:
+> - the SDK-free engine — `engine/*` and `frame_bridge.*` below — is in the
+>   [`hvd-core`](../../hvd-core) submodule: `hvd-core/src/engine/*`,
+>   `hvd-core/src/frame_bridge.*`, `hvd-core/tests/engine/`.
+> - the Python reference — `reference/*` below — is under the `research/`
+>   directory at the repository root: [`../../research/reference`](../../research/reference)
+>   (and `../../research/reference-pal`), since both are pinned snapshots
+>   derived from the live `research/` package, not a separate thing from it.
+> - only `src/hvd_chroma_decoder_stage.*` and `src/plugin.cpp` (the two
+>   SDK-dependent files) still live in this plugin directory.
+>
+> The split happened after most of this document was written, and it
+> follows exactly the boundary the "Shape of the port" table below already
+> drew — read every bare `engine/...`, `src/frame_bridge.*` or
+> `tests/engine/...` below as relative to `hvd-core/`, and every bare
+> `reference/...` as relative to `research/` at the repository root.
+
 ## 1. Shape of the port
 
 The reference is NumPy; decode-orc plugins are compiled C++ (C++17, Google
 style) loaded as `orc-stage-plugin-*` shared objects. So the port has two
-layers, kept strictly separate:
+layers, kept strictly separate — and, since this split, physically separate
+too:
 
 ```
-src/engine/*        numerical core        — no decode-orc dependency
-src/frame_bridge.*  CVBS<->IRE<->engine    — no decode-orc dependency
+hvd-core/src/engine/*        numerical core        — no decode-orc dependency
+hvd-core/src/frame_bridge.*  CVBS<->IRE<->engine    — no decode-orc dependency
 src/hvd_chroma_decoder_stage.*  stage + wrapper representation (SDK)
 src/plugin.cpp      descriptor + entrypoints (SDK macros)
 ```
 
 `hvd_core` (engine + bridge) links only FFTW and is unit-tested without the
-host. Only two files depend on the SDK.
+host — see `hvd-core/README.md`. Only two files depend on the SDK.
 
 ## 2. Verified against the real SDK
 

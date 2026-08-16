@@ -1,1 +1,9 @@
-/orc-plugin_hvd/reference/hvd/__pycache__
+# hvd-core is a git submodule (see .gitmodules); its own .gitignore covers
+# build artifacts and __pycache__ inside it.
+build/
+build-*/
+dist/
+.vscode/
+*.user
+*.swp
+*.swo

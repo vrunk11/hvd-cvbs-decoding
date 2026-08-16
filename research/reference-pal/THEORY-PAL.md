@@ -495,9 +495,11 @@ promised unexpected ideas, ordered by likely value:
 ## 7d. Port status: what reached the C++ engine
 
 This package is the ORACLE for the C++ implementation in
-`orc-plugin_hvd/src/engine/`, not a parallel product. Cross-reference,
-so neither side drifts silently (the authoritative table, kept with the
-code, is `orc-plugin_hvd/docs/PAL.md`):
+`hvd-core/src/engine/` (formerly `orc-plugin_hvd/src/engine/`, before the
+engine was split into its own `hvd-core` submodule — see the repository
+root README), not a parallel product. Cross-reference, so neither side
+drifts silently (the authoritative table, kept with the code, is
+`hvd-core/docs/PAL.md`, formerly `orc-plugin_hvd/docs/PAL.md`):
 
 Ported and live in the plugin: the effective carrier, the swinging-burst
 joint phase+parity lock-in, temporal offsets to f+/-4, the PAL-swept

@@ -2,7 +2,7 @@
 
 The engine now decodes 625-line PAL (B/G/I/D, fsc = 4.43361875 MHz)
 alongside NTSC. The port follows the finding that closed the PAL
-research phase (reference-pal/THEORY-PAL.md 7c #6): **the whole engine
+research phase (`research/reference-pal/THEORY-PAL.md` 7c #6): **the whole engine
 is generic in the effective carrier** — NTSC is the special case
 c = exp(i*phi); PAL folds the V-switch into c:
 
@@ -98,7 +98,7 @@ checked against the real SDK headers:
 
 ## What is ported from the research, and what is not
 
-The Python reference (`reference-pal/`) is the oracle; not all of it is
+The Python reference (`research/reference-pal/`) is the oracle; not all of it is
 decoder functionality. Current state:
 
 | Research feature | C++ | Note |

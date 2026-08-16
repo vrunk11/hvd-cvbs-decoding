@@ -24,23 +24,26 @@ permissions:
   contents: write
 
 jobs:
-  # Fast hermetic job: numerical core + engine tests only (no decode-orc
-  # SDK checkout, no Nix). Catches engine regressions — including the PAL
-  # lock-in / effective-carrier tests — in ~2 minutes, before the full
-  # matrix spends its time. Needs only cmake + g++ + fftw3f.
+  # Fast hermetic job: the hvd-core decoder engine's own test suite, built
+  # standalone from the hvd-core/ submodule (no decode-orc SDK checkout, no
+  # Nix, no plugin). Catches engine regressions — including the PAL lock-in /
+  # effective-carrier tests — in ~2 minutes, before the full matrix spends
+  # its time. Needs only cmake + g++ + fftw3f.
   engine-tests:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: orc-plugin_hvd
+        working-directory: hvd-core
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install FFTW (single precision)
         run: sudo apt-get update && sudo apt-get install -y libfftw3-dev cmake ninja-build
 
-      - name: Configure (engine only)
-        run: cmake -S . -B build-engine -G Ninja -DHVD_ENGINE_ONLY=ON -DBUILD_TESTS=ON
+      - name: Configure
+        run: cmake -S . -B build-engine -G Ninja -DHVD_CORE_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build-engine --parallel
@@ -84,6 +87,8 @@ jobs:
     steps:
       - name: Checkout plugin
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Checkout decode-orc host repository
         uses: actions/checkout@v4

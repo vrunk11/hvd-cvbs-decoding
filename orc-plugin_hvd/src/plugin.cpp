@@ -40,14 +40,12 @@ ORC_STAGE_PLUGIN_EXPORT bool orc_register_stage_plugin(
 
     const auto node_type_info = create_stage()->get_node_type_info();
     if (node_type_info.display_name != orc::plugins::hvd::kStageDisplayName ||
-        node_type_info.menu_category != orc::plugins::hvd::kStageMenuCategory ||
         node_type_info.type != orc::plugins::hvd::kStageNodeType ||
         node_type_info.min_inputs != orc::plugins::hvd::kStageMinInputs ||
         node_type_info.max_inputs != orc::plugins::hvd::kStageMaxInputs ||
         node_type_info.min_outputs != orc::plugins::hvd::kStageMinOutputs ||
         node_type_info.max_outputs != orc::plugins::hvd::kStageMaxOutputs ||
-        node_type_info.compatible_formats != orc::plugins::hvd::kStageCompatibleFormats ||
-        node_type_info.sink_category != orc::plugins::hvd::kStageSinkCategory) {
+        node_type_info.compatible_formats != orc::plugins::hvd::kStageCompatibleFormats) {
         if (error_message) {
             *error_message = "Stage metadata mismatch between plugin.h and NodeTypeInfo";
         }

@@ -39,15 +39,17 @@ inline constexpr uint32_t kStageMaxOutputs = 0;
 inline constexpr orc::VideoFormatCompatibility kStageCompatibleFormats =
     VideoFormatCompatibility::ALL;
 
-// External / third-party plugin.
-inline constexpr orc::SinkCategory kStageSinkCategory = SinkCategory::THIRD_PARTY;
-
-// UI menu category group shown in the node palette.
-inline constexpr const char* kStageMenuCategory = "Chroma decode";
+// NOTE: SinkCategory and the plugin-declared menu category are gone as of
+// ABI 12 (orc-sdk abi_history.yaml, abi: 12). NodeTypeInfo no longer carries
+// a sink_category/menu_category field: the Add Stage menu group is derived
+// from NodeType via NodeTypeInfo::category()/stage_category_for(), so a SINK
+// stage is always filed under "Sink" and this plugin can no longer place
+// itself under an invented category ("Chroma decode" is gone). kStageSinkCategory
+// and kStageMenuCategory were removed accordingly — see plugin.cpp, which no
+// longer cross-checks them against get_node_type_info().
 
 static_assert(kStageName[0] != '\0', "kStageName must not be empty");
 static_assert(kStageDisplayName[0] != '\0', "kStageDisplayName must not be empty");
-static_assert(kStageMenuCategory[0] != '\0', "kStageMenuCategory must not be empty");
 static_assert(kStageMaxInputs >= kStageMinInputs, "max inputs >= min inputs");
 static_assert(kStageMaxOutputs >= kStageMinOutputs, "max outputs >= min outputs");
 

@@ -755,8 +755,12 @@ NodeTypeInfo HvdChromaDecoderStage::get_node_type_info() const
         "Holographic-variational NTSC/PAL Y/C separator (experimental). "
         "Colour preview only — no downstream Y/C representation; use "
         "'Export' to write a raw RGB24 file directly.",
-        1, 1, 0, 0, VideoFormatCompatibility::ALL,  // NTSC + PAL (see plugin.h note)
-        SinkCategory::THIRD_PARTY, "Chroma decode"};
+        1, 1, 0, 0,
+        VideoFormatCompatibility::ALL};  // NTSC + PAL (see plugin.h note).
+                                          // SinkCategory/menu_category are gone
+                                          // as of ABI 12 — the Add Stage menu
+                                          // group is now derived from NodeType
+                                          // (SINK -> "Sink"), not declared here.
 }
 
 std::vector<ArtifactPtr> HvdChromaDecoderStage::execute(

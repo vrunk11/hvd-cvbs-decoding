@@ -3,38 +3,49 @@
 A **holographic-variational NTSC/PAL chroma decoder** for
 [decode-orc](https://github.com/simoninns/decode-orc), built on the official
 `orc-plugin_skeleton` external-plugin template. It is a C++17 port of the
-[hvd-decode](reference/) research decoder.
+[hvd-decode](../research/reference/) research decoder.
 
 Instead of a comb filter, HVD treats each field as an **off-axis hologram** and
 solves Y/C separation as a regularized inverse problem, per frame. The stage
 consumes a composite `CVBS_U10_4FSC` source and emits a **lossless Y/C split**
-for the host's colour path to render. NTSC and 625-line PAL (see docs/PAL.md). Slow (seconds/frame).
+for the host's colour path to render. NTSC and 625-line PAL (see
+`../hvd-core/docs/PAL.md`). Slow (seconds/frame).
 
 > Status: the numerical core is unit-tested (5/5 green, real FFTW) and the
 > stage/plugin layer compiles against the decode-orc plugin SDK headers. It has
 > not yet been link-tested in a full host build or validated on a real capture —
 > two logic points (field parity and the vertical line mapping) are isolated in
-> `src/frame_bridge.cpp` for confirmation there. See `docs/PORTING.md`.
+> `../hvd-core/src/frame_bridge.cpp` for confirmation there. See `docs/PORTING.md`.
 
 ## Layout
 
-This repository follows the skeleton template's structure:
+This directory is the decode-orc **plugin** half of the repository; the
+decoder engine lives one level up, in the [`hvd-core`](../hvd-core) git
+submodule:
 
 ```
 src/plugin.h / plugin.cpp        descriptor + the two required entrypoints
 src/hvd_chroma_decoder_stage.*   the stage + its Y/C wrapper representation
-src/frame_bridge.*               CVBS<->IRE<->engine (SDK-free)
-src/engine/*                     numerical core (SDK-free, FFTW only)
-tests/                           SDK tests (stage/entrypoints) + engine tests
+src/video_writer.*               real-container (.mkv/.mp4/pipe) export, SDK-free but plugin-only
+tests/                           SDK tests (stage/entrypoints)
 cmake/DecodeOrcPluginSDKHelpers.cmake   orc_add_stage_plugin()
 flake.nix                        Nix dev shell matching the host toolchain
 instructions.md                  in-app help
-reference/                       the Python hvd-decode reference (oracle)
+
+../hvd-core/src/frame_bridge.*   CVBS<->IRE<->engine (SDK-free, submodule)
+../hvd-core/src/engine/*         numerical core (SDK-free, FFTW only, submodule)
+../hvd-core/tests/engine/        engine tests (submodule)
+../research/reference/           the Python hvd-decode reference (oracle, NTSC)
+../research/reference-pal/       the Python hvd-decode reference (oracle, PAL)
+../research/                     the live/evolving Python research package
 ```
 
 Only `src/plugin.*` and `src/hvd_chroma_decoder_stage.*` depend on the SDK.
-Everything under `src/engine/` and `src/frame_bridge.*` is compiled into the
-`hvd_core` static library and unit-tested without the host.
+Everything under `hvd-core/src/engine/` and `hvd-core/src/frame_bridge.*` is
+compiled into the `hvd_core` static library and unit-tested without the host —
+see [`../hvd-core/README.md`](../hvd-core/README.md). This plugin's
+`CMakeLists.txt` picks it up automatically via `add_subdirectory(../hvd-core)`;
+run `git submodule update --init --recursive` from the repository root first.
 
 ## The lossless split
 
@@ -115,7 +126,7 @@ delivered, not the shape of a pixel. Two earlier revisions got this
 wrong (first deriving the factor from the delivered dimensions, then
 reporting the delivered full-raster size as the active picture, which
 left the GUI's "4:3 (Display)" mode reasoning about a 1.73 picture
-instead of 1.33). `tests/engine/preview_aspect_test.cpp` guards both.
+instead of 1.33). `../hvd-core/tests/engine/preview_aspect_test.cpp` guards both.
 
 ### Dropout highlighting is disabled on this stage
 
@@ -148,6 +159,11 @@ histogram analyse a same-sized rectangle of mostly sync. **Turn
 
 Full instructions (Linux, Windows, engine-only mode, CI): see [BUILD.md](BUILD.md).
 
+First, get the `hvd-core` submodule (the decoder engine this plugin links):
+
+```bash
+git submodule update --init --recursive
+```
 
 The critical constraint (decode-orc 2.x): the plugin's **toolchain tag must
 match the host's exactly**, so build the plugin in the same environment as the
