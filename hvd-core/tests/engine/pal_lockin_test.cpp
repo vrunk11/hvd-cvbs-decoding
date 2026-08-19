@@ -36,7 +36,14 @@ using hvd::VideoStandard;
 
 constexpr float kHalfPi = 1.57079632679489661923F;
 constexpr float kQuarterPi = 0.78539816339744830962F;
-constexpr float kLineAdv = 3.0F * kHalfPi;  // 270 deg / line
+// 270.576 deg/line, NOT 270. PAL's fsc is 283.7516 x fH (EBU Tech. 3280-E
+// Table 1, the 25 Hz offset), so on the stored 1135-sample grid the carrier
+// advances 2*pi*0.7516 per line. This constant used to be 3*kHalfPi, which
+// baked the very approximation the decoder was fixed for into the test that
+// was supposed to catch it: the synthetic field was generated at 270 and
+// line_advance() was then asserted to equal 270, so the two agreed with each
+// other and with nothing real.
+constexpr float kLineAdv = 2.0F * 3.14159265358979323846F * 0.7516F;
 
 float WrapPi(float a) { return std::atan2(std::sin(a), std::cos(a)); }
 
@@ -129,6 +136,18 @@ void RunTests() {
   CHECK(max_err < 1e-3F);
 
   // --- 3. line_advance / nominal burst dispatch -------------------------
+  // Anchored on the DERIVATION, not on a constant copied from the header:
+  // the fractional part of fsc / fH, times 2*pi. If someone reverts
+  // line_advance() to a round 270 deg this fails, which is the whole point.
+  {
+    const double cycles_per_line = 4433618.75 / 15625.0;  // 283.7516
+    const double frac = cycles_per_line - std::floor(cycles_per_line);
+    const double want = 2.0 * 3.14159265358979323846 * frac;
+    CHECK_NEAR(static_cast<float>(g.line_advance()),
+               static_cast<float>(want), 1e-5F);
+    // and it must NOT be the old 270 deg
+    CHECK(std::abs(g.line_advance() - 1.5 * 3.14159265358979323846) > 1e-3);
+  }
   CHECK_NEAR(static_cast<float>(g.line_advance()), kLineAdv, 1e-5F);
   CHECK_NEAR(g.nominal_burst_ire(), 21.43F, 1e-4F);
   FieldGeometry gn;  // default NTSC

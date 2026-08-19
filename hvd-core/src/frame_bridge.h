@@ -67,7 +67,7 @@ struct FrameParams {
   double sample_rate = kFs4Fsc;
   // Non-standard colour subcarrier (Hz), 0 => the standard's nominal fsc.
   // The stage sets this from HvdConfig::custom_subcarrier /
-  // HvdConfig::subcarrier_khz; see FieldGeometry::subcarrier_hz.
+  // HvdConfig::subcarrier_hz; see FieldGeometry::subcarrier_hz.
   double subcarrier_hz = 0.0;
 
   // NON-ORTHOGONAL LINES (PAL only).

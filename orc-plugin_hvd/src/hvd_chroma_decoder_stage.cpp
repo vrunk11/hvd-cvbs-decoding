@@ -53,7 +53,13 @@ constexpr const char* kAcc = "acc";
 constexpr const char* kChromaGain = "chroma_gain";
 constexpr const char* kMonochrome = "monochrome";
 constexpr const char* kCustomSubcarrier = "custom_subcarrier";
-constexpr const char* kSubcarrierKhz = "subcarrier_khz";
+constexpr const char* kSubcarrierHz = "subcarrier_hz";
+// LEGACY KEY, read-only. The parameter used to be expressed in kHz, which the
+// host's hardcoded setDecimals(4) made unable to express PAL's 4433.61875 kHz
+// (five decimals) at all. set_parameters() still accepts this key and scales
+// it so saved projects don't lose a dialled-in frequency; get_parameters()
+// never emits it, so a project migrates itself on first save.
+constexpr const char* kSubcarrierKhzLegacy = "subcarrier_khz";
 constexpr const char* kSymmetryVariant = "symmetry_variant";
 constexpr const char* kChromaPhaseDeg = "chroma_phase_deg";
 constexpr const char* kPreviewFullRaster = "preview_full_raster";
@@ -196,8 +202,7 @@ HvdDecodedRepresentation::HvdDecodedRepresentation(
     }
     // Non-standard subcarrier: overrides the fsc implied by the system,
     // never the sample rate (the host still stores the standard 4fsc grid).
-    fp.subcarrier_hz =
-        config_.custom_subcarrier ? config_.subcarrier_khz * 1.0e3 : 0.0;
+    fp.subcarrier_hz = config_.custom_subcarrier ? config_.subcarrier_hz : 0.0;
     return fp;
 }
 
@@ -421,13 +426,51 @@ std::optional<ColourFrameCarrier> HvdDecodedRepresentation::build_colour_carrier
     const ::hvd::FrameParams fp = frame_params();
     if (fp.frame_width <= 0 || fp.frame_height <= 0) return std::nullopt;
 
+    // The colour metadata below needs the VideoSystem, which FrameParams
+    // deliberately does not carry (it is the SDK-free mirror, and
+    // ::hvd::VideoStandard is the engine's own narrower enum). Read it from
+    // the source instead. frame_params() has already validated that this is
+    // present and a supported system, so a missing value here means the
+    // source changed under us — bail rather than guess NTSC.
+    const auto params = source_ ? source_->get_video_parameters() : std::nullopt;
+    if (!params.has_value()) return std::nullopt;
+    const SourceParameters& sp = *params;
+
     const ::hvd::YcFrameS16* yc = colour_planes(id);
     if (!yc) return std::nullopt;
     const WovenActivePicture pic = ReorderToWoven(*yc, fp, full_raster, field);
     if (pic.width == 0 || pic.height == 0) return std::nullopt;
 
+    // COLOUR-DOMAIN METADATA. This used to be a hardcoded ColourNTSC, with
+    // `colorimetry` and `system` left default-constructed on every source.
+    //
+    // Verified against the host's render boundary
+    // (orc/sdk/src/colour_preview_conversion.cpp,
+    // render_preview_from_colour_carrier): it reads NEITHER data_type NOR
+    // system — only colorimetry.matrix_coefficients and
+    // .transfer_characteristics — and both have Unspecified fallbacks. So
+    // the hardcode never cost the colour itself: the Unspecified matrix
+    // fallback is {0.2990, 0.1140}, which IS BT601_625, i.e. already right
+    // for PAL. What it did cost is the TRANSFER: Unspecified falls back to
+    // the Gamma22 LUT, so PAL previewed at gamma 2.2 instead of the 2.8 of
+    // ColorimetricMetadata::default_pal(), rendering lighter and flatter
+    // than the host's own Video Sink on the same frame. data_type/system are
+    // set alongside because they are part of the carrier contract and other
+    // consumers (vectorscope, downstream sinks) may read them even though
+    // this one path does not.
+    //
+    // PAL_M takes the PAL branch here, matching video_sink_stage.cpp's own
+    // test (`system == PAL || system == PAL_M`): its chroma is PAL even
+    // though its raster and levels are NTSC's.
+    const bool colour_is_pal = sp.system == VideoSystem::PAL ||
+                               sp.system == VideoSystem::PAL_M;
+
     ColourFrameCarrier carrier;
-    carrier.data_type = VideoDataType::ColourNTSC;
+    carrier.data_type = colour_is_pal ? VideoDataType::ColourPAL
+                                      : VideoDataType::ColourNTSC;
+    carrier.colorimetry = colour_is_pal ? ColorimetricMetadata::default_pal()
+                                        : ColorimetricMetadata::default_ntsc();
+    carrier.system = sp.system;
     carrier.frame_index = id;
     carrier.width = pic.width;
     carrier.height = pic.height;
@@ -875,12 +918,20 @@ bool HvdChromaDecoderStage::trigger(
         if (!raw_file) return fail("could not open '" + output_path_ + "' for writing");
         out_ptr = &raw_file;
     } else {
-        // Frame rate for the muxer: the same is_pal test used everywhere
-        // else in this file (system == NTSC or PAL_M stays on the 30000/
-        // 1001 side; PAL_M genuinely runs at NTSC's field rate despite its
-        // PAL-style chroma). Expressed as a rational so timestamps land on
-        // the exact broadcast rate rather than accumulating a rounding
-        // error from a double.
+        // Frame rate for the muxer. This is the FRAME-RATE test: PAL_M sits
+        // on the 30000/1001 side, because it genuinely runs at NTSC's field
+        // rate despite its PAL-style chroma.
+        //
+        // It is NOT the same test as the colour-domain `colour_is_pal` in
+        // get_preview_capability() / build_colour_carrier(), where PAL_M goes
+        // with PAL because its CHROMA is PAL. This comment used to claim the
+        // two were "the same is_pal test used everywhere else in this file",
+        // which is what let the colour side keep classifying PAL_M as NTSC —
+        // disagreeing with the host's own video_sink_stage.cpp. Two different
+        // questions, two different tests, deliberately named apart.
+        //
+        // Expressed as a rational so timestamps land on the exact broadcast
+        // rate rather than accumulating a rounding error from a double.
         const auto vp = cached_output_->get_video_parameters();
         const bool is_pal = vp.has_value() &&
             !(vp->system == VideoSystem::NTSC || vp->system == VideoSystem::PAL_M);
@@ -1388,18 +1439,24 @@ HvdChromaDecoderStage::get_parameter_descriptors(VideoSystem, SourceType) const
         // artefact, not as a first thing to try.
         // ===================================================================
         ParameterDescriptor{kCustomSubcarrier, "Advanced: Non-standard subcarrier",
-            "For sources with a deliberately lowered colour subcarrier -- "
-            "notably JVC VHD at 2556.8 kHz. Tracks the frequency below "
-            "instead of the standard's nominal fsc (NTSC 3579.5455 kHz, "
-            "PAL 4433.61875 kHz); the sample grid is unchanged, only the "
-            "carrier moves. OFF (default) uses the standard.",
+            "LEAVE OFF for ordinary NTSC / PAL / PAL-M sources. Only for a "
+            "source with a deliberately lowered colour subcarrier -- notably "
+            "JVC VHD at 2 556 818 Hz. When ON, the frequency below REPLACES "
+            "the standard's nominal fsc, and since that field defaults to the "
+            "VHD value, switching this on for a PAL tape without also setting "
+            "the frequency demodulates against a carrier ~1.9 MHz off and "
+            "gives a black-and-white picture, not a hue error. The sample "
+            "grid is unchanged either way; only the carrier moves.",
             ParameterType::BOOL, boolean(false)},
-        ParameterDescriptor{kSubcarrierKhz, "Advanced: Subcarrier frequency (kHz)",
-            "Used only when the checkbox above is ON. VHD 2556.8182 (the "
-            "exact line lock, 162.5 x fH), NTSC 3579.5455, PAL 4433.61875. "
-            "Wrong by a few kHz and the hue rotates progressively along "
+        ParameterDescriptor{kSubcarrierHz, "Advanced: Subcarrier frequency (Hz)",
+            "Used only when the checkbox above is ON. VHD 2556818.2 (the "
+            "exact line lock, 162.5 x fH), NTSC 3579545.5, PAL 4433618.75. "
+            "In Hz rather than kHz because the host renders every DOUBLE "
+            "parameter with 4 fixed decimals: in kHz that could not express "
+            "PAL's 4433.61875 at all, and one spinbox click moved a whole "
+            "kHz. Wrong by a few kHz and the hue rotates progressively along "
             "each line: sweep it while watching a flat colour area.",
-            ParameterType::DOUBLE, real(500.0, 6000.0, 2556.8182)},
+            ParameterType::DOUBLE, real(500000.0, 6000000.0, 2556818.2)},
         ParameterDescriptor{kOddGateFloor, "Advanced: Odd-offset gate floor",
             "Weight kept on opposite-parity (odd) neighbour equations where "
             "the half-line envelope says that field cannot see the feature. "
@@ -1548,7 +1605,7 @@ HvdChromaDecoderStage::get_parameters() const
         {kChromaGain, static_cast<double>(config_.chroma_gain)},
         {kMonochrome, config_.monochrome},
         {kCustomSubcarrier, config_.custom_subcarrier},
-        {kSubcarrierKhz, config_.subcarrier_khz},
+        {kSubcarrierHz, config_.subcarrier_hz},
         {kPreviewFullRaster, preview_full_raster_},
         {kPreviewFieldView, preview_field_view_},
         {kSymmetryVariant, config_.symmetry_variant},
@@ -1564,8 +1621,8 @@ bool HvdChromaDecoderStage::set_parameters(
     const std::map<std::string, ParameterValue>& params)
 {
     // Generic in the destination type. Most config fields are float, but
-    // subcarrier_khz is double: the GUI's step there (0.1 Hz) is finer than
-    // float's ULP at 2556 kHz (0.24 Hz), so a float destination would swallow
+    // subcarrier_hz is double: the GUI resolves 0.0001 Hz, far finer than
+    // float's ULP at 4.4 MHz (0.25 Hz), so a float destination would swallow
     // spinbox steps. See hvd_config.h.
     auto get_double = [&](const char* key, auto& dst) {
         using T = std::decay_t<decltype(dst)>;
@@ -1615,7 +1672,17 @@ bool HvdChromaDecoderStage::set_parameters(
     get_double(kChromaGain, config_.chroma_gain);
     get_bool(kMonochrome, config_.monochrome);
     get_bool(kCustomSubcarrier, config_.custom_subcarrier);
-    get_double(kSubcarrierKhz, config_.subcarrier_khz);
+    // Legacy kHz key FIRST, so an explicit new-unit value in the same map
+    // always wins over a stale one. A project saved before the unit change
+    // carries only the old key and migrates transparently; one saved after
+    // carries only the new key and never touches this branch.
+    {
+        auto it = params.find(kSubcarrierKhzLegacy);
+        if (it != params.end() && std::holds_alternative<double>(it->second)) {
+            config_.subcarrier_hz = std::get<double>(it->second) * 1.0e3;
+        }
+    }
+    get_double(kSubcarrierHz, config_.subcarrier_hz);
     get_bool(kPreviewFullRaster, preview_full_raster_);
     get_bool(kPreviewFieldView, preview_field_view_);
     get_bool(kSymmetryVariant, config_.symmetry_variant);
@@ -1658,8 +1725,14 @@ StagePreviewCapability HvdChromaDecoderStage::get_preview_capability() const
         return capability;
     }
 
-    const bool is_pal =
-        !(params->system == VideoSystem::NTSC || params->system == VideoSystem::PAL_M);
+    // COLOUR type, so PAL_M belongs on the PAL side: the advertised type has
+    // to agree with what build_colour_carrier() actually stamps on the
+    // carrier, and that follows video_sink_stage.cpp (`PAL || PAL_M` ->
+    // ColourPAL) because PAL_M's chroma is PAL. This is NOT the same test as
+    // the frame-RATE `is_pal` further down in trigger(), where PAL_M
+    // genuinely sits on the 30000/1001 side — hence the distinct name.
+    const bool colour_is_pal = params->system == VideoSystem::PAL ||
+                               params->system == VideoSystem::PAL_M;
 
     // Colour type only now (ColourNTSC/ColourPAL) — this is what makes the
     // host's preview renderer take the carrier-backed colour path; it
@@ -1671,7 +1744,7 @@ StagePreviewCapability HvdChromaDecoderStage::get_preview_capability() const
     // get_frame_chroma() were removed — see HvdDecodedRepresentation), so
     // advertising it would just be a dead end for the GUI.
     const VideoDataType colour_type =
-        is_pal ? VideoDataType::ColourPAL : VideoDataType::ColourNTSC;
+        colour_is_pal ? VideoDataType::ColourPAL : VideoDataType::ColourNTSC;
     capability.supported_data_types = {colour_type};
 
     // GEOMETRY SEMANTICS — matched to the SDK's own reference stage

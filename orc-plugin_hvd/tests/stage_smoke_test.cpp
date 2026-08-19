@@ -47,8 +47,8 @@ int main()
     // application while every unit test exercises the struct value --
     // which is exactly how `chroma_phase_deg` kept a default of 180 in the
     // GUI after the struct had been corrected to 0, and how
-    // `subcarrier_khz` shipped the rounded 2556.8 against the struct's
-    // exact 2556.8182. `stage` here is freshly constructed, so
+    // the old `subcarrier_khz` shipped a rounded value against the struct's
+    // exact line lock. `stage` here is freshly constructed, so
     // get_parameters() returns the struct defaults verbatim.
     // ------------------------------------------------------------------
     const auto values = stage.get_parameters();
@@ -62,15 +62,33 @@ int main()
         bool equal = false;
         if (std::holds_alternative<double>(want) &&
             std::holds_alternative<double>(got)) {
-            // HvdConfig stores these numeric defaults as float. Compare both
-            // values in float so the descriptor and HvdConfig use the same
-            // representation instead of comparing float-vs-double rounding.
-            const float a = static_cast<float>(std::get<double>(want));
-            const float b = static_cast<float>(std::get<double>(got));
-            equal = a == b;
-            if (!equal) {
-                std::cerr << "Default mismatch for '" << d.name
-                          << "': descriptor=" << a << " HvdConfig=" << b << '\n';
+            // Most numeric defaults live in HvdConfig as float, so comparing
+            // in float puts descriptor and struct in the same representation
+            // rather than measuring float-vs-double rounding.
+            //
+            // subcarrier_hz is the exception: it is genuinely double (see the
+            // type note in hvd_config.h), and now that it is expressed in Hz
+            // rather than kHz, float's ULP at 2.5 MHz is 0.25 Hz — wide
+            // enough to hide a real disagreement between the two defaults.
+            // Compare that one at full precision.
+            if (d.name == std::string("subcarrier_hz")) {
+                const double a = std::get<double>(want);
+                const double b = std::get<double>(got);
+                equal = a == b;
+                if (!equal) {
+                    std::cerr << "Default mismatch for '" << d.name
+                              << "': descriptor=" << a << " HvdConfig=" << b
+                              << '\n';
+                }
+            } else {
+                const float a = static_cast<float>(std::get<double>(want));
+                const float b = static_cast<float>(std::get<double>(got));
+                equal = a == b;
+                if (!equal) {
+                    std::cerr << "Default mismatch for '" << d.name
+                              << "': descriptor=" << a << " HvdConfig=" << b
+                              << '\n';
+                }
             }
         } else if (std::holds_alternative<bool>(want) &&
                    std::holds_alternative<bool>(got)) {

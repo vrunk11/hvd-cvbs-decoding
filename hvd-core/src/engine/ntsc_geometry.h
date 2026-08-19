@@ -26,10 +26,14 @@ namespace hvd {
 constexpr double kFscNtsc = 315.0e6 / 88.0;      // 3 579 545.45... Hz
 constexpr double kFs4Fsc = 4.0 * kFscNtsc;        // 14 318 181.8 Hz
 
-// PAL 4fsc: fsc = 4 433 618.75 Hz. On the stored 1135-sample grid the
-// subcarrier advances exactly 283.75 cycles/line => 270 deg/line; the
-// 25 Hz offset survives as a slow drift the lock-in MEASURES (the PAL
-// reference in reference-pal/, THEORY-PAL.md sections 1-2).
+// PAL 4fsc: fsc = 4 433 618.75 Hz, i.e. 283.7516 cycles/line -- NOT 283.75.
+// The stored grid is 1135 samples/line but the true line is 1135.0064, so
+// the carrier advances 270.576 deg per stored line (see
+// FieldGeometry::line_advance, which carries the derivation and the
+// measurement that motivated it). The lock-in still MEASURES the per-line
+// phase; the model only has to be close enough that the deviation it
+// smooths stays well inside WrapPi's +/-180 (the PAL reference in
+// reference-pal/, THEORY-PAL.md sections 1-2).
 constexpr double kFscPal = 4433618.75;
 constexpr double kFs4FscPal = 4.0 * kFscPal;      // 17 734 475 Hz
 
@@ -137,7 +141,27 @@ struct FieldGeometry {
     if (subcarrier_hz <= 0.0) {
       switch (standard) {
         case VideoStandard::kPal:
-          return 1.5 * 3.14159265358979323846;  // 270 deg, 283.75 cyc/line
+          // 270.576 deg, NOT 270. EBU Tech. 3280-E Table 1: fsc = 283.7516 x
+          // fH, not 283.75 -- the 25 Hz offset. On the stored 1135-sample
+          // grid the true line is 1135.0064 samples, so the carrier advances
+          // 1135.0064 * 90 deg = 270.576 deg per STORED line. (The 4 extra
+          // samples per frame that EBU puts on lines 312 and 624 close the
+          // 625 * 0.0064 = 4.0 sample gap over a frame; FrameLineOffset
+          // already indexes them, but the PHASE MODEL here still has to
+          // carry the drift WITHIN each field.)
+          //
+          // The old 1.5 * pi left a 0.576 deg/line ramp in the lock-in's
+          // deviation d = wrap(theta_meas - model), which accumulates to
+          // ~176 deg between the first burst-bearing line and the end of the
+          // field -- i.e. it sat just under WrapPi's +/-180 boundary.
+          // Measured on a synthetic PAL field (313 lines, VBI without burst,
+          // 64 initial phases): residual phase error 4.8 deg with 1.5 * pi
+          // against 0.7 deg here, and with 2 IRE of noise the ramp crossed
+          // pi on ~1 field in 64 -- wrapping d by 360 deg, which the
+          // tridiagonal smoother then spread across the field AND which
+          // flipped the V-switch parity vote (355 deg of phase error on that
+          // field). This constant removes the ramp, and with it the cliff.
+          return 2.0 * 3.14159265358979323846 * 0.7516;
         case VideoStandard::kPalM:
           return 0.5 * 3.14159265358979323846;  // 90 deg, 227.25 cyc/line
         default:

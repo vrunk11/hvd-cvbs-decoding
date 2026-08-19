@@ -197,7 +197,16 @@ FrameYc HvdEngine::DecodeFrame(const FieldInput& first, const FieldInput& second
 FrameYc HvdEngine::DecodeChromaOnly(const FieldInput& first,
                                     const FieldInput& second,
                                     const FieldGeometry& g,
-                                    const HvdConfig& cfg) {
+                                    const HvdConfig& cfg_in) {
+  // Same derivation as DecodeFrame and DecodeFieldWindow: is_pal is NOT a
+  // user parameter, it is read off the geometry so callers cannot forget it
+  // (hvd_config.h). Inert on this path today — DecodeChromaOnly skips the
+  // variational stage, and ResolveChromaAniso is the only reader — but
+  // leaving the one entry point that DOESN'T derive it is a trap for
+  // whatever gets added here next.
+  HvdConfig cfg = cfg_in;
+  cfg.is_pal = g.uses_vswitch();
+
   const WovenFrame w = WeaveAndBuildCarrier(first, second, g, cfg);
   const Plane& s = w.s;  // chroma-only, signed, zero-mean — no luma mixed in
   const ComplexPlane& carrier = w.carrier;

@@ -183,36 +183,48 @@ struct HvdConfig {
   // (line rate, sync, blanking, burst window, 4fsc-nominal sample grid)
   // but carry the colour subcarrier somewhere other than fs/4. The sample
   // RATE does not change; only the carrier riding on that grid moves.
-  // The motivating case is JVC VHD, whose subcarrier sits at 2556.8 kHz.
+  // The motivating case is JVC VHD, whose subcarrier sits at 2 556 818 Hz.
   //
-  // custom_subcarrier is the on/off switch, subcarrier_khz the value, kept
+  // custom_subcarrier is the on/off switch, subcarrier_hz the value, kept
   // separate for the same reason enable_temporal and temporal_strength are:
   // so a dialled-in frequency survives toggling the feature off and on.
   //
-  // TYPE IS double, NOT float, unlike every other numeric field here. The
-  // host's spinbox resolves 0.0001 kHz = 0.1 Hz, but float's ULP at 2556 kHz
-  // is 2^-12 kHz = 0.24 Hz — coarser than the control feeding it, so a float
-  // would silently swallow individual spinbox steps and could not hold
-  // 2556.8182 exactly. Everything downstream (FrameParams::subcarrier_hz,
+  // TYPE IS double, NOT float, unlike every other numeric field here. float's
+  // ULP at 4.4 MHz is 0.25 Hz, coarser than the control feeding this, so a
+  // float would silently swallow individual spinbox steps and could not hold
+  // an exact standard fsc. Everything downstream (FrameParams::subcarrier_hz,
   // FieldGeometry::subcarrier_hz) is already double; this closes the one gap.
   //
-  // UNITS ARE kHz, NOT MHz, and that is not cosmetic: the host renders every
-  // DOUBLE parameter with a hardcoded 4 decimal places
-  // (stageparameterdialog.cpp, setDecimals(4)), which a plugin cannot
-  // override. In MHz that quantises the dial to 100 Hz steps — too coarse to
-  // land on a real subcarrier. In kHz the same 4 decimals give 0.1 Hz.
-  // Reference values in these units: VHD 2556.8, NTSC 3579.5455,
-  // PAL 4433.61875.
+  // UNITS ARE Hz. They used to be kHz, and that was not survivable: the host
+  // renders every DOUBLE parameter with a hardcoded 4 decimal places
+  // (stageparameterdialog.cpp, setDecimals(4)) and no setSingleStep, which a
+  // plugin cannot override. In kHz that means
+  //   * 4 decimals = 0.0001 kHz, so PAL's 4433.61875 kHz — which needs FIVE —
+  //     was literally not typeable; the operator got 4433.6187 or 4433.6188,
+  //     i.e. the standard's own subcarrier was unreachable through the
+  //     control whose entire job is to reach a subcarrier;
+  //   * the default single step of 1.0 stepped by a whole kHz per click,
+  //     useless for the "sweep it while watching a flat colour area"
+  //     workflow the descriptor recommends.
+  // In Hz the same hardcoded 4 decimals give 0.0001 Hz of typing resolution
+  // and the 1.0 step becomes 1 Hz per click. Reference values in these units:
+  // VHD 2556818.2, NTSC 3579545.5, PAL 4433618.75.
   //
-  // WHAT STILL HOLDS AT 2556.8 kHz. 2556.8182 kHz is exactly 162.5 * fH —
+  // MIGRATION: the stage's set_parameters() still accepts the old
+  // "subcarrier_khz" key and multiplies by 1000, so projects saved before
+  // this change keep their dialled-in frequency. get_parameters() only ever
+  // emits the new "subcarrier_hz" key, so a project rewrites itself on the
+  // first save.
+  //
+  // WHAT STILL HOLDS AT VHD. 2 556 818.2 Hz is exactly 162.5 * fH —
   // an ODD MULTIPLE OF HALF THE LINE RATE, structurally the same choice as
   // standard NTSC's 227.5 * fH. So line_advance() comes out at 180 deg and
   // the two assumptions that depend on it stay valid: the AUTO chroma_aniso
   // measurement (its 2-line average still cancels the init's cross-colour
   // leak) and the sequence path's ambiguity measurement (same-parity fields
   // still see the carrier flipped 180 deg). The adaptive modes can be left
-  // alone here. The default below is the EXACT line lock 2556.8182 (180
-  // deg/line); the rounded 2556.8 gives 179.584 deg/line and quietly
+  // alone here. The default below is the EXACT line lock 2 556 818.2 (180
+  // deg/line); a rounded 2 556 800 gives 179.584 deg/line and quietly
   // breaks both assumptions above. The GUI descriptor used to default to
   // the rounded value while this struct held the exact one — two sources
   // of truth for one default, which is the same class of bug as the old
@@ -236,7 +248,7 @@ struct HvdConfig {
   // above are actively wrong for the source and the adaptive modes should be
   // replaced by forced values (chroma_aniso 0.5, a fixed temporal_strength).
   bool custom_subcarrier = false;
-  double subcarrier_khz = 2556.8182;  // VHD
+  double subcarrier_hz = 2556818.2;  // VHD, the exact 162.5 * fH line lock
 
   // --- Geometry -----------------------------------------------------------
   // Weave both fields into frame geometry before decoding (default, best

@@ -317,11 +317,33 @@ YcFrameS16 DecodeYcFrameBuffer(const int16_t* luma, const int16_t* chroma,
 
   // Luma is already clean: pass the source's own Y channel through as-is,
   // outside the active picture included (nothing to decode either way).
-  // Plain copy/fill, not a #pragma omp loop — this is memory-bandwidth-
-  // bound with no per-element work, so std::copy/assign (which the
-  // compiler/stdlib can turn into a vectorised memcpy/memset) beats
-  // parallelising it: thread launch overhead would dwarf the actual work.
-  std::copy(luma, luma + static_cast<size_t>(fw) * fh, out.luma.begin());
+  //
+  // LINE BY LINE THROUGH FrameLineOffset, NOT ONE FLAT std::copy. This used
+  // to be `std::copy(luma, luma + fw * fh, out.luma.begin())`, which is only
+  // correct when the source buffer has a uniform fw stride. It does not on
+  // 625-line PAL: the source frame is kPalFrameSamples = 709 379 samples,
+  // with 2 extra samples on each of frame-flat lines 312 and 624
+  // (FrameParams::extra_sample_lines). YcFrameS16's own planes ARE flat
+  // fw * fh (every consumer, including the stage's ReorderToWoven, indexes
+  // them as flat_line * fw + flat_col), so the conversion between the two
+  // layouts has to happen HERE — a flat read of a non-flat buffer put the
+  // WHOLE of field 2 two samples early, i.e. a 2 px horizontal shift on
+  // every other display line, and 2 samples at 4fsc is also 180 deg of
+  // subcarrier.
+  //
+  // It also left luma misregistered against this function's own chroma,
+  // which was already being read correctly through FrameLineOffset just
+  // above. The composite path (DecodeFrameBuffer) always did this properly;
+  // only the Y/C path regressed.
+  //
+  // Still not an omp loop: 625 std::copy calls of 1135 samples each are
+  // memory-bandwidth-bound with no per-element work, so thread launch
+  // overhead would dwarf the actual copying.
+  for (int line = 0; line < fh; ++line) {
+    const int64_t src = FrameLineOffset(fp, line);
+    std::copy(luma + src, luma + src + fw,
+              out.luma.begin() + static_cast<size_t>(line) * fw);
+  }
   std::fill(out.chroma.begin(), out.chroma.end(), 0);
 
   const int fal = g.first_active_field_line;
